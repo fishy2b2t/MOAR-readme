@@ -4,7 +4,7 @@
 
 A client-side Fabric mod that automates schematic building, spawn-proofing, and container management. Load a `.litematic`, point it at some supply chests, and let it build, restock, recover from disconnects, and keep working across long multi-container runs.
 
-## 2.1 Highlights
+## 2.2 Highlights
 
 - **Smarter printer detection** : auto-detects active Litematica placements and can fall back to hologram block correlation when the live placement list is unavailable
 - **Resume-first building** : printer checkpoints survive disconnects and `/printer resume` restores the build state from disk
@@ -304,10 +304,10 @@ Requires **JDK 21+**.
 ```bash
 ./gradlew build                  # Build all versions
 ./gradlew :1.21.8:build          # Build one version
-./gradlew buildAndCollect        # Collect all JARs → build/libs/2.1.0/
+./gradlew buildAndCollect        # Collect all JARs -> build/libs/2.2.0/
 ```
 
-Output: `versions/<mc>/build/libs/moar-2.1.0+<mc>.jar`
+Output: `versions/<mc>/build/libs/moar-2.2.0+<mc>.jar`
 
 ### Build Stack
 
