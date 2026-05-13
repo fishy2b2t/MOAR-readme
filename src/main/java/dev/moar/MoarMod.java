@@ -11,6 +11,7 @@ import dev.moar.lanes.LaneManager;
 import dev.moar.stash.StashDatabase;
 import dev.moar.stash.StashManager;
 import dev.moar.printer.SchematicPrinter;
+import dev.moar.printer.SchematicQueueManager;
 import dev.moar.schematic.PrinterResourceManager;
 import dev.moar.spawnproof.SpawnProofer;
 import dev.moar.util.PathWalker;
@@ -53,6 +54,7 @@ public class MoarMod implements ClientModInitializer {
 
     private static final StashDatabase DATABASE = new StashDatabase();
     private static final SchematicPrinter PRINTER = new SchematicPrinter();
+    private static final SchematicQueueManager QUEUE_MANAGER = new SchematicQueueManager(PRINTER);
     private static final SpawnProofer SPAWN_PROOFER = new SpawnProofer();
     private static final ChestManager CHEST_MANAGER = new ChestManager();
     private static final StashManager STASH_MANAGER = new StashManager();
@@ -123,6 +125,9 @@ public class MoarMod implements ClientModInitializer {
             // Tick the printer
             PRINTER.tick();
 
+            // Tick the queue manager (auto-advance to next schematic)
+            QUEUE_MANAGER.tick();
+
             // Tick the spawnproofer
             SPAWN_PROOFER.tick();
 
@@ -144,6 +149,7 @@ public class MoarMod implements ClientModInitializer {
         // Clean up all state when leaving a server/world
         ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> {
             PRINTER.onDisconnect();
+            QUEUE_MANAGER.onDisconnect();
             STASH_MANAGER.stop();
             STASH_MANAGER.getOrganizer().stop();
             STASH_MANAGER.getRetriever().stop();
@@ -162,6 +168,11 @@ public class MoarMod implements ClientModInitializer {
     /** Get the singleton printer instance. */
     public static SchematicPrinter getPrinter() {
         return PRINTER;
+    }
+
+    /** Get the singleton queue manager instance. */
+    public static SchematicQueueManager getQueueManager() {
+        return QUEUE_MANAGER;
     }
 
     /** Get the singleton spawnproofer instance. */

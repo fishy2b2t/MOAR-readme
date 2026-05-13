@@ -203,6 +203,12 @@ public class SchematicPrinter {
         IDLE
     }
 
+    public enum BuildResult {
+        NONE,
+        COMPLETED,
+        COMPLETED_WITH_MISSING_MATERIALS
+    }
+
     // settings
 
     private int bps = 13;
@@ -211,17 +217,19 @@ public class SchematicPrinter {
     private boolean printInAir = true;
     private SortMode sortMode = SortMode.BOTTOM_UP;
     private boolean statusMessages = true;
-    private boolean autoBuild = true;
+    private boolean autoBuild = false;
 
     // state
 
     private boolean enabled = false;
+    private BuildResult buildResult = BuildResult.NONE;
 
     // schematic state
 
     private LitematicaSchematic schematic;
     private BlockPos anchor;
     private int blocksPlaced;
+    private Path schematicPath;
     private String schematicFile;
     // Dimension the schematic was loaded in — pauses on dimension change.
     /*? if >=26.1 {*//*
@@ -417,11 +425,13 @@ public class SchematicPrinter {
 
     private void enable() {
         enabled = true;
+        clearBuildResult();
 
-        // Sync with Litematica: full re-detect if nothing loaded,
-        // anchor-only sync for manually loaded schematics.
+        // Sync with Litematica: full re-detect only when nothing is loaded.
+        // Once a placement is loaded, keep that selection stable across
+        // toggles and only re-sync the anchor when the match is unambiguous.
         boolean litematicaSynced = false;
-        if (schematic == null || anchor == null || autoDetected) {
+        if (schematic == null || anchor == null) {
             if (tryAutoDetect()) {
                 ChatHelper.labelled("Printer", "§aLoaded §f" + schematic.getName()
                         + " §7(" + schematic.getTotalNonAir() + " blocks)");
@@ -430,10 +440,10 @@ public class SchematicPrinter {
                 ChatHelper.info("§cNo schematic loaded. Use /printer load <file> or load one in Litematica.");
             }
         } else {
-            // Manual load — resync anchor only (avoid replacing schematic).
+            // Already loaded — re-sync anchor only (avoid replacing schematic).
             if (trySyncAnchor()) {
                 litematicaSynced = true;
-            } else {
+            } else if (!autoDetected) {
                 ChatHelper.info("§7Anchor unchanged — SchematicWorld correlation "
                         + "will auto-align on next tick.");
             }
@@ -502,7 +512,7 @@ public class SchematicPrinter {
         }
 
         PlacementEngine.clearCorrectionHistory();
-        PlacementEngine.resetRejectionCounters();
+        PlacementEngine.reset();
 
         // If the build site is far away (unloaded chunks), start
         // walking there immediately instead of waiting for the
@@ -551,7 +561,12 @@ public class SchematicPrinter {
     }
 
     private void disable() {
+        disable(true);
+    }
+
+    private void disable(boolean announce) {
         enabled = false;
+        clearBuildResult();
         PrinterDatabase.flushScaffoldIfDirty(); // persist any pending scaffold data
         saveCheckpoint();
         PlacementEngine.reset();
@@ -562,9 +577,25 @@ public class SchematicPrinter {
         SneakOverride.setForceSneak(false); // always release mixin sneak
         SneakOverride.setForceAbsoluteSneak(false);
 
-        if (statusMessages) {
+        if (announce && statusMessages) {
             ChatHelper.info("Stopped. §e" + blocksPlaced + "§f blocks placed this session.");
         }
+    }
+
+    public void stopForQueueTransition() {
+        if (enabled) {
+            disable(false);
+            return;
+        }
+
+        clearBuildResult();
+        PlacementEngine.reset();
+        PathWalker.stop();
+        autoState = AutoState.IDLE;
+        walkingSetbackPauseTicks = 0;
+        observedWalkingSetbacks = SetbackMonitor.get().totalSetbacks();
+        SneakOverride.setForceSneak(false);
+        SneakOverride.setForceAbsoluteSneak(false);
     }
 
     // Release all accumulated state on world disconnect to prevent leaks.
@@ -610,13 +641,14 @@ public class SchematicPrinter {
             }
             boolean originIsZero = p.originX() == 0 && p.originY() == 0 && p.originZ() == 0;
             double dx = p.originX() - playerPos.getX();
+            double dy = p.originY() - playerPos.getY();
             double dz = p.originZ() - playerPos.getZ();
-            double dist = Math.sqrt(dx * dx + dz * dz);
+            double dist = dx * dx + dy * dy + dz * dz;
 
             // Ignore default-origin placements far from spawn.
             if (originIsZero && dist > 100) {
                 LOGGER.warn("Skipping placement '{}' — origin is (0,0,0) and player is {} blocks away",
-                        p.name(), (int) dist);
+                        p.name(), (int) Math.sqrt(dist));
                 continue;
             }
             if (dist < bestDist) {
@@ -685,6 +717,7 @@ public class SchematicPrinter {
                 }
             }
             this.blocksPlaced = 0;
+            this.schematicPath = placement.schematicPath().normalize();
             this.schematicFile = placement.schematicPath().getFileName().toString();
             this.autoDetected = true;
             /*? if >=26.1 {*//*
@@ -844,11 +877,14 @@ public class SchematicPrinter {
     // SCHEMATIC MANAGEMENT
 
     public void loadSchematic(Path path, BlockPos anchor) throws IOException {
-        this.schematic = LitematicaSchematic.load(path);
+        Path normalizedPath = path.normalize();
+        this.schematic = LitematicaSchematic.load(normalizedPath);
         this.anchor = anchor;
         this.blocksPlaced = 0;
-        this.schematicFile = path.getFileName().toString();
+        this.schematicPath = normalizedPath;
+        this.schematicFile = normalizedPath.getFileName().toString();
         this.autoDetected = false;
+        clearBuildResult();
         /*? if >=26.1 {*//*
         Minecraft mc = Minecraft.getInstance();
         *//*?} else {*/
@@ -867,9 +903,11 @@ public class SchematicPrinter {
         this.schematic = null;
         this.anchor = null;
         this.blocksPlaced = 0;
+        this.schematicPath = null;
         this.schematicFile = null;
         this.autoDetected = false;
         this.buildDimension = null;
+        clearBuildResult();
         PrinterCheckpoint.clear();
         PrinterDatabase.clearScaffold();
         MoarMod.getChestManager().clearSessionData();
@@ -881,6 +919,8 @@ public class SchematicPrinter {
     public boolean isLoaded()                         { return schematic != null && anchor != null; }
     public LitematicaSchematic getSchematic()          { return schematic; }
     public BlockPos getAnchor()                       { return anchor; }
+    public Path getSchematicPath()                    { return schematicPath; }
+    public String getSchematicFileName()              { return schematicFile; }
 
     // Updates the build anchor.  If AutoBuild is actively walking to a
     // build zone, the walk is cancelled and the state machine resets to
@@ -905,6 +945,27 @@ public class SchematicPrinter {
             walkFailCount = 0;
             triedPlacementWalk = false;
         }
+    }
+
+    public void overrideAnchor(BlockPos newAnchor) {
+        this.autoDetected = false;
+        this.anchorCorrelated = false;
+        this.anchorCorrelationCooldown = ANCHOR_CORRELATION_INTERVAL;
+        setAnchor(newAnchor);
+    }
+
+    public BuildResult consumeBuildResult() {
+        BuildResult result = buildResult;
+        buildResult = BuildResult.NONE;
+        return result;
+    }
+
+    private void markBuildResult(BuildResult result) {
+        buildResult = result;
+    }
+
+    private void clearBuildResult() {
+        buildResult = BuildResult.NONE;
     }
 
     public int getBlocksPlaced()                      { return blocksPlaced; }
@@ -1245,13 +1306,12 @@ public class SchematicPrinter {
             }
         }
 
-        // Server-rejection bailout: if the anti-cheat has rejected many
-        // consecutive placements, the player is in an invalid position
-        // (e.g. swimming, falling, wrong angle).  Stop trying to place
-        // and navigate to a better position.
-        if (PlacementEngine.getConsecutiveFailures() >= SERVER_REJECT_THRESHOLD) {
+        // Server-rejection bailout: only hard rejections prove the server
+        // disagreed with the placement. Confirmation timeouts can happen on
+        // strict or delayed stacks, so don't let those alone force a walk.
+        if (PlacementEngine.getConsecutiveRejections() >= SERVER_REJECT_THRESHOLD) {
             PlacementEngine.resetRejectionCounters();
-            LOGGER.debug("Server failed to confirm {} placements — repositioning",
+            LOGGER.debug("Server rejected {} consecutive placements — repositioning",
                     SERVER_REJECT_THRESHOLD);
             if (!tryWalkToNextZone(mc)) {
                 /*? if >=26.1 {*//*
@@ -1567,6 +1627,9 @@ public class SchematicPrinter {
                     }
                 } else {
                     autoState = AutoState.IDLE;
+                    markBuildResult(skippedItems.isEmpty()
+                            ? BuildResult.COMPLETED
+                            : BuildResult.COMPLETED_WITH_MISSING_MATERIALS);
                     if (statusMessages) {
                         if (skippedItems.isEmpty()) {
                             ChatHelper.info("§aBuild appears complete! §e"
@@ -2780,6 +2843,7 @@ public class SchematicPrinter {
                 ChatHelper.info("§aScaffold cleanup complete.");
             }
             autoState = AutoState.IDLE;
+            markBuildResult(BuildResult.COMPLETED);
             return;
         }
 
@@ -2823,6 +2887,7 @@ public class SchematicPrinter {
                 ChatHelper.info("§aScaffold cleanup complete.");
             }
             autoState = AutoState.IDLE;
+            markBuildResult(BuildResult.COMPLETED);
             return;
         }
 
@@ -2848,6 +2913,7 @@ public class SchematicPrinter {
 
         if (closest == null) {
             autoState = AutoState.IDLE;
+            markBuildResult(BuildResult.COMPLETED);
             return;
         }
 
@@ -7404,10 +7470,12 @@ public class SchematicPrinter {
     }
 
     public void restoreFromCheckpoint(PrinterCheckpoint.CheckpointData data, Path schematicPath) throws IOException {
-        this.schematic = LitematicaSchematic.load(schematicPath);
+        Path normalizedPath = schematicPath.normalize();
+        this.schematic = LitematicaSchematic.load(normalizedPath);
         this.anchor = data.anchorPos();
         this.blocksPlaced = data.blocksPlaced;
-        this.schematicFile = schematicPath.getFileName().toString();
+        this.schematicPath = normalizedPath;
+        this.schematicFile = normalizedPath.getFileName().toString();
         /*? if >=26.1 {*//*
         Minecraft mc = Minecraft.getInstance();
         *//*?} else {*/
