@@ -63,6 +63,7 @@ public class MoarMod implements ClientModInitializer {
     private static final LaneManager LANE_MANAGER = new LaneManager();
     private static MoarProperties PROPERTIES;
     private static ApiServer API_SERVER;
+    private static volatile boolean guiOpenRequested;
 
     /*? if >=26.1 {*//*
     private static KeyMapping toggleKey;
@@ -75,6 +76,15 @@ public class MoarMod implements ClientModInitializer {
     @Override
     public void onInitializeClient() {
         LOGGER.info("MOAR initializing...");
+
+        /*? if >=26.1 {*//*
+        KeyMapping.Category keyCategory = KeyMapping.Category.register(
+                Identifier.fromNamespaceAndPath("moar", "category"));
+        *//*?} else if >=1.21.10 {*//*
+        KeyBinding.Category keyCategory = KeyBinding.Category.create(Identifier.of("moar", "category"));
+        *//*?} else {*/
+        String keyCategory = "category.moar";
+        /*?}*/
 
         // Register keybinding to toggle the printer
         /*? if >=26.1 {*//*
@@ -89,13 +99,7 @@ public class MoarMod implements ClientModInitializer {
                 InputUtil.Type.KEYSYM,
                 /*?}*/
                 GLFW.GLFW_KEY_KP_0,
-                /*? if >=26.1 {*//*
-                KeyMapping.Category.register(Identifier.fromNamespaceAndPath("moar", "category"))
-                *//*?} else if >=1.21.10 {*//*
-                KeyBinding.Category.create(Identifier.of("moar", "category"))
-                *//*?} else {*/
-                "category.moar"
-                /*?}*/
+                keyCategory
         ));
 
         /*? if >=26.1 {*//*
@@ -110,13 +114,7 @@ public class MoarMod implements ClientModInitializer {
                 InputUtil.Type.KEYSYM,
                 /*?}*/
                 GLFW.GLFW_KEY_KP_9,
-                /*? if >=26.1 {*//*
-                KeyMapping.Category.register(Identifier.fromNamespaceAndPath("moar", "category"))
-                *//*?} else if >=1.21.10 {*//*
-                KeyBinding.Category.create(Identifier.of("moar", "category"))
-                *//*?} else {*/
-                "category.moar"
-                /*?}*/
+                keyCategory
         ));
 
         // Register client commands
@@ -153,6 +151,11 @@ public class MoarMod implements ClientModInitializer {
             *//*?} else {*/
             while (guiKey.wasPressed()) {
             /*?}*/
+                requestGuiOpen();
+            }
+
+            if (guiOpenRequested) {
+                guiOpenRequested = false;
                 client.setScreen(new MoarScreen());
             }
 
@@ -242,5 +245,10 @@ public class MoarMod implements ClientModInitializer {
     /** Get the embedded API server. */
     public static ApiServer getApiServer() {
         return API_SERVER;
+    }
+
+    /** Open the MOAR GUI on the next client tick after chat/screens settle. */
+    public static void requestGuiOpen() {
+        guiOpenRequested = true;
     }
 }

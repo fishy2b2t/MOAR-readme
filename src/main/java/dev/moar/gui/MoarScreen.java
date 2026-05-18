@@ -323,11 +323,7 @@ public final class MoarScreen extends Screen {
     @Override
     public void render(DrawContext context, int mouseX, int mouseY, float delta) {
     /*?}*/
-        /*? if >=26.1 {*//*
-        extractBackground(context, mouseX, mouseY, delta);
-        *//*?} else {*/
-        renderBackground(context, mouseX, mouseY, delta);
-        /*?}*/
+        fill(context, 0, 0, width, height, 0xD010141A);
         drawTitle(context);
         drawBody(context);
         /*? if >=26.1 {*//*
