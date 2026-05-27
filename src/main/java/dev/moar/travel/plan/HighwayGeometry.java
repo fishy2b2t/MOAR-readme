@@ -9,7 +9,7 @@ public final class HighwayGeometry {
 
     private HighwayGeometry() {}
 
-    // ── Distance tables (ported from anarchy-client HighwayDetector) ──────
+    // ── Distance tables ───────────────────────────────────────────────────
     /** Ring-road axis-aligned square distances from origin. */
     public static final double[] RING_DISTANCES = {
             500, 1000, 1500, 2000, 2500, 7500.5,
@@ -87,17 +87,20 @@ public final class HighwayGeometry {
         }
 
         // ── Diagonal ──────────────────────────────────────────────
+        // Use a proportional tolerance so far-out destinations (e.g. 2M blocks)
+        // that are close to the diagonal in relative terms still score highly.
+        int diagTolerance = Math.max(50, (int)(Math.max(absX, absZ) * 0.03));
         int diffXZ = x - z;
         int sumXZ  = x + z;
-        if (Math.abs(diffXZ) < 50 && absX > 100 && absZ > 100) {
-            float conf = 1f - (Math.abs(diffXZ) / 50f);
+        if (Math.abs(diffXZ) < diagTolerance && absX > 100 && absZ > 100) {
+            float conf = Math.max(0.2f, 1f - (Math.abs(diffXZ) / (float) diagTolerance));
             if (x > 0 && z > 0)
                 result.add(new GeometryCandidate(HighwayCandidate.Axis.DIAG_PX_PZ, conf));
             else if (x < 0 && z < 0)
                 result.add(new GeometryCandidate(HighwayCandidate.Axis.DIAG_MX_MZ, conf));
         }
-        if (Math.abs(sumXZ) < 50 && absX > 100 && absZ > 100) {
-            float conf = 1f - (Math.abs(sumXZ) / 50f);
+        if (Math.abs(sumXZ) < diagTolerance && absX > 100 && absZ > 100) {
+            float conf = Math.max(0.2f, 1f - (Math.abs(sumXZ) / (float) diagTolerance));
             if (x > 0 && z < 0)
                 result.add(new GeometryCandidate(HighwayCandidate.Axis.DIAG_PX_MZ, conf));
             else if (x < 0 && z > 0)

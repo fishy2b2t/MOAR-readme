@@ -3,6 +3,7 @@ package dev.moar.travel;
 import dev.moar.travel.bounce.BounceController;
 import dev.moar.travel.bridge.TravelBaritoneBridge;
 import dev.moar.travel.detour.DetourPlanner;
+import dev.moar.travel.elytra.ElytraManager;
 import dev.moar.travel.flight.FlightController;
 import dev.moar.travel.highway.HighwayVerifier;
 import dev.moar.travel.highway.IntegrityReport;
@@ -42,14 +43,25 @@ public final class TravelManager {
     private final FlightController     flight   = FlightController.get();
     private final HighwayPlanner       planner  = new HighwayPlanner();
     private final HighwayVerifier      verifier = HighwayVerifier.get();
+    private final ElytraManager        elytra   = new ElytraManager();
 
     private int currentLegIndex = -1;
 
     /**
      * Saved bounce leg re-entry point after a detour completes.
-     * Set when entering VERIFYING_DETOUR; cleared on detour completion or abort.
+     * Set when entering VERIFYING_DETOUR or wall bypass; cleared on
+     * detour completion or abort.
      */
     private BlockPos detourResumeExit;
+
+    /**
+     * SETTLE phase countdown (ticks). When non-zero we are in SETTLE,
+     * holding the travel yaw before resuming bounce.
+     */
+    private int  settleTicks  = 0;
+    /** Travel direction preserved through the SETTLE phase. */
+    private int  settleYawDx  = 0;
+    private int  settleYawDz  = 0;
 
     private TravelManager() {}
 
@@ -73,6 +85,7 @@ public final class TravelManager {
 
     public synchronized void stop() {
         if (state.phase == TravelPhase.IDLE) return;
+        elytra.stop();
         state.abortReason = "user stop";
         transition(TravelPhase.ABORTED, "user stop");
     }
@@ -90,10 +103,26 @@ public final class TravelManager {
     }
 
     public synchronized void resume() {
-        if (state.phase != TravelPhase.PAUSED) return;
-        TravelPhase target = state.pausedFromPhase != null ? state.pausedFromPhase : TravelPhase.PLANNING;
-        transition(target, "user resume");
+        if (state.phase == TravelPhase.PAUSED) {
+            TravelPhase target = state.pausedFromPhase != null ? state.pausedFromPhase : TravelPhase.PLANNING;
+            transition(target, "user resume");
+            return;
+        }
+        // Re-plan to last destination after stop.
+        if (state.phase == TravelPhase.IDLE && state.mission != null) {
+            TravelMission m = state.mission;
+            state.reset();
+            verifier.clear();
+            state.mission = m;
+            currentLegIndex = -1;
+            detourResumeExit = null;
+            transition(TravelPhase.PLANNING, "user resume");
+        }
     }
+
+    /** Register the ender chest position used by ElytraManager when resupplying via EC. */
+    public synchronized void setEnderChestPos(BlockPos pos) { elytra.setEnderChestPos(pos); }
+    public synchronized BlockPos getEnderChestPos()         { return elytra.getEnderChestPos(); }
 
     public synchronized TravelTelemetry snapshot() {
         if (state.mission == null) return TravelTelemetry.idle();
@@ -121,6 +150,17 @@ public final class TravelManager {
     // Tick
     // ──────────────────────────────────────────────────────────────
 
+    /** Pre-physics tick — delegates to BounceController before tickMovement() runs. */
+    public synchronized void preTick(Object client) {
+        if (state.phase == TravelPhase.BOUNCING) {
+            bounce.preTick();
+        } else if (state.phase == TravelPhase.SETTLE) {
+            // Hold the travel yaw during the grace window so the player
+            // faces correctly when the bounce loop restarts.
+            setPlayerYaw(yawForDir(settleYawDx, settleYawDz));
+        }
+    }
+
     public synchronized void tick(Object client) {
         if (state.phase == TravelPhase.IDLE) return;
 
@@ -135,11 +175,13 @@ public final class TravelManager {
             case APPROACH_ONRAMP        -> tickApproach();
             case BOUNCING               -> tickBouncing();
             case MINING_TO_FREENETHER   -> tickMining();
+            case ELYTRA_RESUPPLY        -> tickElytraResupply();
             case OFFRAMP_HANDOFF        -> tickOffRampHandoff();
             case ARRIVED, ABORTED       -> tickTerminal();
             case PAUSED                 -> { /* no-op */ }
             case VERIFYING_DETOUR       -> tickVerifyingDetour();
             case DETOURING              -> tickDetouring();
+            case SETTLE                 -> tickSettle();
             case LAUNCH                 -> tickLaunch();
             case ELYTRA_CRUISE          -> tickElytraCruise();
             case ELYTRA_FALLBACK        -> tickElytraFallback();
@@ -195,6 +237,17 @@ public final class TravelManager {
     }
 
     private void tickBouncing() {
+        // ── Elytra durability check ───────────────────────────────────
+        /*? if >=26.1 {*//*
+        Minecraft mc = Minecraft.getInstance();
+        *//*?} else {*/
+        MinecraftClient mc = MinecraftClient.getInstance();
+        /*?}*/
+        if (mc.player != null && ElytraManager.needsResupply(mc)) {
+            startElytraResupply();
+            return;
+        }
+
         // ── Grief check: interrupt and plan detour ────────────────
         IntegrityReport rep = verifier.lastReport();
         if (rep.status() == IntegrityReport.Status.GRIEFED
@@ -217,8 +270,57 @@ public final class TravelManager {
             transition(TravelPhase.VERIFYING_DETOUR, "grief detected: " + rep);
             return;
         }
+        // ── Wall / obstacle ahead: short forward bypass ───────────
+        if (bounce.isWallAhead()) {
+            LOGGER.warn("[Travel] wall/obstacle ahead during bounce, triggering bypass");
+            if (state.mission == null || !state.mission.allowDetour) {
+                abort("wall ahead and detours disabled");
+                return;
+            }
+            triggerWallBypass();
+            return;
+        }
         if (bounce.isArrived()) { advanceLeg("bounce arrived"); return; }
         if (bounce.isStuck())   { abort("bounce stuck"); }
+    }
+
+    /**
+     * Drive ElytraManager each tick; resume bounce on completion or abort on failure.
+     */
+    private void tickElytraResupply() {
+        elytra.tick();
+        if (elytra.isDone()) {
+            LOGGER.info("[Travel] elytra resupply done, resuming bounce");
+            verifier.resetLastReport();
+            if (detourResumeExit != null && state.route != null) {
+                acquireOwner(MovementOwner.BOUNCE);
+                bounce.start(state.route.primary, detourResumeExit,
+                        state.route.travelDx, state.route.travelDz);
+                detourResumeExit = null;
+                transition(TravelPhase.BOUNCING, "elytra resupply complete, resuming bounce");
+            } else {
+                advanceLeg("elytra resupply complete");
+            }
+        } else if (elytra.isFailed()) {
+            abort("elytra resupply failed — no viable traveling materials");
+        }
+    }
+
+    /** Begin elytra resupply: stop bounce, save resume target, launch ElytraManager. */
+    private void startElytraResupply() {
+        LOGGER.warn("[Travel] elytra low/broken — entering ELYTRA_RESUPPLY");
+        if (detourResumeExit == null && state.route != null) {
+            for (HighwayRoute.Leg leg : state.route.legs) {
+                if (leg instanceof HighwayRoute.BounceLeg bl) {
+                    detourResumeExit = bl.exitColumn();
+                    break;
+                }
+            }
+        }
+        releaseOwner(state.owner);
+        state.owner = MovementOwner.NONE;
+        elytra.start();
+        transition(TravelPhase.ELYTRA_RESUPPLY, "elytra durability critical");
     }
 
     /**
@@ -249,13 +351,14 @@ public final class TravelManager {
      */
     private void tickDetouring() {
         if (bridge.isArrived()) {
-            LOGGER.info("[Travel] detour complete, resuming bounce to {}", detourResumeExit);
+            LOGGER.info("[Travel] detour/bypass complete, settling before bounce resume");
             if (detourResumeExit != null && state.route != null) {
-                acquireOwner(MovementOwner.BOUNCE);
-                bounce.start(state.route.primary, detourResumeExit,
-                        state.route.travelDx, state.route.travelDz);
-                detourResumeExit = null;
-                transition(TravelPhase.BOUNCING, "detour complete, resuming bounce");
+                settleYawDx = state.route.travelDx;
+                settleYawDz = state.route.travelDz;
+                settleTicks = 10;   // 10-tick grace window before bounce resumes
+                releaseOwner(state.owner);
+                state.owner = MovementOwner.NONE;
+                transition(TravelPhase.SETTLE, "detour complete, entering settle");
             } else {
                 detourResumeExit = null;
                 advanceLeg("detour complete (no resume exit)");
@@ -263,6 +366,28 @@ public final class TravelManager {
             return;
         }
         if (bridge.isStuck()) { abort("detour stuck"); }
+    }
+
+    /** 10-tick yaw-hold after detour/bypass before resuming the bounce. */
+    private void tickSettle() {
+        // Yaw is held in preTick(); nothing else to do except count down.
+        settleTicks--;
+        if (settleTicks <= 0) {
+            settleTicks = 0;
+            if (detourResumeExit != null && state.route != null) {
+                LOGGER.info("[Travel] SETTLE done, resuming bounce to {}", detourResumeExit);
+                // Clear stale report without re-arming the scan timer.
+                verifier.resetLastReport();
+                acquireOwner(MovementOwner.BOUNCE);
+                bounce.start(state.route.primary, detourResumeExit,
+                        state.route.travelDx, state.route.travelDz);
+                detourResumeExit = null;
+                transition(TravelPhase.BOUNCING, "settle complete, resuming bounce");
+            } else {
+                detourResumeExit = null;
+                advanceLeg("settle complete (no resume exit)");
+            }
+        }
     }
 
     private void tickMining() {
@@ -286,7 +411,10 @@ public final class TravelManager {
             TravelPhase from = state.phase;
             releaseOwner(state.owner);
             verifier.clear();
+            // Keep mission so resume() can restart after stop.
+            TravelMission lastMission = state.mission;
             state.reset();
+            state.mission = lastMission;
             currentLegIndex = -1;
             detourResumeExit = null;
             TravelLog.get().recordTransition(0, 0, from, TravelPhase.IDLE, "terminal cleanup");
@@ -407,6 +535,33 @@ public final class TravelManager {
         transition(phase, reason + " -> walk to " + target.toShortString());
     }
 
+    /** Walk WALL_BYPASS_DISTANCE forward past the obstacle, then SETTLE back into bounce. */
+    private static final int WALL_BYPASS_DISTANCE = 12;
+    private void triggerWallBypass() {
+        BlockPos pos = currentPlayerPos();
+        if (pos == null || state.route == null) {
+            abort("no player pos for wall bypass");
+            return;
+        }
+        // Capture the bounce leg exit if not already set.
+        if (detourResumeExit == null) {
+            for (HighwayRoute.Leg leg : state.route.legs) {
+                if (leg instanceof HighwayRoute.BounceLeg bl) {
+                    detourResumeExit = bl.exitColumn();
+                    break;
+                }
+            }
+        }
+        BlockPos goal = new BlockPos(
+                pos.getX() + state.route.travelDx * WALL_BYPASS_DISTANCE,
+                pos.getY(),
+                pos.getZ() + state.route.travelDz * WALL_BYPASS_DISTANCE);
+        releaseOwner(state.owner);
+        acquireOwner(MovementOwner.BARITONE);
+        bridge.walkNear(goal, 2);
+        transition(TravelPhase.DETOURING, "wall bypass: goal=" + goal.toShortString());
+    }
+
     private void abort(String reason) {
         state.abortReason = reason;
         transition(TravelPhase.ABORTED, reason);
@@ -464,6 +619,22 @@ public final class TravelManager {
         MinecraftClient mc = MinecraftClient.getInstance();
         if (mc.player == null) return null;
         return mc.player.getBlockPos();
+        /*?}*/
+    }
+
+    /** MC yaw (degrees) for a travel direction vector. */
+    private static float yawForDir(int dx, int dz) {
+        return (float) Math.toDegrees(Math.atan2(-dx, dz));
+    }
+
+    /** Set the player's view yaw — Stonecutter-safe. */
+    private static void setPlayerYaw(float yaw) {
+        /*? if >=26.1 {*//*
+        Minecraft mc = Minecraft.getInstance();
+        if (mc.player != null) mc.player.setYRot(yaw);
+        *//*?} else {*/
+        MinecraftClient mc = MinecraftClient.getInstance();
+        if (mc.player != null) mc.player.setYaw(yaw);
         /*?}*/
     }
 }

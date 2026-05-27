@@ -26,7 +26,7 @@ public final class HighwayDetectorBridge {
     private HighwayDetectorBridge() {}
 
     // ── ScanResult ───────────────────────────────────────────────
-    public record ScanResult(int floorY, int width,
+    public record ScanResult(int floorY, int width, int centerX, int centerZ,
                               int leftRailOffset, int rightRailOffset,
                               boolean hasLeftRail, boolean hasRightRail,
                               float blockConfidence) {}
@@ -35,6 +35,21 @@ public final class HighwayDetectorBridge {
     public enum CellStatus { OK, GRIEFED, UNLOADED }
 
     // ── Public API ───────────────────────────────────────────────
+    /**
+     * Floor-presence check used by the integrity verifier.
+     * Deliberately does NOT check clearance above — nether rack can generate
+     * at Y+1 above a clean highway floor and must not trigger false griefs.
+     */
+    public CellStatus checkFloorOnly(int bx, int floorY, int bz) {
+        BlockPos pos = new BlockPos(bx, floorY, bz);
+        if (!isChunkLoaded(pos)) return CellStatus.UNLOADED;
+        if (isHighwayBlock(bx, floorY,     bz)) return CellStatus.OK;
+        // Highway floor may step ±1 block in height at section joints; treat as intact.
+        if (isHighwayBlock(bx, floorY + 1, bz)) return CellStatus.OK;
+        if (isHighwayBlock(bx, floorY - 1, bz)) return CellStatus.OK;
+        return CellStatus.GRIEFED;
+    }
+
     /** Try to confirm a highway near the player's current Y. */
     public Optional<ScanResult> scanAt(BlockPos playerPos, HighwayCandidate.Axis axis) {
         for (int yOff = -1; yOff <= 1; yOff++) {
@@ -121,10 +136,22 @@ public final class HighwayDetectorBridge {
         int width = medianLeft + 1 + medianRight;
         if (width < 2 || width > 7) return null;
 
+        // Shift the anchor to the geometric midpoint of the highway floor.
+        // The initial centerX/Z is wherever the player happened to snap — it is
+        // NOT necessarily the true center. For example, if the player snapped to
+        // the guardrail edge, medianLeft=0 and medianRight=width-1, so the anchor
+        // is completely off-center. Correcting this before returning the ScanResult
+        // is what makes the planner path to the highway center instead of the rail.
+        int centerAdjust = (medianRight - medianLeft) / 2;
+        centerX += perpDx * centerAdjust;
+        centerZ += perpDz * centerAdjust;
+        int adjLeft  = medianLeft  + centerAdjust;
+        int adjRight = medianRight - centerAdjust;
+
         boolean leftRail  = hasGuardrail(
-                centerX - perpDx * (medianLeft  + 1), floorY, centerZ - perpDz * (medianLeft  + 1));
+                centerX - perpDx * (adjLeft  + 1), floorY, centerZ - perpDz * (adjLeft  + 1));
         boolean rightRail = hasGuardrail(
-                centerX + perpDx * (medianRight + 1), floorY, centerZ + perpDz * (medianRight + 1));
+                centerX + perpDx * (adjRight + 1), floorY, centerZ + perpDz * (adjRight + 1));
 
         float linearity = validSamples / (float)(SCAN_RANGE * 2 + 1);
         float conf = 0f;
@@ -136,8 +163,8 @@ public final class HighwayDetectorBridge {
         conf = Math.min(1f, conf);
         if (conf < 0.3f) return null;
 
-        return new ScanResult(floorY, width,
-                -(medianLeft + 1), medianRight + 1,
+        return new ScanResult(floorY, width, centerX, centerZ,
+                -(adjLeft + 1), adjRight + 1,
                 leftRail, rightRail, conf);
     }
 

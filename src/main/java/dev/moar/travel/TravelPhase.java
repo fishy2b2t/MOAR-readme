@@ -14,10 +14,15 @@ public enum TravelPhase {
     VERIFYING_DETOUR,
     /** Reserved for milestone 4. Baritone bridges around a griefed section. */
     DETOURING,
+    /** 10-tick grace period after a detour/bypass arrival. Yaw is held;
+     *  bounce mechanics are dormant to avoid immediately re-slamming the obstacle. */
+    SETTLE,
     /** Transitional. Releases bounce ownership and hands off to Baritone. */
     OFFRAMP_HANDOFF,
     /** Baritone walks/mines from the off-ramp to a free-nether takeoff point. */
     MINING_TO_FREENETHER,
+    /** ElytraManager is running the resupply playbook (equip spare, mend, or EC). */
+    ELYTRA_RESUPPLY,
     /** Reserved for milestone 5a. Equip, jump, START_FALL_FLYING, initial boost. */
     LAUNCH,
     /** Reserved for milestone 5a. Baritone elytra owns movement. */

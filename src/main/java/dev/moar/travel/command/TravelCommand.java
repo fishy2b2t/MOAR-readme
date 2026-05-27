@@ -2,6 +2,7 @@ package dev.moar.travel.command;
 
 import com.mojang.brigadier.arguments.IntegerArgumentType;
 
+import dev.moar.MoarMod;
 import dev.moar.travel.TravelManager;
 import dev.moar.travel.TravelMission;
 import dev.moar.travel.telemetry.TravelLog;
@@ -49,12 +50,36 @@ public final class TravelCommand {
                                     .then(ClientCommands.argument("z", IntegerArgumentType.integer())
                                             .executes(ctx -> doGoto(
                                                     IntegerArgumentType.getInteger(ctx, "x"),
-                                                    IntegerArgumentType.getInteger(ctx, "z"))))))
+                                                    IntegerArgumentType.getInteger(ctx, "z")))
+                                            .then(ClientCommands.literal("overworld")
+                                                    .executes(ctx -> doGoto(
+                                                            IntegerArgumentType.getInteger(ctx, "x"),
+                                                            IntegerArgumentType.getInteger(ctx, "z"),
+                                                            true)))
+                                            .then(ClientCommands.literal("nether")
+                                                    .executes(ctx -> doGoto(
+                                                            IntegerArgumentType.getInteger(ctx, "x"),
+                                                            IntegerArgumentType.getInteger(ctx, "z"),
+                                                            false))))))
+                    .then(ClientCommands.literal("bounce").executes(ctx -> doBounce()))
                     .then(ClientCommands.literal("stop").executes(ctx -> doStop()))
                     .then(ClientCommands.literal("pause").executes(ctx -> doPause()))
                     .then(ClientCommands.literal("resume").executes(ctx -> doResume()))
                     .then(ClientCommands.literal("status").executes(ctx -> doStatus()))
-                    .then(ClientCommands.literal("log").executes(ctx -> doLog())));
+                    .then(ClientCommands.literal("log").executes(ctx -> doLog()))
+                    .then(ClientCommands.literal("enderchest")
+                            .then(ClientCommands.argument("x", IntegerArgumentType.integer())
+                                    .then(ClientCommands.argument("y", IntegerArgumentType.integer())
+                                            .then(ClientCommands.argument("z", IntegerArgumentType.integer())
+                                                    .executes(ctx -> doEnderChest(
+                                                            IntegerArgumentType.getInteger(ctx, "x"),
+                                                            IntegerArgumentType.getInteger(ctx, "y"),
+                                                            IntegerArgumentType.getInteger(ctx, "z")))))))
+                    .then(ClientCommands.literal("elytra")
+                            .then(ClientCommands.literal("resupply-count")
+                                    .then(ClientCommands.argument("count", IntegerArgumentType.integer(1, 27))
+                                            .executes(ctx -> doElytraResupplyCount(
+                                                    IntegerArgumentType.getInteger(ctx, "count")))))));
             *//*?} else {*/
             var root = ClientCommandManager.literal("moar").then(ClientCommandManager.literal("travel")
                     .then(ClientCommandManager.literal("goto")
@@ -62,30 +87,109 @@ public final class TravelCommand {
                                     .then(ClientCommandManager.argument("z", IntegerArgumentType.integer())
                                             .executes(ctx -> doGoto(
                                                     IntegerArgumentType.getInteger(ctx, "x"),
-                                                    IntegerArgumentType.getInteger(ctx, "z"))))))
+                                                    IntegerArgumentType.getInteger(ctx, "z")))
+                                            .then(ClientCommandManager.literal("overworld")
+                                                    .executes(ctx -> doGoto(
+                                                            IntegerArgumentType.getInteger(ctx, "x"),
+                                                            IntegerArgumentType.getInteger(ctx, "z"),
+                                                            true)))
+                                            .then(ClientCommandManager.literal("nether")
+                                                    .executes(ctx -> doGoto(
+                                                            IntegerArgumentType.getInteger(ctx, "x"),
+                                                            IntegerArgumentType.getInteger(ctx, "z"),
+                                                            false))))))
+                    .then(ClientCommandManager.literal("bounce").executes(ctx -> doBounce()))
                     .then(ClientCommandManager.literal("stop").executes(ctx -> doStop()))
                     .then(ClientCommandManager.literal("pause").executes(ctx -> doPause()))
                     .then(ClientCommandManager.literal("resume").executes(ctx -> doResume()))
                     .then(ClientCommandManager.literal("status").executes(ctx -> doStatus()))
-                    .then(ClientCommandManager.literal("log").executes(ctx -> doLog())));
+                    .then(ClientCommandManager.literal("log").executes(ctx -> doLog()))
+                    .then(ClientCommandManager.literal("enderchest")
+                            .then(ClientCommandManager.argument("x", IntegerArgumentType.integer())
+                                    .then(ClientCommandManager.argument("y", IntegerArgumentType.integer())
+                                            .then(ClientCommandManager.argument("z", IntegerArgumentType.integer())
+                                                    .executes(ctx -> doEnderChest(
+                                                            IntegerArgumentType.getInteger(ctx, "x"),
+                                                            IntegerArgumentType.getInteger(ctx, "y"),
+                                                            IntegerArgumentType.getInteger(ctx, "z")))))))
+                    .then(ClientCommandManager.literal("elytra")
+                            .then(ClientCommandManager.literal("resupply-count")
+                                    .then(ClientCommandManager.argument("count", IntegerArgumentType.integer(1, 27))
+                                            .executes(ctx -> doElytraResupplyCount(
+                                                    IntegerArgumentType.getInteger(ctx, "count")))))));
             /*?}*/
             dispatcher.register(root);
             LOGGER.info("TravelCommand: /moar travel registered");
         });
     }
 
+    private static int doElytraResupplyCount(int count) {
+        MoarMod.getProperties().setElytraResupplyCount(count);
+        chat("\u00a7a[Travel] elytra resupply count set to \u00a7f" + count
+                + "\u00a7a. Will grab \u00a7f" + count + "\u00a7a elytra(s) per shulker trip.");
+        return 1;
+    }
+
     private static int doGoto(int x, int z) {
+        return doGoto(x, z, false);
+    }
+
+    /** Snaps yaw to nearest 45° axis, sets dest 500k ahead, then plans and bounces. */
+    private static int doBounce() {
+        BlockPos origin = playerPos();
+        if (origin == null) { chat("§c[Travel] no player"); return 0; }
+
+        float yaw = playerYaw();
+        // Snap to nearest 45° increment then derive integer step direction.
+        float snapped  = Math.round(yaw / 45f) * 45f;
+        double rad     = Math.toRadians(snapped);
+        int dx = (int) Math.round(-Math.sin(rad));
+        int dz = (int) Math.round( Math.cos(rad));
+        if (dx == 0 && dz == 0) dz = 1;  // degenerate guard — shouldn’t happen
+
+        BlockPos dest = new BlockPos(
+                origin.getX() + dx * 500_000,
+                origin.getY(),
+                origin.getZ() + dz * 500_000);
+        TravelMission m = TravelMission.to(dest).build();
+        boolean ok = TravelManager.get().start(m);
+        if (ok) {
+            chat("§a[Travel] bounce started → axis (" + dx + "," + dz
+                    + "), dest=" + dest.toShortString());
+        } else {
+            chat("§c[Travel] rejected — already running");
+        }
+        return ok ? 1 : 0;
+    }
+
+    private static int doGoto(int x, int z, boolean overworldCoords) {
         BlockPos origin = playerPos();
         if (origin == null) {
             chat("§c[Travel] no player");
             return 0;
         }
-        BlockPos dest = new BlockPos(x, origin.getY(), z);
+        int nx = overworldCoords ? x / 8 : x;
+        int nz = overworldCoords ? z / 8 : z;
+        BlockPos dest = new BlockPos(nx, origin.getY(), nz);
         TravelMission m = TravelMission.to(dest).build();
         boolean ok = TravelManager.get().start(m);
-        chat(ok ? "§a[Travel] started → " + dest.toShortString()
-                : "§c[Travel] rejected — already running");
+        if (ok) {
+            String note = overworldCoords
+                    ? " §7(overworld→nether: " + x + "," + z + " → " + nx + "," + nz + ")"
+                    : "";
+            chat("§a[Travel] started → " + dest.toShortString() + note);
+        } else {
+            chat("§c[Travel] rejected — already running");
+        }
         return ok ? 1 : 0;
+    }
+
+    private static int doEnderChest(int x, int y, int z) {
+        BlockPos pos = new BlockPos(x, y, z);
+        TravelManager.get().setEnderChestPos(pos);
+        chat("§a[Travel] ender chest registered at " + pos.toShortString()
+                + " — elytra resupply will use this chest.");
+        return 1;
     }
 
     private static int doStop() {
@@ -155,7 +259,15 @@ public final class TravelCommand {
         return mc.player.getBlockPos();
         /*?}*/
     }
-
+    private static float playerYaw() {
+        /*? if >=26.1 {*//*
+        Minecraft mc = Minecraft.getInstance();
+        return mc.player != null ? mc.player.getYRot() : 0f;
+        *//*?} else {*/
+        MinecraftClient mc = MinecraftClient.getInstance();
+        return mc.player != null ? mc.player.getYaw() : 0f;
+        /*?}*/
+    }
     private static void chat(String msg) {
         /*? if >=26.1 {*//*
         Minecraft mc = Minecraft.getInstance();

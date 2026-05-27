@@ -20,8 +20,7 @@ public final class HighwayCandidate {
 
     // ── Axis ──────────────────────────────────────────────────────
     /**
-     * Named to match anarchy-client (DIAG_PX_PZ, etc.) so diffs stay
-     * readable. Carries its own perpendicular-direction and yaw math.
+     * Carries its own perpendicular-direction and yaw math.
      */
     public enum Axis {
         PLUS_X(false, +1,  0),
@@ -54,7 +53,7 @@ public final class HighwayCandidate {
 
         /**
          * Expected yaw (degrees, MC convention: 0=South +Z, 90=West -X,
-         * 180=North -Z, 270=East +X). Mirrors anarchy-client verbatim.
+         * 180=North -Z, 270=East +X).
          */
         public float expectedYaw() {
             return switch (this) {

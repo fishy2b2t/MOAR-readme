@@ -64,13 +64,16 @@ public final class HighwayPlanner {
         BlockPos onRamp     = new BlockPos(onRampXZ[0], floorY, onRampXZ[1]);
         BlockPos exitColumn = new BlockPos(exitXZ[0],   floorY, exitXZ[1]);
 
-        // ── 4. Optional: refine floorY via live block scan at origin ──
+        // ── 4. Optional: refine floorY and center via live block scan at origin ──
         Optional<HighwayDetectorBridge.ScanResult> scan =
                 HighwayDetectorBridge.get().scanAt(new BlockPos(ox, floorY, oz), best.axis);
         if (scan.isPresent()) {
-            floorY      = scan.get().floorY();
-            onRamp      = new BlockPos(onRampXZ[0], floorY, onRampXZ[1]);
-            exitColumn  = new BlockPos(exitXZ[0],   floorY, exitXZ[1]);
+            floorY = scan.get().floorY();
+            // Use the block-confirmed center rather than the mathematical projection.
+            // For diagonal highways this is critical: even 2-3 blocks off-center
+            // causes reduced speeds and edge-fall risk during the bounce.
+            onRamp     = new BlockPos(scan.get().centerX(), floorY, scan.get().centerZ());
+            exitColumn = new BlockPos(exitXZ[0], floorY, exitXZ[1]);
         }
 
         HighwayCandidate primary = new HighwayCandidate(
@@ -84,12 +87,15 @@ public final class HighwayPlanner {
 
         // ── 5. Build legs ─────────────────────────────────────────
         List<HighwayRoute.Leg> legs = new ArrayList<>();
-        double originToOnRamp  = HighwayGeometry.horizontalDistance(ox, oz, onRampXZ[0], onRampXZ[1]);
+        // Recompute from the (possibly scan-refined) onRamp so the distance is accurate.
+        double originToOnRamp  = HighwayGeometry.horizontalDistance(ox, oz, onRamp.getX(), onRamp.getZ());
         double bounceLength    = HighwayGeometry.horizontalDistance(onRampXZ[0], onRampXZ[1], exitXZ[0], exitXZ[1]);
         double exitToDest      = HighwayGeometry.horizontalDistance(exitXZ[0], exitXZ[1], dx, dz);
 
-        // Only add approach leg when we are meaningfully off the highway
-        if (originToOnRamp > 10) {
+        // Always center-snap for diagonal highways (scan or mathematical), lower threshold.
+        // For cardinal highways keep the original 10-block guard.
+        double approachThreshold = best.axis.diagonal ? 3.0 : 10.0;
+        if (originToOnRamp > approachThreshold) {
             legs.add(new HighwayRoute.ApproachLeg(onRamp));
         }
         legs.add(new HighwayRoute.BounceLeg(primary, exitColumn, travelDir[0], travelDir[1]));
@@ -118,6 +124,22 @@ public final class HighwayPlanner {
     private static HighwayGeometry.GeometryCandidate fallbackAxis(int ox, int oz, int dx, int dz) {
         int absDx = Math.abs(dx - ox);
         int absDz = Math.abs(dz - oz);
+        // When both deltas are substantial and within 30 % of each other,
+        // a diagonal highway is almost always the better choice than a
+        // cardinal that would require a 500 k-block perpendicular detour.
+        if (absDx > 1000 && absDz > 1000) {
+            int smaller = Math.min(absDx, absDz);
+            int larger  = Math.max(absDx, absDz);
+            if (smaller > larger * 0.7f) {
+                boolean px = (dx - ox) >= 0;
+                boolean pz = (dz - oz) >= 0;
+                HighwayCandidate.Axis diag = px && pz  ? HighwayCandidate.Axis.DIAG_PX_PZ
+                        : (!px && !pz)                 ? HighwayCandidate.Axis.DIAG_MX_MZ
+                        : px                           ? HighwayCandidate.Axis.DIAG_PX_MZ
+                        :                                HighwayCandidate.Axis.DIAG_MX_PZ;
+                return new HighwayGeometry.GeometryCandidate(diag, 0.05f);
+            }
+        }
         HighwayCandidate.Axis axis = absDx >= absDz
                 ? (dx >= ox ? HighwayCandidate.Axis.PLUS_X : HighwayCandidate.Axis.MINUS_X)
                 : (dz >= oz ? HighwayCandidate.Axis.PLUS_Z : HighwayCandidate.Axis.MINUS_Z);

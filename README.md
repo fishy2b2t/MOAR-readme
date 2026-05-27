@@ -321,6 +321,12 @@ Output: `versions/<mc>/build/libs/moar-2.2.0+<mc>.jar`
 
 Baritone is loaded via reflection at runtime : no compile dependency, nothing bundled. If Baritone isn't installed, the mod uses its built-in vanilla walker instead. On Baritone-enabled installs, MOAR also protects storage and other interactive blocks from path-mining during sensitive automation flows.
 
+## Disclaimer
+
+MOAR is provided as-is, without warranty of any kind, under the terms of the GNU Affero General Public License v3.
+
+Users are solely responsible for ensuring that their use of MOAR complies with the rules, policies, and terms of any server or service they connect to. The maintainers are not responsible for bans, penalties, account actions, server rule violations, or other consequences resulting from use of this software.
+
 ## License
 
 [GNU Affero General Public License v3.0](LICENSE)

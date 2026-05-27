@@ -16,16 +16,13 @@ import java.util.List;
 /** Plans a short side-step detour around a griefed highway section. */
 public final class DetourPlanner {
 
-    /** Perpendicular offset in blocks — enough to clear an 8-wide griefed section. */
-    public static int SIDE_OFFSET = 12;
+    /** Perpendicular offset in blocks — one lane-width inside the tunnel wall. */
+    public static int SIDE_OFFSET = 2;
 
     /** Extra blocks past the grief end before returning to the highway. */
     public static int CLEAR_MARGIN = 8;
 
-    /**
-     * Minimum confidence in the integrity report required before trusting the
-     * grief offsets.  Below this threshold we return an empty list (caller aborts).
-     */
+    /** Minimum report confidence to trust grief offsets; returns empty list below threshold. */
     public static float MIN_CONFIDENCE = 0.4f;
 
     private DetourPlanner() {}
@@ -52,6 +49,15 @@ public final class DetourPlanner {
 
         int px = playerPos.getX();
         int pz = playerPos.getZ();
+
+        // Snap player position to highway center line before computing waypoints.
+        // Prevents WP1 landing in the guardrail when the player has drifted off-center.
+        int ex     = highway.entry.getX();
+        int ez     = highway.entry.getZ();
+        int perpSq = perpDx * perpDx + perpDz * perpDz; // 1 for cardinal, 2 for diagonal
+        int dp     = (px - ex) * perpDx + (pz - ez) * perpDz;
+        px -= perpDx * dp / perpSq;
+        pz -= perpDz * dp / perpSq;
 
         // How far along the axis to travel to clear the grief region
         int clearDepth = report.griefEndOffset() + CLEAR_MARGIN;

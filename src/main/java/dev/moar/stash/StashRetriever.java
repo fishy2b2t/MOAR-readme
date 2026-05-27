@@ -159,7 +159,6 @@ public final class StashRetriever {
     private static final int SHULKER_SWAP_SETTLE    = 6;  // ticks after hotbar SWAP before looking at target
     private static final int SHULKER_LOOK_SETTLE    = 4;  // ticks of stable rotation before placement packet
     private static final int MAX_SHULKER_OPEN_RETRIES = 3;
-    private static final int SHULKER_PLACE_CALM_TICKS = 18;
     private static final int SHULKER_PLACE_RECENT_WINDOW = 24;
     private static final int SHULKER_PLACE_STATIONARY_TICKS = 5;
     private int shulkerPhase;
@@ -860,7 +859,6 @@ public final class StashRetriever {
     /** Placement-safe means long enough calm plus no recent correction burst. */
     private boolean isPlacementWindowSafe() {
         SetbackMonitor monitor = SetbackMonitor.get();
-        if (monitor.ticksSinceSetback() < SHULKER_PLACE_CALM_TICKS) return false;
         if (monitor.recentSetbackCount(SHULKER_PLACE_RECENT_WINDOW) > 0) return false;
         return monitor.isStationaryFor(SHULKER_PLACE_STATIONARY_TICKS);
     }

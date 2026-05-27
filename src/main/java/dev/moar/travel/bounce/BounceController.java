@@ -6,12 +6,19 @@ import dev.moar.travel.plan.HighwayCandidate;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.Options;
 import net.minecraft.core.BlockPos;
+import net.minecraft.network.protocol.game.ServerboundPlayerCommandPacket;
 import net.minecraft.util.Mth;
 *//*?} else {*/
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.option.GameOptions;
+import net.minecraft.network.packet.c2s.play.ClientCommandC2SPacket;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.MathHelper;
+/*?}*/
+/*? if >=26.1 {*//*
+import net.minecraft.world.level.block.Blocks;
+*//*?} else {*/
+import net.minecraft.block.Blocks;
 /*?}*/
 
 import org.slf4j.Logger;
@@ -35,6 +42,10 @@ public final class BounceController {
     private boolean active;
     private boolean arrived;
     private boolean stuck;
+    /** True when a solid block is detected 2-6 blocks ahead at highway Y,
+     *  or when the player bumps a wall (horizontalCollision). Cleared each
+     *  tick; TravelManager checks this flag to trigger a wall bypass. */
+    private boolean wallAhead;
     private int     ticksActive;
 
     // Stuck detection — track XZ progress in periodic windows
@@ -57,6 +68,7 @@ public final class BounceController {
         active         = true;
         arrived        = false;
         stuck          = false;
+        wallAhead      = false;
         ticksActive    = 0;
         noProgressTicks = 0;
         progressSeeded  = false;
@@ -69,10 +81,13 @@ public final class BounceController {
         LOGGER.debug("[Bounce] stopped");
     }
 
-    public boolean isActive()  { return active; }
-    public boolean isArrived() { return arrived; }
-    public boolean isStuck()   { return stuck; }
-    public int     ticksActive(){ return ticksActive; }
+    public boolean isActive()    { return active; }
+    public boolean isArrived()   { return arrived; }
+    public boolean isStuck()     { return stuck; }
+    /** True if a wall or solid obstacle was detected ahead this tick.
+     *  TravelManager uses this to trigger a bypass without aborting. */
+    public boolean isWallAhead() { return wallAhead; }
+    public int     ticksActive() { return ticksActive; }
 
     // ──────────────────────────────────────────────────────────────
     // Tick — called by TravelManager via driveOwner() when BOUNCE owns
@@ -111,6 +126,13 @@ public final class BounceController {
             return;
         }
 
+        // ── Wall / obstruction detection ─────────────────────────
+        // Check horizontalCollision and scan 2-6 blocks ahead at
+        // player-body height.  TravelManager reads isWallAhead() to
+        // trigger a bypass walk rather than a hard abort.
+        wallAhead = detectWallOrCollision(mc);
+        if (wallAhead) return; // skip stuck-detection this tick
+
         // ── Exit check ───────────────────────────────────────────
         if (hasPassedExit(pos)) {
             LOGGER.info("[Bounce] arrived at exit {}", exitColumn.toShortString());
@@ -141,8 +163,47 @@ public final class BounceController {
             }
         }
 
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // Pre-tick — runs before tickMovement(); applies movement inputs
+    // ──────────────────────────────────────────────────────────────
+
+    /** Apply sprint/jump/pitch/elytra inputs before vanilla physics this tick. */
+    public void preTick() {
+        if (!active) return;
+
+        /*? if >=26.1 {*//*
+        Minecraft mc = Minecraft.getInstance();
+        *//*?} else {*/
+        MinecraftClient mc = MinecraftClient.getInstance();
+        /*?}*/
+        if (mc.player == null) return;
+
         // ── Yaw alignment ────────────────────────────────────────
         float targetYaw = yawForDirection(travelDx, travelDz);
+
+        // ── Perp drift correction ─────────────────────────────────
+        // Blend a small correction toward center into targetYaw to prevent
+        // systematic guardrail drift over thousands of blocks.
+        if (highway != null && highway.entry != null) {
+            int perpDx  = highway.axis.perpDx();
+            int perpDz  = highway.axis.perpDz();
+            int perpSq  = perpDx * perpDx + perpDz * perpDz; // 1 cardinal, 2 diagonal
+            double cpx  = mc.player.getX();
+            double cpz  = mc.player.getZ();
+            double perpOffset = ((cpx - highway.entry.getX() - 0.5) * perpDx
+                               + (cpz - highway.entry.getZ() - 0.5) * perpDz) / perpSq;
+            if (Math.abs(perpOffset) > BounceTuning.PERP_CORRECTION_DEADZONE) {
+                double normPerpX = perpDx / Math.sqrt(perpSq);
+                double normPerpZ = perpDz / Math.sqrt(perpSq);
+                double dirX = -Math.sin(Math.toRadians(targetYaw));
+                double dirZ =  Math.cos(Math.toRadians(targetYaw));
+                dirX -= normPerpX * perpOffset * BounceTuning.PERP_CORRECTION_GAIN;
+                dirZ -= normPerpZ * perpOffset * BounceTuning.PERP_CORRECTION_GAIN;
+                targetYaw = (float) Math.toDegrees(Math.atan2(-dirX, dirZ));
+            }
+        }
 
         /*? if >=26.1 {*//*
         float curYaw  = mc.player.getYRot();
@@ -162,38 +223,23 @@ public final class BounceController {
             /*?}*/
         }
 
-        // ── Keys: hold forward + sprint ──────────────────────────
-        /*? if >=26.1 {*//*
-        Options opts = mc.options;
-        opts.keyUp.setDown(true);
-        opts.keySprint.setDown(true);
-        opts.keyDown.setDown(false);
-        opts.keyLeft.setDown(false);
-        opts.keyRight.setDown(false);
-        *//*?} else {*/
-        GameOptions opts = mc.options;
-        opts.forwardKey.setPressed(true);
-        opts.sprintKey.setPressed(true);
-        opts.backKey.setPressed(false);
-        opts.leftKey.setPressed(false);
-        opts.rightKey.setPressed(false);
-        /*?}*/
-
-        // ── Jump whenever grounded ───────────────────────────────
+        // ── Sprint, jump, pitch, START_FALL_FLYING ────────────────
+        mc.player.setSprinting(true);
         /*? if >=26.1 {*//*
         if (mc.player.onGround()) mc.player.jumpFromGround();
+        mc.player.setXRot(BounceTuning.BOUNCE_PITCH);
         *//*?} else {*/
         if (mc.player.isOnGround()) mc.player.jump();
+        mc.player.setPitch(BounceTuning.BOUNCE_PITCH);
         /*?}*/
+        sendStartFlying();
     }
 
     // ──────────────────────────────────────────────────────────────
     // Internals
     // ──────────────────────────────────────────────────────────────
 
-    /**
-     * Return true once the player reaches the exit along the chosen direction.
-     */
+    // True once the player passes the exit column in the travel direction.
     private boolean hasPassedExit(BlockPos pos) {
         if (exitColumn == null || highway == null) return false;
         long playerProj = (long) pos.getX() * travelDx + (long) pos.getZ() * travelDz;
@@ -203,6 +249,58 @@ public final class BounceController {
 
     private static float yawForDirection(int dx, int dz) {
         return (float) Math.toDegrees(Math.atan2(-dx, dz));
+    }
+
+    // True if a solid block is 2–6 ahead at body height, or horizontalCollision fired.
+    // Uses locked travel yaw so mouse movement doesn't cause false positives.
+    private boolean detectWallOrCollision(
+            /*? if >=26.1 {*//* Minecraft mc *//*?} else {*/ MinecraftClient mc /*?}*/) {
+        if (mc.player == null || highway == null) return false;
+        if (mc.player.horizontalCollision) return true;
+
+        /*? if >=26.1 {*//*
+        if (mc.level == null) return false;
+        *//*?} else {*/
+        if (mc.world == null) return false;
+        /*?}*/
+
+        int hwY   = highway.floorY + 1;  // player feet level
+        float yaw = yawForDirection(travelDx, travelDz);
+        double yawRad = Math.toRadians(yaw);
+        double dirX   = -Math.sin(yawRad);
+        double dirZ   =  Math.cos(yawRad);
+        double px = mc.player.getX();
+        double pz = mc.player.getZ();
+
+        for (int d = 2; d <= 6; d++) {
+            int bx = (int) Math.floor(px + dirX * d);
+            int bz = (int) Math.floor(pz + dirZ * d);
+            BlockPos feet = new BlockPos(bx, hwY,     bz);
+            BlockPos head = new BlockPos(bx, hwY + 1, bz);
+            /*? if >=26.1 {*//*
+            if (!mc.level.getBlockState(feet).isAir()) return true;
+            if (!mc.level.getBlockState(head).isAir()) return true;
+            *//*?} else {*/
+            if (!mc.world.getBlockState(feet).isAir()) return true;
+            if (!mc.world.getBlockState(head).isAir()) return true;
+            /*?}*/
+        }
+        return false;
+    }
+
+    /** Sends START_FALL_FLYING; server ignores it unless player is airborne with elytra. */
+    private void sendStartFlying() {
+        /*? if >=26.1 {*//*
+        Minecraft mc = Minecraft.getInstance();
+        if (mc.player == null) return;
+        mc.getConnection().send(new ServerboundPlayerCommandPacket(
+                mc.player, ServerboundPlayerCommandPacket.Action.START_FALL_FLYING));
+        *//*?} else {*/
+        MinecraftClient mc = MinecraftClient.getInstance();
+        if (mc.player == null) return;
+        mc.player.networkHandler.sendPacket(new ClientCommandC2SPacket(
+                mc.player, ClientCommandC2SPacket.Mode.START_FALL_FLYING));
+        /*?}*/
     }
 
     private void releaseKeys() {
@@ -220,6 +318,7 @@ public final class BounceController {
         opts.keyDown.setDown(false);
         opts.keyLeft.setDown(false);
         opts.keyRight.setDown(false);
+        opts.keyJump.setDown(false);
         *//*?} else {*/
         GameOptions opts = mc.options;
         opts.forwardKey.setPressed(false);
@@ -227,6 +326,7 @@ public final class BounceController {
         opts.backKey.setPressed(false);
         opts.leftKey.setPressed(false);
         opts.rightKey.setPressed(false);
+        opts.jumpKey.setPressed(false);
         /*?}*/
     }
 }

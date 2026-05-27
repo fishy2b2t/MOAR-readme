@@ -18,8 +18,20 @@ public final class BounceTuning {
     public static double MIN_PROGRESS_PER_INTERVAL_SQ = 4.0;
 
     /** Skip yaw correction when already close enough. */
-    public static float ALIGN_TOLERANCE_DEG = 8.0f;
+    public static float ALIGN_TOLERANCE_DEG = 3.0f;
 
     /** Cap yaw correction to avoid sharp server-visible snaps. */
     public static float MAX_YAW_STEP_DEG = 20.0f;
+
+    /** Perpendicular drift correction gain (travel-direction units per block of offset). */
+    public static double PERP_CORRECTION_GAIN = 0.1;
+
+    /** Ignore perpendicular offsets smaller than this (blocks). */
+    public static double PERP_CORRECTION_DEADZONE = 0.25;
+
+    /** Activate elytra when upward velocity drops to this value (m/tick). */
+    public static double ELYTRA_ACTIVATE_VY_THRESHOLD = 0.1;
+
+    /** Glide pitch in degrees. Positive = looking down. 75 = aggressive, 40–55 = sweet-spot. */
+    public static float BOUNCE_PITCH = 75.0f;
 }

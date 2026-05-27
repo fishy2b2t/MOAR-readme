@@ -49,6 +49,7 @@ public final class FlightController {
     private int     noProgressTicks;
 
     // Launch sub-state
+    private boolean sentGroundJump;  // true after the initial sprint-jump to get airborne
     private boolean sentJumpPress;
     private boolean firedFirstRocket;
 
@@ -68,6 +69,7 @@ public final class FlightController {
         rocketCooldown    = 0;
         progressSeeded    = false;
         noProgressTicks   = 0;
+        sentGroundJump    = false;
         sentJumpPress     = false;
         firedFirstRocket  = false;
         LOGGER.info("[Flight] start dest={}", dest.toShortString());
@@ -134,17 +136,18 @@ public final class FlightController {
             return;
         }
 
-        // Phase 1: hold forward to walk off ledge
+        // Phase 1: hold forward + sprint to build speed toward edge or flat-ground launch
         if (ticksActive <= FlightTuning.LAUNCH_WALK_TICKS) {
             /*? if >=26.1 {*//*
             opts.keyUp.setDown(true);
+            opts.keySprint.setDown(true);
             *//*?} else {*/
             opts.forwardKey.setPressed(true);
+            opts.sprintKey.setPressed(true);
             /*?}*/
             return;
         }
 
-        // Phase 2: in air — press jump once to activate elytra
         /*? if >=26.1 {*//*
         boolean onGround = player.onGround();
         boolean flying   = player.isFallFlying();
@@ -156,6 +159,28 @@ public final class FlightController {
         boolean flying   = player.isFallFlying();
         /*?}*/
 
+        // Phase 2a: still on the ground — sprint-jump to get airborne
+        if (onGround && !flying && !sentGroundJump) {
+            /*? if >=26.1 {*//*
+            opts.keySprint.setDown(true);
+            player.jumpFromGround();
+            *//*?} else {*/
+            opts.sprintKey.setPressed(true);
+            player.jump();
+            /*?}*/
+            sentGroundJump = true;
+            LOGGER.debug("[Flight] sent ground-jump for airborne at tick {}", ticksActive);
+            return;
+        }
+
+        // If we landed again before activating elytra, reset and retry
+        if (onGround && sentGroundJump && !flying) {
+            sentGroundJump = false;
+            sentJumpPress  = false;
+            return;
+        }
+
+        // Phase 2b: in air — press jump once to activate elytra
         if (!onGround && !flying && !sentJumpPress) {
             /*? if >=26.1 {*//*
             opts.keyJump.setDown(true);

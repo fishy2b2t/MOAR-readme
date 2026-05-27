@@ -36,6 +36,11 @@ public final class HighwayVerifier {
         this.ticksSinceLastSample = SAMPLE_INTERVAL; // force sample next tick
     }
 
+    /** Clear stale last report without re-arming the scan timer. */
+    public void resetLastReport() {
+        this.lastReport = IntegrityReport.insufficient();
+    }
+
     /** Clear the current highway and reset state. */
     public void clear() {
         highway = null;
@@ -48,10 +53,7 @@ public final class HighwayVerifier {
     /** Most recent integrity report. Never null. */
     public IntegrityReport lastReport() { return lastReport; }
 
-    /**
-     * Drive one tick. Should be called from TravelManager while a highway
-     * is set. Cheap on non-sample ticks (one counter increment).
-     */
+    /** Drive one tick; samples only every SAMPLE_INTERVAL ticks. */
     public void tick(BlockPos playerPos) {
         if (highway == null || playerPos == null) return;
         ticksSinceLastSample++;
@@ -68,15 +70,29 @@ public final class HighwayVerifier {
         HighwayDetectorBridge bridge = HighwayDetectorBridge.get();
         int floorY  = highway.floorY;
 
+        // Snap origin to highway centre — raw playerPos drifts perp during elytra, causing FP grief at high lookahead.
+        int ox = playerPos.getX();
+        int oz = playerPos.getZ();
+        if (highway.axis.diagonal) {
+            int perpDx = highway.axis.perpDx();
+            int perpDz = highway.axis.perpDz();
+            int ex = highway.entry.getX(), ez = highway.entry.getZ();
+            // Project player onto axis through entry; |perp|² = 2 for unit-diagonal axes.
+            int dp = (ox - ex) * perpDx + (oz - ez) * perpDz;
+            int snapAmount = dp / (perpDx * perpDx + perpDz * perpDz);
+            ox -= perpDx * snapAmount;
+            oz -= perpDz * snapAmount;
+        }
+
         int total = 0, griefed = 0, unloaded = 0;
         int griefStart = -1, griefEnd = -1;
 
         for (int step = 1; step <= LOOK_AHEAD_BLOCKS; step++) {
-            int bx = playerPos.getX() + travelDx * step;
-            int bz = playerPos.getZ() + travelDz * step;
-            BlockPos floorPos = new BlockPos(bx, floorY, bz);
+            int bx = ox + travelDx * step;
+            int bz = oz + travelDz * step;
 
-            HighwayDetectorBridge.CellStatus status = bridge.checkCell(floorPos);
+            // Floor-only: checkCell also needs air above, but nether netherrack causes FP grief.
+            HighwayDetectorBridge.CellStatus status = bridge.checkFloorOnly(bx, floorY, bz);
             total++;
             switch (status) {
                 case GRIEFED -> {
