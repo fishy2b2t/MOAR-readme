@@ -30,7 +30,7 @@ import org.slf4j.LoggerFactory;
 import java.util.List;
 import java.util.Optional;
 
-/** Owns the travel mission state machine and movement handoffs. */
+// Travel mission state machine; owns phase progression and movement handoffs.
 public final class TravelManager {
 
     private static final Logger LOGGER = LoggerFactory.getLogger("MOAR/Travel");
@@ -48,40 +48,18 @@ public final class TravelManager {
 
     private int currentLegIndex = -1;
 
-    /**
-     * Saved bounce leg re-entry point after a detour completes.
-     * Set when entering VERIFYING_DETOUR or wall bypass; cleared on
-     * detour completion or abort.
-     */
+    // Bounce-leg exit to re-enter after a detour/resupply; null when none active.
     private BlockPos detourResumeExit;
 
-    /**
-     * SETTLE phase countdown (ticks). When non-zero we are in SETTLE,
-     * holding the travel yaw before resuming bounce.
-     */
-    private int  settleTicks  = 0;
-    /** Travel direction preserved through the SETTLE phase. */
+    private int  settleTicks  = 0;  // yaw-hold countdown; 0 = not settling
     private int  settleYawDx  = 0;
     private int  settleYawDz  = 0;
 
     // ── Auto-resume ────────────────────────────────────────────────
-    /**
-     * Ticks to wait in IDLE before automatically re-planning after a
-     * non-user abort. Zero means no pending auto-resume.
-     */
-    private int autoResumeTicks = 0;
-    /**
-     * Number of consecutive auto-resume attempts since the mission started.
-     * Prevents infinite retry loops when an obstacle is permanent.
-     */
-    private int autoResumeAttempts = 0;
-    /** Wait 5 seconds before each auto-resume attempt. */
-    private static final int AUTO_RESUME_DELAY_TICKS = 100;
-    /**
-     * Give up after this many consecutive auto-resumes without reaching the
-     * destination.  Reset to 0 whenever the user explicitly calls {@link #start}.
-     */
-    static final int MAX_AUTO_RESUME_ATTEMPTS = 10;
+    private int autoResumeTicks    = 0; // ticks until next re-plan; 0 = none pending
+    private int autoResumeAttempts = 0; // consecutive retries since mission start
+    private static final int AUTO_RESUME_DELAY_TICKS = 100; // 5 s between retries
+    static final int MAX_AUTO_RESUME_ATTEMPTS = 10;          // cap on retry budget
 
     private TravelManager() {}
 
@@ -143,15 +121,11 @@ public final class TravelManager {
         }
     }
 
-    /** Register the ender chest position used by ElytraManager when resupplying via EC. */
+    // EC position for ElytraManager resupply.
     public synchronized void setEnderChestPos(BlockPos pos) { elytra.setEnderChestPos(pos); }
     public synchronized BlockPos getEnderChestPos()         { return elytra.getEnderChestPos(); }
 
-    /**
-     * Start a standalone Mending-only repair cycle for the worn elytra.
-     * Does not require an active travel mission; transitions back to IDLE when done.
-     * Rejected if a mission is already in progress.
-     */
+    // Repair worn elytra without a travel mission; returns to IDLE when done.
     public synchronized boolean startStandaloneRepair() {
         if (state.phase != TravelPhase.IDLE) {
             LOGGER.warn("[Travel] startStandaloneRepair rejected: phase={}", state.phase);
@@ -188,7 +162,7 @@ public final class TravelManager {
     // Tick
     // ──────────────────────────────────────────────────────────────
 
-    /** Pre-physics tick — delegates to BounceController before tickMovement() runs. */
+    // Pre-physics tick: drives BounceController before tickMovement().
     public synchronized void preTick(Object client) {
         if (state.phase == TravelPhase.BOUNCING) {
             bounce.preTick();
@@ -286,34 +260,19 @@ public final class TravelManager {
     }
 
     private void tickApproach() {
-        // ── Fall detection — same immediate escalation as tickDetouring ───
+        // Fall detection: abort on fall; nether-elytra would hit bedrock ceiling.
         if (state.route != null && state.route.primary != null) {
             BlockPos pos = currentPlayerPos();
             if (pos != null && pos.getY() < state.route.primary.floorY - 2) {
-                if (state.mission != null && state.mission.useElytra) {
-                    LOGGER.warn("[Travel] APPROACH: player fell below highway (y={} floorY={}) — escalating to elytra",
-                            pos.getY(), state.route.primary.floorY);
-                    acquireOwner(MovementOwner.FLIGHT);
-                    flight.start(state.mission.destination);
-                    transition(TravelPhase.LAUNCH, "approach fall — elytra escape");
-                } else {
-                    abort("approach fall — player below highway, no elytra");
-                }
+                abort("approach fall — player below highway (y=" + pos.getY() + ")");
                 return;
             }
         }
         if (bridge.isArrived()) { advanceLeg("approach arrived"); return; }
         if (bridge.isStuck()) {
-            // Escalate to elytra if the approach is blocked (e.g. wither attacking).
-            // Ground walking through an active wither ambush is never recoverable.
-            if (state.mission != null && state.mission.useElytra) {
-                LOGGER.warn("[Travel] approach stuck — escalating to elytra escape");
-                acquireOwner(MovementOwner.FLIGHT);
-                flight.start(state.mission.destination);
-                transition(TravelPhase.LAUNCH, "approach stuck — elytra escape");
-            } else {
-                abort("approach stuck");
-            }
+            // Wither knockback or similar — abort and let auto-resume retry.
+            // Do NOT escalate to nether-elytra on a confined highway.
+            abort("approach stuck — wither/knockback? auto-resume will retry");
         }
     }
 
@@ -333,18 +292,9 @@ public final class TravelManager {
         //    zone (e.g. wither blast + multi-chunk void) takes the elytra-escape
         //    path rather than starting a ground detour with the player mid-air.
         if (bounce.isStuck()) {
-            if (bounce.isStuckFromFall() && state.mission != null && state.mission.useElytra) {
-                // Player fell off the highway into a gap (grief false-negative or sudden drop).
-                // Rather than aborting the mission, switch to elytra flight for the remainder.
-                // preTick() has already set level pitch + fired START_FALL_FLYING so the player
-                // is gliding safely; Baritone elytra (or FlightController fallback) takes it.
-                LOGGER.warn("[Travel] player fell off highway — switching to elytra recovery");
-                acquireOwner(MovementOwner.FLIGHT);  // acquireOwner calls bounce.stop() first
-                flight.start(state.mission.destination);
-                transition(TravelPhase.LAUNCH, "elytra recovery from fall");
-            } else {
-                abort("bounce stuck");
-            }
+            // No nether-elytra escalation: corridor too confined; auto-resume retries.
+            abort(bounce.isStuckFromFall() ? "bounce: fell off highway, gliding to safety"
+                                           : "bounce stuck");
             return;
         }
 
@@ -381,10 +331,6 @@ public final class TravelManager {
             return;
         }
         // ── Knockback / lateral displacement ────────────────────
-        // If the player was hit off the highway sideways (mob, explosion, or
-        // another player), their perpendicular distance from the highway axis
-        // will exceed KNOCKBACK_PERP_THRESHOLD.  Use Baritone to walk back to
-        // the axis and then resume bouncing.
         if (isPlayerKnockedOffHighway()) {
             if (state.mission == null || !state.mission.allowDetour) {
                 abort("knocked off highway and detours disabled");
@@ -396,17 +342,13 @@ public final class TravelManager {
         if (bounce.isArrived()) { advanceLeg("bounce arrived"); }
     }
 
-    /**
-     * Drive ElytraManager each tick; resume bounce on completion or abort on failure.
-     * When no active route exists (standalone repair), transitions to IDLE instead.
-     */
+    // Drive ElytraManager; resume bounce on done, abort on failure, IDLE for standalone.
     private void tickElytraResupply() {
         elytra.tick();
         if (elytra.isDone()) {
             LOGGER.info("[Travel] elytra resupply done");
             verifier.resetLastReport();
             if (state.route == null) {
-                // Standalone repair — no mission to resume
                 transition(TravelPhase.IDLE, "standalone repair complete");
             } else if (detourResumeExit != null) {
                 acquireOwner(MovementOwner.BOUNCE);
@@ -419,7 +361,6 @@ public final class TravelManager {
             }
         } else if (elytra.isFailed()) {
             if (state.route == null) {
-                // Standalone repair — transition to IDLE rather than aborting a mission
                 elytra.stop();
                 transition(TravelPhase.IDLE, "standalone repair failed");
             } else {
@@ -445,9 +386,7 @@ public final class TravelManager {
         transition(TravelPhase.ELYTRA_RESUPPLY, "elytra durability critical");
     }
 
-    /**
-     * Plan detour waypoints and hand movement to Baritone.
-     */
+    // Plan detour waypoints and hand off to Baritone.
     private void tickVerifyingDetour() {
         BlockPos pos = currentPlayerPos();
         if (pos == null) { abort("no player pos during detour verification"); return; }
@@ -468,32 +407,17 @@ public final class TravelManager {
                 + rep.griefStartOffset() + "," + rep.griefEndOffset() + "]");
     }
 
-    /**
-     * Resume bounce when Baritone finishes the detour.
-     */
+    // Resume bounce when Baritone finishes the detour.
     private void tickDetouring() {
-        // ── Fall detection — player dropped below highway floor ───────────
-        // Baritone's ground-walk goal is at highway Y; from below it cannot
-        // route up through solid obsidian or across voids.  Escalate to elytra
-        // immediately rather than waiting 200 ticks for Baritone's stuck timer.
+        // Fall detection: abort if below highway floor; auto-resume re-plans.
         if (state.route != null && state.route.primary != null) {
             BlockPos pos = currentPlayerPos();
             if (pos != null && pos.getY() < state.route.primary.floorY - 2) {
-                if (state.mission != null && state.mission.useElytra) {
-                    LOGGER.warn("[Travel] DETOURING: player fell below highway (y={} floorY={}) — escalating to elytra",
-                            pos.getY(), state.route.primary.floorY);
-                    acquireOwner(MovementOwner.FLIGHT);
-                    flight.start(state.mission.destination);
-                    transition(TravelPhase.LAUNCH, "detouring fall — elytra escape");
-                } else {
-                    abort("detouring fall — player below highway, no elytra");
-                }
+                abort("detouring fall — player below highway (y=" + pos.getY() + ")");
                 return;
             }
         }
-        // If Baritone internally upgraded to elytra flight (e.g. the player fell
-        // through a grief void while Baritone was ground-walking), follow its lead
-        // so that Baritone remains the sole movement authority for the escape.
+        // If Baritone escalated to elytra during ground detour, follow its lead.
         if (bridge.isElytraOwning()) {
             LOGGER.info("[Travel] DETOURING: Baritone switched to elytra — upgrading to ELYTRA_CRUISE");
             transition(TravelPhase.ELYTRA_CRUISE, "Baritone elytra took over during ground detour");
@@ -515,22 +439,12 @@ public final class TravelManager {
             return;
         }
         if (bridge.isStuck()) {
-            // Continuous wither knockback can make ground walking permanently stuck.
-            // Fly out instead of aborting and burning an auto-resume slot.
-            if (state.mission != null && state.mission.useElytra) {
-                LOGGER.warn("[Travel] detour stuck (wither/knockback?) — escalating to elytra escape");
-                acquireOwner(MovementOwner.FLIGHT);
-                flight.start(state.mission.destination);
-                transition(TravelPhase.LAUNCH, "detour stuck — elytra escape");
-            } else {
-                abort("detour stuck");
-            }
+            abort("detour stuck — wither/knockback? auto-resume will retry");
         }
     }
 
-    /** 10-tick yaw-hold after detour/bypass before resuming the bounce. */
+    // 10-tick yaw-hold after detour/bypass before resuming the bounce.
     private void tickSettle() {
-        // Yaw is held in preTick(); nothing else to do except count down.
         settleTicks--;
         if (settleTicks <= 0) {
             settleTicks = 0;
@@ -542,9 +456,7 @@ public final class TravelManager {
                 bounce.start(state.route.primary, detourResumeExit,
                         state.route.travelDx, state.route.travelDz);
                 detourResumeExit = null;
-                // Detour cleared successfully — reset the retry budget so a future
-                // temporary obstacle (another wither, etc.) still gets full retries.
-                autoResumeAttempts = 0;
+                autoResumeAttempts = 0; // detour succeeded: reset retry budget
                 transition(TravelPhase.BOUNCING, "settle complete, resuming bounce");
             } else {
                 detourResumeExit = null;
@@ -557,8 +469,6 @@ public final class TravelManager {
         if (bridge.isArrived()) {
             IntegrityReport rep = verifier.lastReport();
             LOGGER.info("[Travel] mining arrived; last integrity={}", rep);
-            // If the mission has a flight leg and elytra is enabled, advance to LAUNCH
-            // Otherwise end the mission here.
             advanceLeg("mining-leg arrived");
             return;
         }
@@ -597,80 +507,48 @@ public final class TravelManager {
         }
     }
 
-    /**
-     * Let FlightController launch, then try Baritone elytra or manual cruise.
-     * Baritone elytra is attempted immediately on the first tick — since
-     * sendStartFlying() was already called before LAUNCH is entered, the player
-     * is already gliding and Baritone can take exclusive control without any
-     * warm-up window.  FlightController stays active only as a fallback when
-     * Baritone is unavailable.
-     */
+    // Poll until Baritone elytra takes ownership; re-issue command each tick. Abort on timeout.
     private void tickLaunch() {
-        if (flight.isArrived()) {
-            transition(TravelPhase.ARRIVED, "flight arrived during launch (very short hop)");
+        if (bridge.isElytraOwning()) {
+            LOGGER.info("[Travel] LAUNCH -> ELYTRA_CRUISE (Baritone elytra active, t={})", state.ticksInPhase);
+            transition(TravelPhase.ELYTRA_CRUISE, "Baritone elytra started");
             return;
         }
-        if (flight.isStuck()) {
-            abort("flight stuck during LAUNCH");
-            return;
-        }
-        if (!flight.isActive()) {
-            abort("flight inactive unexpectedly in LAUNCH");
-            return;
-        }
-        // Attempt Baritone elytra on every tick until it starts.  Player is already
-        // gliding so Baritone can take over as the sole movement authority immediately,
-        // eliminating the race condition between FlightController and Baritone.
-        if (bridge.isAvailable()) {
-            BlockPos dest = flightDestination();
-            if (dest != null) {
-                bridge.startElytraFlight(dest);
-                if (bridge.isElytraOwning()) {
-                    LOGGER.info("[Travel] LAUNCH -> ELYTRA_CRUISE (Baritone elytra, t={})", state.ticksInPhase);
-                    acquireOwner(MovementOwner.BARITONE);  // stops FlightController
-                    transition(TravelPhase.ELYTRA_CRUISE, "Baritone elytra started");
-                    return;
-                }
-            }
-        }
-        // Baritone unavailable or elytra process not yet owning — FlightController
-        // holds movement; switch to manual cruise after a short grace window.
-        if (state.ticksInPhase > 10) {
-            LOGGER.info("[Travel] LAUNCH -> ELYTRA_FALLBACK (Baritone elytra unavailable, t={})", state.ticksInPhase);
-            transition(TravelPhase.ELYTRA_FALLBACK, "Baritone elytra unavailable, manual flight");
+        // Re-issue pathTo every tick until Baritone acknowledges ownership.
+        BlockPos dest = flightDestination();
+        if (dest == null && state.mission != null) dest = state.mission.destination;
+        if (bridge.isAvailable() && dest != null) bridge.startElytraFlight(dest);
+
+        if (state.ticksInPhase > 200) {
+            abort("Baritone elytra did not start within 200 ticks");
         }
     }
 
-    /** Fall back to manual flight if Baritone elytra drops. */
+    // Baritone nether-elytra owns movement; re-request on ownership loss.
     private void tickElytraCruise() {
         if (bridge.isElytraArrived()) {
             transition(TravelPhase.ARRIVED, "elytra cruise arrived");
             return;
         }
         if (bridge.isElytraStuck() || !bridge.isElytraOwning()) {
-            LOGGER.warn("[Travel] ELYTRA_CRUISE -> ELYTRA_FALLBACK (Baritone elytra lost/stuck)");
-            bridge.cancelAll();
+            LOGGER.warn("[Travel] ELYTRA_CRUISE: Baritone elytra lost ownership — re-requesting");
             BlockPos dest = flightDestination();
+            if (dest == null && state.mission != null) dest = state.mission.destination;
             if (dest != null) {
-                acquireOwner(MovementOwner.FLIGHT);
-                flight.start(dest);
+                bridge.startElytraFlight(dest);
+                transition(TravelPhase.LAUNCH, "Baritone elytra re-requested after loss");
+            } else {
+                abort("Baritone elytra lost and no flight destination");
             }
-            transition(TravelPhase.ELYTRA_FALLBACK, "Baritone elytra unavailable");
         }
     }
 
-    /** Manual rocket flight owns movement. */
+    // FlightController removed — this state should no longer be reached.
     private void tickElytraFallback() {
-        if (flight.isArrived()) {
-            transition(TravelPhase.ARRIVED, "manual flight arrived");
-            return;
-        }
-        if (flight.isStuck()) {
-            abort("manual flight stuck");
-        }
+        abort("ELYTRA_FALLBACK reached — FlightController has been replaced by Baritone nether-elytra");
     }
 
-    /** Extract the destination from the FlightLeg in the current route, or null. */
+    // FlightLeg destination from the current route, or null.
     private BlockPos flightDestination() {
         if (state.route == null) return null;
         for (HighwayRoute.Leg leg : state.route.legs) {
@@ -705,8 +583,8 @@ public final class TravelManager {
             startBaritoneWalk(mine.freeNetherTarget(), 1, TravelPhase.MINING_TO_FREENETHER, reason);
         } else if (leg instanceof HighwayRoute.FlightLeg flightLeg) {
             if (state.mission != null && state.mission.useElytra) {
-                acquireOwner(MovementOwner.FLIGHT);
-                flight.start(flightLeg.destination());
+                acquireOwner(MovementOwner.BARITONE);
+                bridge.startElytraFlight(flightLeg.destination());
                 transition(TravelPhase.LAUNCH, reason + " -> launching to " + flightLeg.destination().toShortString());
             } else {
                 LOGGER.info("[Travel] FlightLeg skipped (useElytra=false)");
@@ -721,17 +599,9 @@ public final class TravelManager {
         transition(phase, reason + " -> walk to " + target.toShortString());
     }
 
-    /** Walk WALL_BYPASS_DISTANCE forward past the obstacle, then SETTLE back into bounce. */
-    private static final int WALL_BYPASS_DISTANCE = 12;
+    private static final int WALL_BYPASS_DISTANCE      = 12; // blocks to walk past a wall
+    private static final int KNOCKBACK_PERP_THRESHOLD  =  5; // off-axis blocks before recovery
 
-    /**
-     * How many blocks the player must be from the highway centre (perpendicularly)
-     * before we conclude they were knocked off rather than drifting.
-     * 2b2t highways are typically 4-5 blocks wide; 5 blocks off-centre is
-     * unambiguously outside the highway for any axis.
-     */
-    private static final int KNOCKBACK_PERP_THRESHOLD = 5;
-    /** Walk WALL_BYPASS_DISTANCE forward past the obstacle, then SETTLE back into bounce. */
     private void triggerWallBypass() {
         BlockPos pos = currentPlayerPos();
         if (pos == null || state.route == null) {
@@ -757,10 +627,7 @@ public final class TravelManager {
         transition(TravelPhase.DETOURING, "wall bypass: goal=" + goal.toShortString());
     }
 
-    /**
-     * True when the player's perpendicular offset from the highway axis exceeds
-     * KNOCKBACK_PERP_THRESHOLD — indicating they were hit off rather than drifting.
-     */
+    // True when the player's perp offset from the highway axis exceeds KNOCKBACK_PERP_THRESHOLD.
     private boolean isPlayerKnockedOffHighway() {
         if (state.route == null || state.route.primary == null) return false;
         BlockPos pos = currentPlayerPos();
@@ -776,12 +643,7 @@ public final class TravelManager {
         return Math.abs(dot) > KNOCKBACK_PERP_THRESHOLD * perpSq;
     }
 
-    /**
-     * Player was knocked laterally off the highway.  Project their position
-     * onto the travel axis to find the nearest on-highway point and use
-     * Baritone to walk back there.  Reuses the DETOURING → SETTLE → BOUNCING
-     * flow so the bounce resumes normally after re-approach.
-     */
+    // Project player onto travel axis and walk back; reuses DETOURING → SETTLE → BOUNCING.
     private void triggerKnockbackRecovery() {
         BlockPos pos = currentPlayerPos();
         if (pos == null || state.route == null) { abort("no player pos for knockback recovery"); return; }
@@ -867,12 +729,12 @@ public final class TravelManager {
         /*?}*/
     }
 
-    /** MC yaw (degrees) for a travel direction vector. */
+    // MC yaw in degrees for a travel direction vector.
     private static float yawForDir(int dx, int dz) {
         return (float) Math.toDegrees(Math.atan2(-dx, dz));
     }
 
-    /** Set the player's view yaw — Stonecutter-safe. */
+    // Set the player's view yaw (Stonecutter-safe).
     private static void setPlayerYaw(float yaw) {
         /*? if >=26.1 {*//*
         Minecraft mc = Minecraft.getInstance();

@@ -48,11 +48,45 @@ jobs:
           :1.21.11:buildAndCollect
           --no-daemon
 
+      - name: Read mod version
+        id: modver
+        run: |
+          VER=$(grep '^mod\.version=' gradle.properties | cut -d= -f2)
+          echo "version=${VER}" >> "$GITHUB_OUTPUT"
+
+      - name: Package build ZIPs
+        id: package
+        run: |
+          VER="${{ steps.modver.outputs.version }}"
+          STAGING="build/release"
+          mkdir -p "$STAGING"
+
+          for mc in 1.21.1 1.21.4 1.21.5 1.21.8 1.21.10 1.21.11; do
+            JAR="build/libs/${VER}/moar-${VER}+${mc}.jar"
+            if [ ! -f "$JAR" ]; then
+              echo "::error::Missing JAR: $JAR"
+              exit 1
+            fi
+            JAR_NAME="moar-${VER}+${mc}.jar"
+            ZIP_NAME="moar-${VER}+${mc}.zip"
+            HASH=$(sha256sum "$JAR" | awk '{print $1}')
+            echo "${HASH}  ${JAR_NAME}" > "${STAGING}/SHA256SUMS.txt"
+            (cd "build/libs/${VER}" && zip -j "../../release/${ZIP_NAME}" "$JAR_NAME")
+            (cd "$STAGING" && zip "${ZIP_NAME}" SHA256SUMS.txt)
+            rm "${STAGING}/SHA256SUMS.txt"
+          done
+
+          SOURCES_JAR=$(find "build/libs/${VER}" -name "moar-*-sources.jar" | head -1)
+          [ -n "$SOURCES_JAR" ] && cp "$SOURCES_JAR" "$STAGING/"
+
+          echo "staging=$STAGING" >> "$GITHUB_OUTPUT"
+          ls -la "$STAGING/"
+
       - name: Upload MC 1.21.1
         uses: actions/upload-artifact@v4
         with:
           name: moar-1.21.1
-          path: build/libs/*/moar-*+1.21.1.jar
+          path: build/release/moar-*+1.21.1.zip
           if-no-files-found: error
           retention-days: 14
 
@@ -60,7 +94,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: moar-1.21.4
-          path: build/libs/*/moar-*+1.21.4.jar
+          path: build/release/moar-*+1.21.4.zip
           if-no-files-found: error
           retention-days: 14
 
@@ -68,7 +102,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: moar-1.21.5
-          path: build/libs/*/moar-*+1.21.5.jar
+          path: build/release/moar-*+1.21.5.zip
           if-no-files-found: error
           retention-days: 14
 
@@ -76,7 +110,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: moar-1.21.8
-          path: build/libs/*/moar-*+1.21.8.jar
+          path: build/release/moar-*+1.21.8.zip
           if-no-files-found: error
           retention-days: 14
 
@@ -84,7 +118,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: moar-1.21.10
-          path: build/libs/*/moar-*+1.21.10.jar
+          path: build/release/moar-*+1.21.10.zip
           if-no-files-found: error
           retention-days: 14
 
@@ -92,7 +126,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: moar-1.21.11
-          path: build/libs/*/moar-*+1.21.11.jar
+          path: build/release/moar-*+1.21.11.zip
           if-no-files-found: error
           retention-days: 14
 
@@ -100,7 +134,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: moar-sources
-          path: build/libs/*/moar-*-sources.jar
+          path: build/release/moar-*-sources.jar
           if-no-files-found: error
           retention-days: 14
 

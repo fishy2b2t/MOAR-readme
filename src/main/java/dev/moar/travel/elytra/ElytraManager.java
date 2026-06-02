@@ -13,6 +13,7 @@ import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.Vec3;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
+import net.minecraft.world.level.block.EnderChestBlock;
 import net.minecraft.world.level.block.ShulkerBoxBlock;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.Level;
@@ -38,6 +39,7 @@ import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.math.Vec3d;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Direction;
+import net.minecraft.block.EnderChestBlock;
 import net.minecraft.block.ShulkerBoxBlock;
 import net.minecraft.block.BlockState;
 import net.minecraft.world.World;
@@ -90,6 +92,7 @@ public final class ElytraManager {
     private static final int MEND_THROW_INTERVAL     = 4;    // ticks between bottle throws
     private static final int MEND_MAX_TICKS          = 1800; // 90 s total mending window
     private static final int PHASE_TIMEOUT           = 100;
+    private static final int EC_BREAK_TIMEOUT        = 200; // ender chest hardness 22.5 needs ~84 ticks; 200 gives headroom on 2b2t
     private static final int LOOK_SETTLE             = 4;
     private static final int SWAP_SETTLE             = 6;
     private static final int PLACE_RECENT_WINDOW     = 24;
@@ -407,6 +410,8 @@ public final class ElytraManager {
             // flight / high-latency windows.  Fall back to EC/shulker resupply instead.
             LOGGER.warn("[Elytra] equip timeout — falling back to EC/shulker path");
             skipDirectEquip = true;
+            shulkerPhase = 0;   // prevent stale mid-swap phase from contaminating tickMending
+            shulkerSlot = -1;   // stale slot reference no longer valid after timeout
             transition(State.CHECKING);
             return;
         }
@@ -552,11 +557,24 @@ public final class ElytraManager {
             // inventory and swap it in so everything gets mended in one sitting.
             int nextSlot = findDamagedMendableElytraInInventory(mc);
             if (nextSlot >= 0) {
-                LOGGER.info("[Elytra] worn elytra mended — swapping in next at inv slot {} for continued mending", nextSlot);
-                shulkerSlot = nextSlot;
-                shulkerPhase = 1;
-                actionCooldown = CLICK_COOLDOWN;
-                return;
+                if (nextSlot == shulkerSlot) {
+                    // Same slot returned immediately after a completed swap.  The three
+                    // armor-slot clicks were likely rejected by the server and corrected back,
+                    // leaving the damaged elytra in-place.  Retrying would produce an infinite
+                    // loop (phase-3 resets mendTicks=0 so the MEND_MAX_TICKS timeout never
+                    // fires).  Give up on this elytra and fall through to DONE so travel can
+                    // resume rather than stalling ELYTRA_RESUPPLY permanently.
+                    LOGGER.warn("[Elytra] mend-swap for inv slot {} immediately re-selected after phase-3 — " +
+                            "swap appears stuck (server reject?); skipping to DONE", shulkerSlot);
+                    shulkerSlot = -1;
+                    // fall through to restoreHotbar + DONE below
+                } else {
+                    LOGGER.info("[Elytra] worn elytra mended — swapping in next at inv slot {} for continued mending", nextSlot);
+                    shulkerSlot = nextSlot;
+                    shulkerPhase = 1;
+                    actionCooldown = CLICK_COOLDOWN;
+                    return;
+                }
             }
             restoreHotbar(mc);
             LOGGER.info("[Elytra] all elytras mended after {} ticks", mendTicks);
@@ -857,6 +875,24 @@ public final class ElytraManager {
     *//*?} else {*/
     private void tickOpeningEC(MinecraftClient mc) {
     /*?}*/
+        // Guard: if the block at enderChestPos is no longer an ender chest (mined by player or
+        // otherwise gone), clear the stale reference and return to CHECKING instead of timing
+        // out after 80 ticks and disconnecting.
+        /*? if >=26.1 {*//*
+        BlockState ecSt = mc.level.getBlockState(enderChestPos);
+        if (!(ecSt.getBlock() instanceof EnderChestBlock)) {
+        *//*?} else {*/
+        BlockState ecSt = mc.world.getBlockState(enderChestPos);
+        if (!(ecSt.getBlock() instanceof EnderChestBlock)) {
+        /*?}*/
+            LOGGER.warn("[Elytra] EC block at {} is gone/wrong ({}); clearing stale position",
+                    enderChestPos, ecSt.getBlock());
+            enderChestPos = null;
+            ecFromInventory = false;
+            transition(State.CHECKING);
+            return;
+        }
+
         openWaitTicks++;
 
         /*? if >=26.1 {*//*
@@ -1954,13 +1990,17 @@ public final class ElytraManager {
                     shulkerTicks = 0;
                     return;
                 }
-                if (shulkerTicks >= PHASE_TIMEOUT) {
+                if (shulkerTicks >= EC_BREAK_TIMEOUT) {
                     /*? if >=26.1 {*//*
                     mc.gameMode.stopDestroyBlock();
                     *//*?} else {*/
                     mc.interactionManager.cancelBlockBreaking();
                     /*?}*/
-                    LOGGER.warn("[Elytra] timed out breaking placed EC; it remains in the world");
+                    LOGGER.warn("[Elytra] timed out breaking placed EC at {}; abandoning position to prevent loop",
+                            enderChestPos);
+                    // Clear stale reference so CHECKING and OPENING_EC don't re-enter this cycle
+                    enderChestPos = null;
+                    ecFromInventory = false;
                     transition(postShulkerState);
                     return;
                 }
@@ -2162,7 +2202,14 @@ public final class ElytraManager {
             /*?}*/
             if (stack.isEmpty()) continue;
             if (!ItemIdentifier.getItemId(stack).equals("minecraft:elytra")) continue;
-            if (!isElytraLow(stack)) continue;
+            // Any damage at all — we want to mend everything in one sitting, not just
+            // critically-low pieces (isElytraLow was too conservative and caused premature
+            // DONE transitions, leaving moderately-worn elytras unrepaired).
+            /*? if >=26.1 {*//*
+            if (stack.getDamageValue() == 0) continue;
+            *//*?} else {*/
+            if (stack.getDamage() == 0) continue;
+            /*?}*/
             if (!hasEnchantment(stack, "mending")) continue;
             return i;
         }
