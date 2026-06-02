@@ -4,8 +4,13 @@
 
 A client-side Fabric mod that automates schematic building, spawn-proofing, and container management. Load a `.litematic`, point it at some supply chests, and let it build, restock, recover from disconnects, and keep working across long multi-container runs.
 
-## 2.2 Highlights
+## 3.0 Highlights
 
+- **Highway travel system** : automatically plans and executes nether highway runs — detects the nearest highway, bounces to the exit, detours around grief, and resumes after obstacles
+- **Bounce flight** : elytra bounce engine with geometric ground/air detection, lateral knockback recovery, and a 10-tick yaw-settle window before each bounce restart
+- **Elytra resupply** : monitors elytra durability mid-travel and runs a full resupply cycle (shulker pull → equip → Mend via XP bottles → swap all inventory elytras) without interrupting the mission
+- **Grief detour** : on-the-fly detour planning around griefed highway sections; auto-resumes bounce after Baritone walks past the damage (up to 10 consecutive retries)
+- **Nether-only free flight** : uses Baritone nether-elytra for the final leg when the destination is far enough off the highway
 - **Smarter printer detection** : auto-detects active Litematica placements and can fall back to hologram block correlation when the live placement list is unavailable
 - **Resume-first building** : printer checkpoints survive disconnects and `/printer resume` restores the build state from disk
 - **Safer mode switching** : toggling between manual printer mode and AutoBuild now resets stale pathing and in-flight placement state cleanly
@@ -14,6 +19,19 @@ A client-side Fabric mod that automates schematic building, spawn-proofing, and 
 - **Safer stash retrieval** : `/stash get` and `/stash kit load` skip protected supply/dump/storage containers, track owned shulkers, split oversized stacks, and abort cleanly after repeated failures
 
 ## What It Does
+
+### Highway Travel
+
+Automate long nether highway runs end-to-end without manual input.
+
+- **Route planning** : scans the highway network and builds a multi-leg route (approach → bounce → off-ramp → free flight) from current position to destination
+- **Bounce engine** : elytra bounce flight with accurate ground/air detection, smooth re-launch, and diagonal highway support
+- **Grief detour** : detects griefed sections mid-bounce, plans a Baritone ground bypass, then resumes bouncing past the damage
+- **Wall bypass** : walks 12 blocks forward past minor obstacles and re-enters bounce without re-planning the full route
+- **Knockback recovery** : detects lateral displacement (mob hit, explosion) and walks back to the highway axis
+- **Elytra resupply** : pauses travel when elytra durability is low, pulls a fresh one from a shulker, Mends all inventory elytras via XP bottles, then resumes
+- **Auto-resume** : after a non-fatal abort (fall, wither hit, stuck) the mission re-plans up to 10 times before giving up
+- **Standalone repair** : `/moar travel elytra repair` runs the Mending cycle outside of a travel mission
 
 ### Schematic Printer
 Load a Litematica schematic and build it automatically  or toggle manual mode to place blocks yourself.
@@ -70,6 +88,7 @@ Scan, index, and organize containers across large areas.
 | 1.21.8 | 0.136.1+1.21.8 | 21 |
 | 1.21.9–1.21.10 | 0.138.4+1.21.10 | 21 |
 | 1.21.11 | 0.141.3+1.21.11 | 21 |
+| 26.1.1 (unobfuscated) | 0.145.4+26.1.1 | 21 |
 
 All versions require [Fabric Loader](https://fabricmc.net/use/) ≥ 0.18.4.
 
@@ -156,6 +175,23 @@ All versions require [Fabric Loader](https://fabricmc.net/use/) ≥ 0.18.4.
 | `/spawnproof supply add` | Mark a chest as light supply |
 | `/spawnproof supply remove` | Unmark a supply chest |
 | `/spawnproof supply list` | List supply chests |
+
+### Travel
+
+| Command | What it does |
+|---------|--------------|
+| `/moar travel goto <x> <z>` | Travel to nether coordinates |
+| `/moar travel goto <x> <z> overworld` | Travel to overworld coordinates (auto-divides by 8) |
+| `/moar travel goto <x> <z> nether` | Explicit nether coordinates |
+| `/moar travel bounce` | Snap yaw to nearest 45° and bounce indefinitely in that direction |
+| `/moar travel stop` | Stop the current travel mission |
+| `/moar travel pause` | Pause the mission |
+| `/moar travel resume` | Resume a paused mission or re-plan after stop |
+| `/moar travel status` | Show current phase, owner, ticks, and last transition reason |
+| `/moar travel log` | Print recent mission log entries |
+| `/moar travel enderchest <x> <y> <z>` | Register an ender chest for elytra resupply |
+| `/moar travel elytra resupply-count <n>` | Set how many elytras to pull per shulker trip (1–27) |
+| `/moar travel elytra repair` | Run a standalone Mending cycle without a travel mission |
 
 ### Stash
 
@@ -304,10 +340,10 @@ Requires **JDK 21+**.
 ```bash
 ./gradlew build                  # Build all versions
 ./gradlew :1.21.8:build          # Build one version
-./gradlew buildAndCollect        # Collect all JARs -> build/libs/2.2.0/
+./gradlew buildAndCollect        # Collect all JARs -> build/libs/3.0.0/
 ```
 
-Output: `versions/<mc>/build/libs/moar-2.2.0+<mc>.jar`
+Output: `versions/<mc>/build/libs/moar-3.0.0+<mc>.jar`
 
 ### Build Stack
 
@@ -320,6 +356,12 @@ Output: `versions/<mc>/build/libs/moar-2.2.0+<mc>.jar`
 ### Baritone Integration
 
 Baritone is loaded via reflection at runtime : no compile dependency, nothing bundled. If Baritone isn't installed, the mod uses its built-in vanilla walker instead. On Baritone-enabled installs, MOAR also protects storage and other interactive blocks from path-mining during sensitive automation flows.
+
+## Disclaimer
+
+MOAR is provided as-is, without warranty of any kind, under the terms of the GNU Affero General Public License v3.
+
+Users are solely responsible for ensuring that their use of MOAR complies with the rules, policies, and terms of any server or service they connect to. The maintainers are not responsible for bans, penalties, account actions, server rule violations, or other consequences resulting from use of this software.
 
 ## License
 

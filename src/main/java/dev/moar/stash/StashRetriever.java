@@ -112,7 +112,7 @@ public final class StashRetriever {
     private static final Logger LOGGER = LoggerFactory.getLogger("MOAR/Retriever");
 
     private static final int OPEN_TIMEOUT_TICKS = 60;
-    // Slower pacing to keep under Grim/Folia thresholds.
+    // Slower pacing to keep under anti-cheat and server-side rate limits.
     private static final int CLICK_COOLDOWN_TICKS = 5;
     private static final int CHEST_SYNC_DELAY = 3;
     private static final int OPEN_RETRY_INTERVAL_TICKS = 14;
@@ -159,7 +159,6 @@ public final class StashRetriever {
     private static final int SHULKER_SWAP_SETTLE    = 6;  // ticks after hotbar SWAP before looking at target
     private static final int SHULKER_LOOK_SETTLE    = 4;  // ticks of stable rotation before placement packet
     private static final int MAX_SHULKER_OPEN_RETRIES = 3;
-    private static final int SHULKER_PLACE_CALM_TICKS = 18;
     private static final int SHULKER_PLACE_RECENT_WINDOW = 24;
     private static final int SHULKER_PLACE_STATIONARY_TICKS = 5;
     private int shulkerPhase;
@@ -860,7 +859,6 @@ public final class StashRetriever {
     /** Placement-safe means long enough calm plus no recent correction burst. */
     private boolean isPlacementWindowSafe() {
         SetbackMonitor monitor = SetbackMonitor.get();
-        if (monitor.ticksSinceSetback() < SHULKER_PLACE_CALM_TICKS) return false;
         if (monitor.recentSetbackCount(SHULKER_PLACE_RECENT_WINDOW) > 0) return false;
         return monitor.isStationaryFor(SHULKER_PLACE_STATIONARY_TICKS);
     }
@@ -1034,7 +1032,7 @@ public final class StashRetriever {
             // Phase 0: wait for the anti-cheat to be calm, then pick a
             // shulker and a placement spot.
             case 0 -> {
-                // Gate on SetbackMonitor: outlasts Grim 3's burst window.
+                // Gate on SetbackMonitor: waits out the server's correction burst window.
                 if (!SetbackMonitor.get().isCalm()) return;
                 if (!isPlacementWindowSafe()) return;
 
@@ -1068,7 +1066,7 @@ public final class StashRetriever {
                 savedPitch = player.getPitch();
                 /*?}*/
                 // Start rotating to the placement target before the swap.
-                // Lets Grim see a stable rotation by the time the place packet flies.
+                // Establishes a stable rotation before the placement packet is sent.
                 /*? if >=26.1 {*//*
                 Vec3 preTarget = Vec3.atCenterOf(shulkerPos.below()).add(0, 0.5, 0);
                 *//*?} else {*/

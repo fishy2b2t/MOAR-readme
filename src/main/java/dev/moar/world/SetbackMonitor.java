@@ -113,7 +113,7 @@ public final class SetbackMonitor {
     /** Total setbacks observed this session. */
     public int totalSetbacks() { return totalSetbacks; }
 
-    /** Setbacks within the last {@code windowTicks} client ticks. */
+    /** Setbacks within the last windowTicks client ticks. */
     public int recentSetbackCount(int windowTicks) {
         if (windowTicks <= 0) return 0;
         long cutoff = currentTick - windowTicks;

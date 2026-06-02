@@ -30,6 +30,9 @@ public final class MoarProperties {
     // Webhook (n8n, etc.)
     private String webhookUrl;
 
+    // Elytra resupply
+    private int elytraResupplyCount;
+
     private MoarProperties() {}
 
     // Defaults
@@ -38,6 +41,7 @@ public final class MoarProperties {
     private static final int API_PORT = 8585;
     private static final String API_KEY = "";
     private static final String WEBHOOK_URL = "";
+    private static final int ELYTRA_RESUPPLY_COUNT = 1;
 
     public static MoarProperties load() {
         MoarProperties cfg = new MoarProperties();
@@ -58,6 +62,13 @@ public final class MoarProperties {
                 String.valueOf(API_PORT)));
         cfg.apiKey = props.getProperty("api.key", API_KEY);
         cfg.webhookUrl = props.getProperty("webhook.url", WEBHOOK_URL);
+        try {
+            int v = Integer.parseInt(props.getProperty("elytra.resupply.count",
+                    String.valueOf(ELYTRA_RESUPPLY_COUNT)));
+            cfg.elytraResupplyCount = Math.max(1, Math.min(27, v));
+        } catch (NumberFormatException ignored) {
+            cfg.elytraResupplyCount = ELYTRA_RESUPPLY_COUNT;
+        }
 
         // Write defaults on first run so users can see the available keys
         if (!Files.exists(FILE)) {
@@ -77,6 +88,7 @@ public final class MoarProperties {
             props.setProperty("api.port", String.valueOf(apiPort));
             props.setProperty("api.key", apiKey);
             props.setProperty("webhook.url", webhookUrl);
+            props.setProperty("elytra.resupply.count", String.valueOf(elytraResupplyCount));
 
             try (OutputStream out = Files.newOutputStream(FILE)) {
                 props.store(out, "MOAR API / webhook configuration");
@@ -93,6 +105,7 @@ public final class MoarProperties {
     public int getApiPort()          { return apiPort; }
     public String getApiKey()        { return apiKey; }
     public String getWebhookUrl()    { return webhookUrl; }
+    public int getElytraResupplyCount() { return elytraResupplyCount; }
 
     // Setters (mutate + persist)
 
@@ -101,6 +114,7 @@ public final class MoarProperties {
     public void setApiPort(int v) { apiPort = v; save(); }
     public void setApiKey(String v) { apiKey = v; save(); }
     public void setWebhookUrl(String v) { webhookUrl = v; save(); }
+    public void setElytraResupplyCount(int v) { elytraResupplyCount = Math.max(1, Math.min(27, v)); save(); }
 
     private static int parsePort(String s) {
         try {

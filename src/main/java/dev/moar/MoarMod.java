@@ -16,6 +16,10 @@ import dev.moar.printer.SchematicPrinter;
 import dev.moar.printer.SchematicQueueManager;
 import dev.moar.schematic.PrinterResourceManager;
 import dev.moar.spawnproof.SpawnProofer;
+import dev.moar.travel.TravelManager;
+import dev.moar.travel.command.TravelCommand;
+import dev.moar.travel.hud.HighwayOverlayRenderer;
+import dev.moar.travel.hud.TravelHud;
 import dev.moar.util.PathWalker;
 import dev.moar.util.PrinterDatabase;
 import net.fabricmc.api.ClientModInitializer;
@@ -122,6 +126,11 @@ public class MoarMod implements ClientModInitializer {
         PrinterCommand.register();
         SpawnProofCommand.register();
         StashCommand.register();
+        TravelCommand.register();
+
+        // Register travel HUD overlay and 3-D highway wireframe
+        TravelHud.register();
+        HighwayOverlayRenderer.register();
 
         // Load saved supply chest positions
         PrinterResourceManager.load();
@@ -176,6 +185,14 @@ public class MoarMod implements ClientModInitializer {
 
             // Tick the lane manager (sorting state machine)
             LANE_MANAGER.tick();
+
+            // Tick the travel manager (highway/elytra state machine)
+            TravelManager.get().tick(client);
+        });
+
+        // Pre-physics tick: bounce physics actions fire before tickMovement().
+        ClientTickEvents.START_CLIENT_TICK.register(client -> {
+            TravelManager.get().preTick(client);
         });
 
         // Restart API server when joining a server/world
@@ -192,6 +209,7 @@ public class MoarMod implements ClientModInitializer {
             STASH_MANAGER.getRetriever().stop();
             LANE_MANAGER.stop();
             SPAWN_PROOFER.stop();
+            TravelManager.get().stop();
             PathWalker.stop();
             SetbackMonitor.get().reset();
             PrinterDatabase.clearScaffold();

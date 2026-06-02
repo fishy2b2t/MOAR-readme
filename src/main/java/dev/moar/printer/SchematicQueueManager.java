@@ -263,13 +263,7 @@ public final class SchematicQueueManager {
 
     // Queue reordering
 
-    /**
-     * Move a task to a specific position in the queue (0-indexed).
-     * Position 0 = front of queue (next to build).
-     * Cannot move the active task.
-     * 
-     * @return true if successful, false if task not found or is active
-     */
+    /** Move a task to a specific queue position (0 = next to build). Returns false if the task is active or not found. */
     public boolean moveTask(UUID taskId, int newPosition) {
         if (activeTask != null && activeTask.getId().equals(taskId)) {
             LOGGER.warn("Cannot reorder active task");
@@ -309,11 +303,7 @@ public final class SchematicQueueManager {
         return true;
     }
 
-    /**
-     * Move a task up one position in the queue (towards front).
-     * 
-     * @return true if successful, false if already at front or not found
-     */
+    /** Move a task one position towards the front. Returns false if already at front or not found. */
     public boolean moveTaskUp(UUID taskId) {
         int currentIndex = findTaskIndex(taskId);
         if (currentIndex < 0) {
@@ -329,11 +319,7 @@ public final class SchematicQueueManager {
         return moveTask(taskId, currentIndex - 1);
     }
 
-    /**
-     * Move a task down one position in the queue (towards back).
-     * 
-     * @return true if successful, false if already at back or not found
-     */
+    /** Move a task one position towards the back. Returns false if already at back or not found. */
     public boolean moveTaskDown(UUID taskId) {
         int currentIndex = findTaskIndex(taskId);
         if (currentIndex < 0) {
@@ -349,11 +335,7 @@ public final class SchematicQueueManager {
         return moveTask(taskId, currentIndex + 1);
     }
 
-    /**
-     * Move a task to the front of the queue (will be built next).
-     * 
-     * @return true if successful, false if not found
-     */
+    /** Move a task to the front of the queue. Returns false if not found. */
     public boolean moveTaskToFront(UUID taskId) {
         if (findTaskIndex(taskId) < 0) {
             LOGGER.warn("Task not found: {}", taskId);
@@ -362,11 +344,7 @@ public final class SchematicQueueManager {
         return moveTask(taskId, 0);
     }
 
-    /**
-     * Move a task to the back of the queue (will be built last).
-     * 
-     * @return true if successful, false if not found
-     */
+    /** Move a task to the back of the queue. Returns false if not found. */
     public boolean moveTaskToBack(UUID taskId) {
         if (findTaskIndex(taskId) < 0) {
             LOGGER.warn("Task not found: {}", taskId);
