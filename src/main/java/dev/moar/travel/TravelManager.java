@@ -86,6 +86,8 @@ public final class TravelManager {
     private int miningRetargetAttempts = 0;
     private MiningTraversal miningTraversal = MiningTraversal.NONE;
     private BlockPos activeMineTarget;
+    private TravelPhase resupplyResumePhase;
+    private BlockPos resupplyResumeTarget;
 
     private enum MiningTraversal {
         NONE,
@@ -121,6 +123,8 @@ public final class TravelManager {
         miningRetargetAttempts = 0;
         miningTraversal = MiningTraversal.NONE;
         activeMineTarget = null;
+        resupplyResumePhase = null;
+        resupplyResumeTarget = null;
         transition(TravelPhase.PLANNING, "user start: " + mission);
         return true;
     }
@@ -133,7 +137,11 @@ public final class TravelManager {
         miningRetargetAttempts = 0;
         miningTraversal = MiningTraversal.NONE;
         activeMineTarget = null;
-        elytra.stop();
+        if (state.phase == TravelPhase.ELYTRA_RESUPPLY) {
+            elytra.pause();
+        } else {
+            elytra.stop();
+        }
         bridge.cancelAll();
         bounce.stop();
         flight.stop();
@@ -149,6 +157,7 @@ public final class TravelManager {
     public synchronized void pause() {
         if (state.phase == TravelPhase.IDLE || state.phase == TravelPhase.PAUSED) return;
         state.pausedFromPhase = state.phase;
+        if (state.phase == TravelPhase.ELYTRA_RESUPPLY) elytra.pause();
         releaseOwner(state.owner);
         state.owner = MovementOwner.NONE;
         TravelPhase from = state.phase;
@@ -165,11 +174,13 @@ public final class TravelManager {
         }
         if (state.phase == TravelPhase.PAUSED) {
             TravelPhase target = state.pausedFromPhase != null ? state.pausedFromPhase : TravelPhase.PLANNING;
+            if (target == TravelPhase.ELYTRA_RESUPPLY) elytra.resumeFromCheckpoint();
             transition(target, "user resume");
             return;
         }
         // Re-plan to last destination after stop.
         if (state.phase == TravelPhase.IDLE && state.mission != null) {
+            if (resumeSavedProgress("user resume")) return;
             TravelMission m = state.mission;
             state.reset();
             verifier.clear();
@@ -192,6 +203,7 @@ public final class TravelManager {
             LOGGER.warn("[Travel] startStandaloneRepair rejected: phase={}", state.phase);
             return false;
         }
+        clearResupplyResumeContext();
         elytra.startRepair();
         transition(TravelPhase.ELYTRA_RESUPPLY, "standalone repair");
         return true;
@@ -309,6 +321,20 @@ public final class TravelManager {
         BlockPos origin = currentPlayerPos();
         if (origin == null) { abort("no player on PLANNING"); return; }
 
+        if (canDirectFlightFromCurrentPosition(origin)) {
+            double dist = horizontalDistance(origin, state.mission.destination);
+            state.route = new HighwayRoute(
+                    null,
+                    List.of(new HighwayRoute.FlightLeg(state.mission.destination)),
+                    dist,
+                    0,
+                    0);
+            currentLegIndex = -1;
+            LOGGER.info("[Travel] planned direct open-nether flight route to {}", state.mission.destination.toShortString());
+            advanceLeg("planning complete");
+            return;
+        }
+
         HighwayPlanner.Options opts = new HighwayPlanner.Options()
                 .freeNetherFlightThreshold(state.mission.freeNetherFlightThreshold)
                 .allowFlight(state.mission.useElytra);
@@ -342,6 +368,11 @@ public final class TravelManager {
         /*?}*/
         if (mc.player != null && ElytraManager.needsResupply(mc)) {
             startElytraResupply();
+            return;
+        }
+        if (mc.player != null && plannedFlightDestination() != null
+                && ElytraManager.needsFireworksRestock(mc)) {
+            startFireworkRestock();
             return;
         }
 
@@ -398,11 +429,11 @@ public final class TravelManager {
         if (elytra.isDone()) {
             LOGGER.info("[Travel] elytra resupply done");
             verifier.resetLastReport();
+            if (resumeAfterResupply("elytra resupply complete")) {
+                return;
+            }
             if (state.route == null) {
                 transition(TravelPhase.IDLE, "standalone repair complete");
-            } else if (detourResumeExit != null && resumeCurrentBounce()) {
-                detourResumeExit = null;
-                transition(TravelPhase.BOUNCING, "elytra resupply complete, resuming bounce");
             } else {
                 advanceLeg("elytra resupply complete");
             }
@@ -419,11 +450,22 @@ public final class TravelManager {
     // Pause travel and hand off to ElytraManager.
     private void startElytraResupply() {
         LOGGER.warn("[Travel] elytra low/broken — entering ELYTRA_RESUPPLY");
+        rememberResupplyResumeContext();
         rememberCurrentBounceExit();
         releaseOwner(state.owner);
         state.owner = MovementOwner.NONE;
         elytra.start();
         transition(TravelPhase.ELYTRA_RESUPPLY, "elytra durability critical");
+    }
+
+    private void startFireworkRestock() {
+        LOGGER.warn("[Travel] fireworks low — entering ELYTRA_RESUPPLY");
+        rememberResupplyResumeContext();
+        rememberCurrentBounceExit();
+        releaseOwner(state.owner);
+        state.owner = MovementOwner.NONE;
+        elytra.startFireworkRestock();
+        transition(TravelPhase.ELYTRA_RESUPPLY, "fireworks low");
     }
 
     // Plan detour waypoints and hand off to Baritone.
@@ -512,6 +554,15 @@ public final class TravelManager {
     private void tickMining() {
         BlockPos pos = currentPlayerPos();
         BlockPos flightDest = plannedFlightDestination();
+        /*? if >=26.1 {*//*
+        Minecraft mc = Minecraft.getInstance();
+        *//*?} else {*/
+        MinecraftClient mc = MinecraftClient.getInstance();
+        /*?}*/
+        if (mc.player != null && flightDest != null && ElytraManager.needsFireworksRestock(mc)) {
+            startFireworkRestock();
+            return;
+        }
         if (bridge.isArrived()) {
             if (advanceMiningTraversal(pos)) return;
             if (hasAnotherMineLegAhead()) {
@@ -612,6 +663,15 @@ public final class TravelManager {
 
     // Poll until Baritone elytra takes ownership; re-issue command each tick. Abort on timeout.
     private void tickLaunch() {
+        /*? if >=26.1 {*//*
+        Minecraft mc = Minecraft.getInstance();
+        *//*?} else {*/
+        MinecraftClient mc = MinecraftClient.getInstance();
+        /*?}*/
+        if (!isPlayerGliding() && mc.player != null && ElytraManager.needsFireworksRestock(mc)) {
+            startFireworkRestock();
+            return;
+        }
         if (flight.isCruising() && isPlayerGliding()) {
             LOGGER.info("[Travel] LAUNCH -> ELYTRA_FALLBACK (manual flight entered cruise)");
             transition(TravelPhase.ELYTRA_FALLBACK, "manual flight entered cruise");
@@ -709,6 +769,15 @@ public final class TravelManager {
             if (leg instanceof HighwayRoute.FlightLeg flightLeg) return flightLeg.destination();
         }
         return null;
+    }
+
+    private boolean canDirectFlightFromCurrentPosition(BlockPos origin) {
+        if (state.mission == null || !state.mission.useElytra) return false;
+        if (horizontalDistance(origin, state.mission.destination) < state.mission.freeNetherFlightThreshold) {
+            return false;
+        }
+        return isLaunchReadyAt(origin, state.mission.destination)
+                || isStrongLaunchAnchor(origin, state.mission.destination);
     }
 
     // ──────────────────────────────────────────────────────────────
@@ -933,6 +1002,7 @@ public final class TravelManager {
     private void pauseForDimensionChange() {
         if (state.phase == TravelPhase.IDLE || state.phase == TravelPhase.PAUSED) return;
         state.pausedFromPhase = state.phase;
+        if (state.phase == TravelPhase.ELYTRA_RESUPPLY) elytra.pause();
         releaseOwner(state.owner);
         state.owner = MovementOwner.NONE;
         TravelPhase from = state.phase;
@@ -968,6 +1038,78 @@ public final class TravelManager {
     private void rememberCurrentBounceExit() {
         HighwayRoute.BounceLeg bounceLeg = currentBounceLeg();
         if (bounceLeg != null) detourResumeExit = bounceLeg.exitColumn();
+    }
+
+    private void rememberResupplyResumeContext() {
+        resupplyResumePhase = null;
+        resupplyResumeTarget = null;
+
+        if (state.phase == TravelPhase.MINING_TO_FREENETHER && activeMineTarget != null) {
+            resupplyResumePhase = TravelPhase.MINING_TO_FREENETHER;
+            resupplyResumeTarget = activeMineTarget;
+            return;
+        }
+
+        BlockPos flightTarget = currentFlightDestination();
+        if (flightTarget == null && state.mission != null) flightTarget = state.mission.destination;
+        if ((state.phase == TravelPhase.LAUNCH
+                || state.phase == TravelPhase.ELYTRA_CRUISE
+                || state.phase == TravelPhase.ELYTRA_FALLBACK)
+                && flightTarget != null) {
+            resupplyResumePhase = TravelPhase.LAUNCH;
+            resupplyResumeTarget = flightTarget;
+            return;
+        }
+
+        if (state.phase == TravelPhase.BOUNCING && plannedFlightDestination() != null) {
+            resupplyResumePhase = TravelPhase.BOUNCING;
+        }
+    }
+
+    private void clearResupplyResumeContext() {
+        resupplyResumePhase = null;
+        resupplyResumeTarget = null;
+    }
+
+    private boolean resumeAfterResupply(String reason) {
+        if (resumeSavedProgress(reason)) return true;
+        if (detourResumeExit != null && resumeCurrentBounce()) {
+            detourResumeExit = null;
+            clearResupplyResumeContext();
+            transition(TravelPhase.BOUNCING, reason + ", resuming bounce");
+            return true;
+        }
+        clearResupplyResumeContext();
+        return false;
+    }
+
+    private boolean resumeSavedProgress(String reason) {
+        if (resupplyResumePhase == null) return false;
+        if (resupplyResumePhase == TravelPhase.MINING_TO_FREENETHER
+                && resupplyResumeTarget != null
+                && state.route != null) {
+            BlockPos resumeTarget = resupplyResumeTarget;
+            clearResupplyResumeContext();
+            startMiningTraversal(resumeTarget, reason);
+            return true;
+        }
+        if (resupplyResumePhase == TravelPhase.LAUNCH && resupplyResumeTarget != null) {
+            BlockPos target = resupplyResumeTarget;
+            clearResupplyResumeContext();
+            acquireOwner(MovementOwner.FLIGHT);
+            flight.start(target);
+            bridge.startElytraFlight(target);
+            transition(TravelPhase.LAUNCH, reason + " -> resuming flight to " + target.toShortString());
+            return true;
+        }
+        if (resupplyResumePhase == TravelPhase.BOUNCING && state.route != null
+                && detourResumeExit != null && resumeCurrentBounce()) {
+            detourResumeExit = null;
+            clearResupplyResumeContext();
+            transition(TravelPhase.BOUNCING, reason + " -> resuming bounce");
+            return true;
+        }
+        return false;
     }
 
     private boolean resumeCurrentBounce() {
