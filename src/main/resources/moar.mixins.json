@@ -7,7 +7,9 @@
     "KeyboardInputMixin",
     "BounceGlideSpoofLivingEntityMixin",
     "BounceGlideSpoofEntityMixin",
-    "BounceForwardKeyMixin"
+    "BounceForwardKeyMixin",
+    "PlacementMovementSuppressMixin",
+    "PacketTelemetryMixin"
   ],
   "injectors": {
     "defaultRequire": 1

@@ -21,6 +21,12 @@ public final class HighwayPlanner {
     private static final float SYNTHETIC_CONFIDENCE = 0.75f;
     // Push entry past a junction so Baritone follows the planned branch.
     private static final int INTERSECTION_DIRECTIONAL_OFFSET = 8;
+    // Favor staying on the current highway over leaving it for a better-looking road.
+    private static final double CURRENT_HIGHWAY_STAY_BONUS = 1_024.0;
+    private static final double OFF_NETWORK_INGRESS_PENALTY = 25_000.0;
+    private static final double SAME_AXIS_INGRESS_PENALTY = 256.0;
+    // Only fly highway ingress when the hop is meaningfully long.
+    private static final int INGRESS_FLIGHT_MIN_DISTANCE = 64;
     // Mine this far off the highway before launch.
     private static final int FREENETHER_TAKEOFF_DISTANCE = 48;
     // Split off-ramp mining into short legs.
@@ -59,6 +65,9 @@ public final class HighwayPlanner {
                                   int[] onRampXZ,
                                   int[] exitXZ) {}
 
+    private record OriginHighway(HighwayCandidate.Axis axis,
+                                 HighwayDetectorBridge.ScanResult scan) {}
+
     private record RingSegment(BlockPos start,
                                BlockPos end,
                                HighwayCandidate.Axis axis,
@@ -72,6 +81,7 @@ public final class HighwayPlanner {
 
         int ox = origin.getX(),      oz = origin.getZ();
         int dx = destination.getX(), dz = destination.getZ();
+        OriginHighway originHighway = detectOriginHighway(origin);
 
         List<HighwayGeometry.GeometryCandidate> candidates =
                 HighwayGeometry.rankCandidates(dx, dz, opts.detectRings, opts.detectDiamonds);
@@ -93,7 +103,7 @@ public final class HighwayPlanner {
             RoutePlan route = buildDirectRoute(origin, destination, opts, candidate, floorY, onRampXZ, exitXZ);
             if (route == null || route.primary == null || route.legs.isEmpty()) continue;
 
-            double score = routeScore(route, candidate);
+            double score = routeScore(route, candidate, originHighway);
             if (score < bestScore) {
                 bestScore = score;
                 bestDirect = new CandidateRoute(candidate, route, onRampXZ, exitXZ);
@@ -118,10 +128,25 @@ public final class HighwayPlanner {
                 plan.primary, plan.legs, plan.totalCost, plan.travelDx, plan.travelDz));
     }
 
-    private static double routeScore(RoutePlan route, HighwayGeometry.GeometryCandidate candidate) {
+    private static double routeScore(RoutePlan route,
+                                     HighwayGeometry.GeometryCandidate candidate,
+                                     OriginHighway originHighway) {
         // Prefer the cheapest route from the player's actual origin, while giving
         // a small edge to stronger geometric matches when costs are close.
-        return route.totalCost + (1.0 - candidate.confidence) * 64.0;
+        double score = route.totalCost + (1.0 - candidate.confidence) * 64.0;
+        if (originHighway == null) return score;
+
+        HighwayRoute.Leg firstLeg = route.legs.isEmpty() ? null : route.legs.get(0);
+        boolean startsOffNetwork = firstLeg instanceof HighwayRoute.ApproachLeg
+                || firstLeg instanceof HighwayRoute.FlightLeg;
+        boolean sameAxis = candidate.axis == originHighway.axis;
+
+        if (startsOffNetwork) {
+            score += sameAxis ? SAME_AXIS_INGRESS_PENALTY : OFF_NETWORK_INGRESS_PENALTY;
+        } else if (sameAxis) {
+            score -= CURRENT_HIGHWAY_STAY_BONUS;
+        }
+        return score;
     }
 
     private RoutePlan buildDirectRoute(BlockPos origin,
@@ -137,7 +162,7 @@ public final class HighwayPlanner {
         BlockPos exitColumn = new BlockPos(exitXZ[0], refinedFloorY, exitXZ[1]);
 
         Optional<HighwayDetectorBridge.ScanResult> scan =
-                HighwayDetectorBridge.get().scanAt(new BlockPos(origin.getX(), refinedFloorY, origin.getZ()), best.axis);
+                HighwayDetectorBridge.get().scanAt(origin, best.axis);
         if (scan.isPresent()) {
             refinedFloorY = scan.get().floorY();
             onRamp = new BlockPos(scan.get().centerX(), refinedFloorY, scan.get().centerZ());
@@ -155,7 +180,9 @@ public final class HighwayPlanner {
         double originToOnRamp = HighwayGeometry.horizontalDistance(
                 origin.getX(), origin.getZ(), primary.entry.getX(), primary.entry.getZ());
         double approachThreshold = best.axis.diagonal ? 3.0 : 10.0;
-        boolean requiresIngressTravel = needsIngressTravel(originToOnRamp, approachThreshold, opts.allowFlight);
+        boolean alreadyOnHighway = isReadyForIngressBounce(origin, primary, travelDir[0], travelDir[1]);
+        boolean requiresIngressTravel = !alreadyOnHighway
+                && needsIngressTravel(originToOnRamp, approachThreshold, opts.allowFlight);
         if (requiresIngressTravel) {
             BlockPos directionalEntry = directionalAnchor(primary.entry, travelDir[0], travelDir[1]);
             primary = new HighwayCandidate(
@@ -221,8 +248,12 @@ public final class HighwayPlanner {
 
             double originToOnRamp = HighwayGeometry.horizontalDistance(
                     origin.getX(), origin.getZ(), originOnRamp.getX(), originOnRamp.getZ());
-            boolean requiresIngressTravel = needsIngressTravel(originToOnRamp, 10.0, opts.allowFlight);
             int[] travelDir = travelDirection(point(originOnRamp), point(originJunction), originAxis);
+            HighwayCandidate provisionalSpoke = syntheticCandidate(
+                    originAxis, HighwayCandidate.Category.CARDINAL, floorY,
+                    originOnRamp, originJunction, null, 0.0);
+            boolean requiresIngressTravel = !isReadyForIngressBounce(origin, provisionalSpoke, travelDir[0], travelDir[1])
+                    && needsIngressTravel(originToOnRamp, 10.0, opts.allowFlight);
             BlockPos spokeEntry = requiresIngressTravel
                     ? directionalAnchor(originOnRamp, travelDir[0], travelDir[1])
                     : originOnRamp;
@@ -335,9 +366,10 @@ public final class HighwayPlanner {
                                         BlockPos target,
                                         double approachThreshold,
                                         boolean allowFlight) {
-        // Do not use open-nether flight for the initial highway ingress.
-        // At planning time we have not verified a launchable corridor yet,
-        // and short ingress targets can incorrectly "arrive" immediately.
+        if (allowFlight && distance > Math.max(approachThreshold, INGRESS_FLIGHT_MIN_DISTANCE)) {
+            legs.add(new HighwayRoute.FlightLeg(target));
+            return distance;
+        }
         if (distance > approachThreshold) {
             legs.add(new HighwayRoute.ApproachLeg(target));
             return distance;
@@ -348,6 +380,43 @@ public final class HighwayPlanner {
     private static boolean needsIngressTravel(double distance, double approachThreshold, boolean allowFlight) {
         if (allowFlight) return distance > 2.0;
         return distance > approachThreshold;
+    }
+
+    private static OriginHighway detectOriginHighway(BlockPos origin) {
+        if (origin == null) return null;
+        OriginHighway best = null;
+        float bestScore = Float.NEGATIVE_INFINITY;
+        for (HighwayCandidate.Axis axis : HighwayCandidate.Axis.values()) {
+            Optional<HighwayDetectorBridge.ScanResult> scan = HighwayDetectorBridge.get().scanAt(origin, axis);
+            if (scan.isEmpty()) continue;
+            HighwayDetectorBridge.ScanResult result = scan.get();
+            float score = result.blockConfidence();
+            if (result.hasLeftRail()) score += 0.15f;
+            if (result.hasRightRail()) score += 0.15f;
+            score += Math.min(0.2f, result.width() * 0.03f);
+            if (score > bestScore) {
+                bestScore = score;
+                best = new OriginHighway(axis, result);
+            }
+        }
+        return best;
+    }
+
+    private static boolean isReadyForIngressBounce(BlockPos origin,
+                                                   HighwayCandidate highway,
+                                                   int travelDx,
+                                                   int travelDz) {
+        if (origin == null || highway == null || highway.entry == null) return false;
+        if (highway.floorY > Integer.MIN_VALUE && Math.abs(origin.getY() - highway.floorY) > 2) {
+            return false;
+        }
+        int dx = origin.getX() - highway.entry.getX();
+        int dz = origin.getZ() - highway.entry.getZ();
+        int perpDot = dx * highway.axis.perpDx() + dz * highway.axis.perpDz();
+        int alongDot = dx * travelDx + dz * travelDz;
+        int perpLimit = highway.axis.diagonal ? 4 : 3;
+        if (Math.abs(perpDot) > perpLimit) return false;
+        return alongDot >= -3;
     }
 
     private static void appendBounceLeg(List<HighwayRoute.Leg> legs,

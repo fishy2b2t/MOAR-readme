@@ -7,6 +7,8 @@ import dev.moar.schematic.PrinterCheckpoint;
 import dev.moar.schematic.PrinterResourceManager;
 import dev.moar.util.BlockDependency;
 import dev.moar.util.ChatHelper;
+import dev.moar.util.ItemIdentifier;
+import dev.moar.util.PacketTelemetry;
 import dev.moar.util.PathWalker;
 import dev.moar.util.PlacementEngine;
 import dev.moar.util.PrinterDatabase;
@@ -209,15 +211,34 @@ public class SchematicPrinter {
         COMPLETED_WITH_MISSING_MATERIALS
     }
 
+    private enum DumpMode {
+        NONE,
+        CHEST,
+        LOCAL_SHULKER
+    }
+
     // settings
 
-    private int bps = 13;
+    private int bps = 19;
     private double range = 4.2;
     private boolean swapItems = true;
     private boolean printInAir = true;
     private SortMode sortMode = SortMode.BOTTOM_UP;
     private boolean statusMessages = true;
     private boolean autoBuild = false;
+    private static final int BUILD_SWAP_RECENT_SETBACK_WINDOW = 40;
+    private static final int BOTTOM_UP_ACTIVE_BAND_HEIGHT = 2;
+    private static final int EXTERIOR_BUILD_SHELL_DEPTH = 4;
+
+    private boolean allowLiveInventorySwapsDuringBuild() {
+        if (!swapItems) return false;
+        SetbackMonitor monitor = SetbackMonitor.get();
+        return monitor.isCalm()
+                && monitor.recentSetbackCount(BUILD_SWAP_RECENT_SETBACK_WINDOW) == 0
+                && monitor.isStationaryFor(3)
+                && PlacementEngine.getConsecutiveFailures() == 0
+                && PlacementEngine.getConsecutiveRejections() == 0;
+    }
 
     // state
 
@@ -244,11 +265,22 @@ public class SchematicPrinter {
     private BlockPos lastBuildPos;
     private BlockPos supplyTarget;
     private Set<String> neededItems;
+    private Map<String, Integer> neededItemCounts = new LinkedHashMap<>();
     private int restockWaitTicks;
     // Ticks waiting for server to sync chest contents in RESTOCKING.
     private int chestSyncDelay;
+    private static final int CONTAINER_ACTION_TIMEOUT_TICKS = 8;
     // Consecutive restock failures without grabbing any items.
     private int restockFailures;
+    private enum ContainerTransferLane { NONE, RESTOCK, DUMP, SHULKER }
+    private ContainerTransferLane pendingContainerLane = ContainerTransferLane.NONE;
+    private int pendingContainerSyncId = -1;
+    private int pendingContainerSlot = -1;
+    private ItemStack pendingContainerSlotSnapshot = ItemStack.EMPTY;
+    private int pendingContainerTicks;
+    private final Set<Integer> blockedRestockSlots = new HashSet<>();
+    private final Set<Integer> blockedDumpSlots = new HashSet<>();
+    private final Set<Integer> blockedShulkerSlots = new HashSet<>();
     // Chests Baritone couldn't reach — LRU-evicted at 64.
     private final Set<BlockPos> unreachableChests = Collections.newSetFromMap(
             new LinkedHashMap<>(32, 0.75f, false) {
@@ -280,17 +312,59 @@ public class SchematicPrinter {
     private boolean triedPlacementWalk;
     // The target zone we last navigated toward — prevent re-targeting.
     private BlockPos lastWalkTargetZone;
+    private BlockPos lastWalkStandPos;
+    private BlockPos lastWalkApproachPos;
     private int walkAttemptCooldown;
     private int stuckCycles;
     private static final int MAX_STUCK_CYCLES = 10;
     private int walkingSetbackPauseTicks;
     private int observedWalkingSetbacks;
+    private int observedPlacementSetbacks;
     private static final int WALK_SETBACK_PAUSE_TICKS = 16;
     // Ticks until next skippedItems re-evaluation.
     private int skippedItemRecheckCooldown;
     private static final int SKIPPED_RECHECK_INTERVAL = 200; // ~10s
+    private static final int STANDING_CLEARANCE_GOAL = 4;
+    private static final double STANDING_BELOW_TARGET_PENALTY = 28.0;
+    private static final double STANDING_LOW_HEADROOM_PENALTY = 14.0;
+    private static final double STANDING_ENCLOSURE_PENALTY = 8.0;
+    private static final int STAGING_PLAN_MAX_CANDIDATES = 18;
+    private static final int STAGING_PLAN_CACHE_TTL = 4;
+    private static final int ACCESS_MINING_SEARCH_RADIUS = 8;
     // Max consecutive server-rejected placements before repositioning.
     private static final int SERVER_REJECT_THRESHOLD = 6;
+    private static final int SERVER_TIMEOUT_REPOSITION_THRESHOLD = 2;
+    private static final int TIMEOUT_SETBACK_REPOSITION_WINDOW_TICKS = 24;
+    private static final int PLACEMENT_START_TIMEOUT_TICKS = 10;
+    private static final int PLACEMENT_FAILURE_PAUSE_TICKS = 6;
+    private static final int PLACEMENT_START_FAILURE_PAUSE_TICKS = 4;
+    private static final int SOFT_TIMEOUT_FAILURE_PAUSE_TICKS = 1;
+    private static final int BUILD_GATE_STALL_RECHECK_TICKS = 20;
+    private static final int BUILD_GATE_STALL_TIMEOUT_TICKS = 80;
+    private static final int PLACEMENT_START_FAILURE_TARGET_COOLDOWN_TICKS = 20;
+    private static final int TIMEOUT_TARGET_COOLDOWN_TICKS = 20;
+    private static final int TIMEOUT_TARGET_COOLDOWN_STEP_TICKS = 10;
+    private static final int MAX_TIMEOUT_TARGET_COOLDOWN_TICKS = 60;
+    private static final int REJECTED_TARGET_COOLDOWN_TICKS = 36;
+    private BlockPos pendingBuildPlacementPos;
+    private BlockState pendingBuildPlacementState;
+    private long pendingBuildPlacementStartTick = -1;
+    private int placementFailurePauseTicks;
+    private int buildGateStallTicks;
+    private boolean deferredPlacementReposition;
+    private BlockPos deferredPlacementRepositionPos;
+    private BlockPos lastPlacementStartFailurePos;
+    private int placementStartFailureStreak;
+    private final Map<BlockPos, Integer> buildPlacementFailures = new LinkedHashMap<>(32, 0.75f, false) {
+        @Override protected boolean removeEldestEntry(Map.Entry<BlockPos, Integer> eldest) {
+            return size() > 128;
+        }
+    };
+    private final Map<BlockPos, Long> cooledDownPlacementTargets = new LinkedHashMap<>(32, 0.75f, false) {
+        @Override protected boolean removeEldestEntry(Map.Entry<BlockPos, Long> eldest) {
+            return size() > 128;
+        }
+    };
     // True during the redstone placement pass.
     private boolean redstonePass;
     // True during the liquid placement pass.
@@ -314,9 +388,16 @@ public class SchematicPrinter {
 
     // area-clearing state
     private BlockPos clearBreakTarget;
+    private BlockPos lastClearTargetBlock;
+    private boolean accessClearInProgress;
     private int clearBreakTicks;
     private float clearSavedYaw, clearSavedPitch;
     private static final int MAX_CLEAR_BREAK_TICKS = 200;
+    private static final double CLEAR_INTERACTION_RANGE = 3.0;
+    private static final double CLEAR_FINAL_APPROACH_TRIGGER_SQ = 8.0 * 8.0;
+    private static final double CLEAR_PATH_ARRIVAL_DISTANCE = 1.25;
+    private static final int ACCESS_REPAIR_MEMORY_RADIUS = 1;
+    private static final int ACCESS_REPAIR_MEMORY_MAX = 256;
     private int clearBlocksBroken;
     private boolean clearingDone;
     private int clearCooldownTicks;
@@ -333,6 +414,12 @@ public class SchematicPrinter {
             new LinkedHashMap<>(32, 0.75f, false) {
                 @Override protected boolean removeEldestEntry(Map.Entry<BlockPos, Boolean> eldest) {
                     return size() > 64;
+                }
+            });
+    private final Set<BlockPos> repairPriorityTargets = Collections.newSetFromMap(
+            new LinkedHashMap<>(64, 0.75f, false) {
+                @Override protected boolean removeEldestEntry(Map.Entry<BlockPos, Boolean> eldest) {
+                    return size() > ACCESS_REPAIR_MEMORY_MAX;
                 }
             });
 
@@ -372,6 +459,16 @@ public class SchematicPrinter {
     // Ticks since the dump chest screen first appeared.
     private int dumpSyncDelay;
     private static final int DUMP_SYNC_DELAY = 3;
+    private DumpMode dumpMode = DumpMode.NONE;
+    private int dumpShulkerPhase;
+    private BlockPos dumpShulkerPos;
+    private int dumpShulkerSlot = -1;
+    private int dumpShulkerOpenRetries;
+    private int dumpShulkerTransferTimeouts;
+    private static final int MAX_DUMP_SHULKER_OPEN_RETRIES = 3;
+    private static final int MAX_DUMP_SHULKER_TRANSFER_TIMEOUTS = 2;
+    private final Set<Integer> preDumpShulkerSlots = new HashSet<>();
+    private final Set<Integer> exhaustedDumpShulkerSlots = new HashSet<>();
 
     private int placementCheckCooldown;
 
@@ -386,13 +483,38 @@ public class SchematicPrinter {
     private boolean autoDetected;
 
     private static final int RESTOCK_THRESHOLD = 64;
+    private static final int RESTOCK_WORKING_SET_SCAN_LIMIT = 200;
+    private static final int RESTOCK_WORKING_SET_TYPES = 10;
+    private static final int RESTOCK_TARGET_STACKS_PER_ITEM = 1;
+    private static final int RESTOCK_RESERVED_FREE_SLOTS = 4;
+    private static final int RENDER_SCAN_EXTRA_CHUNKS = 1;
+    private static final int CHUNK_DIFF_CACHE_TTL = 20;
+    private static final double APPROACH_STAGING_EXTRA_REACH = 2.5;
+    private static final double APPROACH_STAGING_MAX_REACH = 7.5;
     private static final int MISSING_MSG_COOLDOWN = 100;
     private static final int CHEST_OPEN_TIMEOUT = 40;
-    private static final int IDLE_SCAN_INTERVAL = 200;
-    private static final int NO_PROGRESS_TIMEOUT = 100;
+    private static final int IDLE_SCAN_INTERVAL = 10;
+    private static final int NO_PROGRESS_TIMEOUT = 40;
+    private static final int NO_PROGRESS_WALK_RECHECK_TICKS = 6;
+    private static final int PLACEMENT_START_REPOSITION_THRESHOLD = 3;
     // Delay for server to sync chest contents after screen opens.
     private static final int CHEST_SYNC_DELAY = 3;
     private static final int MAX_RESTOCK_FAILURES = 6;
+
+    private record RenderWindow(int chunkRadius, int minChunkX, int maxChunkX, int minChunkZ, int maxChunkZ) {}
+    private record SchematicBlockRef(BlockPos pos, BlockState target, Item item, boolean liquid, boolean redstone) {}
+    private record ChunkDiffSnapshot(long scanTick, List<SchematicBlockRef> unresolved) {}
+    private record BuildStagingPlan(BlockPos zone, BlockPos standPos, boolean approachOnly) {}
+    private record StagingTargetCandidate(SchematicBlockRef ref, double targetDist) {}
+    private record BuildAccessTarget(BlockPos feetPos, BlockPos clearPos) {}
+    private record AccessPathProbe(BlockPos clearPos, boolean blocked) {}
+
+    private final Map<Long, List<SchematicBlockRef>> schematicBlocksByChunk = new HashMap<>();
+    private final Map<Long, ChunkDiffSnapshot> chunkDiffCache = new HashMap<>();
+    private long cachedBuildStagingPlanTick = Long.MIN_VALUE;
+    private BlockPos cachedBuildStagingPlanPlayerPos;
+    private int cachedBuildStagingPlanExtraReachBonus = Integer.MIN_VALUE;
+    private BuildStagingPlan cachedBuildStagingPlan;
 
     // cached schematic scan results
     // TTL for full-schematic remaining-block scans.
@@ -471,23 +593,36 @@ public class SchematicPrinter {
         clearBlocksBroken = 0;
         clearingDone = false;
         clearBreakTarget = null;
+        lastClearTargetBlock = null;
+        accessClearInProgress = false;
         consecutiveClearFailures = 0;
         clearStallResets = 0;
         failedClearTargets.clear();
+        repairPriorityTargets.clear();
         autoState = AutoState.CLEARING_AREA;
         noProgressTicks = 0;
         idleScanCooldown = 0;
         failedZones.clear();
+        clearPendingBuildPlacement();
+        buildPlacementFailures.clear();
+        repairPriorityTargets.clear();
+        resetPlacementFailureRecovery();
+        resetContainerTransferTracking();
         walkFailCount = 0;
         triedPlacementWalk = false;
-        lastWalkTargetZone = null;
-        walkAttemptCooldown = 0;
-        stuckCycles = 0;
-        walkingSetbackPauseTicks = 0;
-        observedWalkingSetbacks = SetbackMonitor.get().totalSetbacks();
+            lastWalkTargetZone = null;
+            walkAttemptCooldown = 0;
+            stuckCycles = 0;
+            walkingSetbackPauseTicks = 0;
+            int totalSetbacks = SetbackMonitor.get().totalSetbacks();
+            observedWalkingSetbacks = totalSetbacks;
+            observedPlacementSetbacks = totalSetbacks;
         restockFailures = 0;
         unreachableChests.clear();
         skippedItems.clear();
+        accessClearInProgress = false;
+        lastMissingItems.clear();
+        neededItems = null;
         redstonePass = false;
         liquidPass = false;
         triedWaypointRestock = false;
@@ -496,10 +631,18 @@ public class SchematicPrinter {
         shulkerNoSpaceSkipped = false;
         placementCheckCooldown = 0;
         skippedItemRecheckCooldown = SKIPPED_RECHECK_INTERVAL;
+        neededItemCounts.clear();
         preDumpClearPos = null;
         dumpTarget = null;
         dumpWaitTicks = 0;
         dumpSyncDelay = 0;
+        dumpMode = DumpMode.NONE;
+        dumpShulkerPhase = 0;
+        dumpShulkerPos = null;
+        dumpShulkerSlot = -1;
+        dumpShulkerOpenRetries = 0;
+        dumpShulkerTransferTimeouts = 0;
+        preDumpShulkerSlots.clear();
         // If Litematica placement data provided the anchor, trust it
         // and skip the immediate hologram correlation — the heuristic
         // scan can produce wrong anchors when many blocks share state.
@@ -572,8 +715,15 @@ public class SchematicPrinter {
         PlacementEngine.reset();
         PathWalker.stop();
         autoState = AutoState.IDLE;
+        clearPendingBuildPlacement();
+        buildPlacementFailures.clear();
+        repairPriorityTargets.clear();
+        resetPlacementFailureRecovery();
+        resetContainerTransferTracking();
         walkingSetbackPauseTicks = 0;
-        observedWalkingSetbacks = SetbackMonitor.get().totalSetbacks();
+        int totalSetbacks = SetbackMonitor.get().totalSetbacks();
+        observedWalkingSetbacks = totalSetbacks;
+        observedPlacementSetbacks = totalSetbacks;
         SneakOverride.setForceSneak(false); // always release mixin sneak
         SneakOverride.setForceAbsoluteSneak(false);
 
@@ -592,8 +742,15 @@ public class SchematicPrinter {
         PlacementEngine.reset();
         PathWalker.stop();
         autoState = AutoState.IDLE;
+        clearPendingBuildPlacement();
+        buildPlacementFailures.clear();
+        repairPriorityTargets.clear();
+        resetPlacementFailureRecovery();
+        resetContainerTransferTracking();
         walkingSetbackPauseTicks = 0;
-        observedWalkingSetbacks = SetbackMonitor.get().totalSetbacks();
+        int totalSetbacks = SetbackMonitor.get().totalSetbacks();
+        observedWalkingSetbacks = totalSetbacks;
+        observedPlacementSetbacks = totalSetbacks;
         SneakOverride.setForceSneak(false);
         SneakOverride.setForceAbsoluteSneak(false);
     }
@@ -604,7 +761,13 @@ public class SchematicPrinter {
         unreachableChests.clear();
         skippedItems.clear();
         failedZones.clear();
+        clearPendingBuildPlacement();
+        buildPlacementFailures.clear();
+        resetPlacementFailureRecovery();
+        resetContainerTransferTracking();
         failedClearTargets.clear();
+        repairPriorityTargets.clear();
+        accessClearInProgress = false;
         lastMissingItems.clear();
     }
 
@@ -690,6 +853,7 @@ public class SchematicPrinter {
                         placement.originX() + schematic.getOriginOffsetX(),
                         placement.originY() + schematic.getOriginOffsetY(),
                         placement.originZ() + schematic.getOriginOffsetZ());
+                rebuildSchematicChunkIndex();
                 this.autoDetected = true;
                 warnIfAnchorSuspicious();
                 return true;
@@ -716,6 +880,7 @@ public class SchematicPrinter {
                             sameFilePlacementCount, correlated);
                 }
             }
+            rebuildSchematicChunkIndex();
             this.blocksPlaced = 0;
             this.schematicPath = placement.schematicPath().normalize();
             this.schematicFile = placement.schematicPath().getFileName().toString();
@@ -792,6 +957,7 @@ public class SchematicPrinter {
             ChatHelper.info("§eSynced anchor with Litematica placement → §e"
                     + newAnchor.getX() + " " + newAnchor.getY() + " " + newAnchor.getZ());
             this.anchor = newAnchor;
+            rebuildSchematicChunkIndex();
         }
         return true;
     }
@@ -880,6 +1046,7 @@ public class SchematicPrinter {
         Path normalizedPath = path.normalize();
         this.schematic = LitematicaSchematic.load(normalizedPath);
         this.anchor = anchor;
+        rebuildSchematicChunkIndex();
         this.blocksPlaced = 0;
         this.schematicPath = normalizedPath;
         this.schematicFile = normalizedPath.getFileName().toString();
@@ -897,11 +1064,15 @@ public class SchematicPrinter {
         /*?}*/
         PrinterDatabase.clearScaffold();
         MoarMod.getChestManager().clearSessionData();
+        resetPlacementFailureRecovery();
+        resetContainerTransferTracking();
     }
 
     public void unload() {
         this.schematic = null;
         this.anchor = null;
+        schematicBlocksByChunk.clear();
+        chunkDiffCache.clear();
         this.blocksPlaced = 0;
         this.schematicPath = null;
         this.schematicFile = null;
@@ -928,12 +1099,14 @@ public class SchematicPrinter {
     public void setAnchor(BlockPos newAnchor) {
         BlockPos old = this.anchor;
         this.anchor = newAnchor;
+        rebuildSchematicChunkIndex();
 
         if (enabled && autoBuild && old != null && newAnchor != null
                 && !old.equals(newAnchor)) {
             PathWalker.stop();
             clearingDone = false;
             clearBreakTarget = null;
+            lastClearTargetBlock = null;
             clearBlocksBroken = 0;
             consecutiveClearFailures = 0;
             clearStallResets = 0;
@@ -944,6 +1117,8 @@ public class SchematicPrinter {
             lastWalkTargetZone = null;
             walkFailCount = 0;
             triedPlacementWalk = false;
+            resetPlacementFailureRecovery();
+            resetContainerTransferTracking();
         }
     }
 
@@ -977,6 +1152,787 @@ public class SchematicPrinter {
     public void setBps(int bps)        { this.bps = Math.max(1, Math.min(20, bps)); }
     public double getRange()           { return range; }
     public void setRange(double range) { this.range = Math.max(2.0, Math.min(4.5, range)); }
+
+    private double getClearReach() {
+        return Math.min(range, CLEAR_INTERACTION_RANGE);
+    }
+
+    private void clearPendingBuildPlacement() {
+        if (pendingBuildPlacementPos != null) {
+            PlacementEngine.clearVerificationStatus(pendingBuildPlacementPos);
+        }
+        pendingBuildPlacementPos = null;
+        pendingBuildPlacementState = null;
+        pendingBuildPlacementStartTick = -1;
+    }
+
+    private void resetPlacementFailureRecovery() {
+        placementFailurePauseTicks = 0;
+        buildGateStallTicks = 0;
+        deferredPlacementReposition = false;
+        deferredPlacementRepositionPos = null;
+        cooledDownPlacementTargets.clear();
+        clearPlacementStartFailureState();
+    }
+
+    private void prepareForBuildFromCurrentStance() {
+        PlacementEngine.reset();
+        clearPendingBuildPlacement();
+        resetPlacementFailureRecovery();
+        noProgressTicks = 0;
+    }
+
+    private void resetBuildPlannerState() {
+        clearPendingBuildPlacement();
+        buildPlacementFailures.clear();
+        resetPlacementFailureRecovery();
+        failedZones.clear();
+        walkFailCount = 0;
+        triedPlacementWalk = false;
+        lastWalkTargetZone = null;
+        lastWalkStandPos = null;
+        lastWalkApproachPos = null;
+        noProgressTicks = 0;
+        walkAttemptCooldown = 0;
+        stuckCycles = 0;
+        walkingSetbackPauseTicks = 0;
+        buildGateStallTicks = 0;
+        remainingCacheTick = Long.MIN_VALUE;
+    }
+
+    private void refreshPlacementPlannerState() {
+        resetBuildPlannerState();
+        rebuildSchematicChunkIndex();
+    }
+
+    private void enterBuildMode(String reason) {
+        enterBuildMode(reason, true);
+    }
+
+    private void resumeBuildFromCurrentStance(String reason) {
+        enterBuildMode(reason, false);
+    }
+
+    private void enterBuildMode(String reason, boolean resetPlanner) {
+        PathWalker.stop();
+        if (resetPlanner) {
+            resetBuildPlannerState();
+        } else {
+            prepareForBuildFromCurrentStance();
+            walkFailCount = 0;
+            triedPlacementWalk = false;
+            walkAttemptCooldown = 0;
+            stuckCycles = 0;
+            walkingSetbackPauseTicks = 0;
+            buildGateStallTicks = 0;
+        }
+        autoState = AutoState.BUILDING;
+        PacketTelemetry.mark("enter build reason=" + reason
+                + " planner=" + (resetPlanner ? "reset" : "resume"));
+        LOGGER.debug("Entering build mode ({}, planner={})",
+                reason, resetPlanner ? "reset" : "resume");
+    }
+
+    /*? if >=26.1 {*//*
+    private boolean canBuildFromCurrentStance(LocalPlayer player, Level world) {
+    *//*?} else {*/
+    private boolean canBuildFromCurrentStance(ClientPlayerEntity player, World world) {
+    /*?}*/
+        if (player == null || world == null) {
+            return false;
+        }
+        /*? if >=26.1 {*//*
+        if (!player.onGround()) {
+        *//*?} else {*/
+        if (!player.isOnGround()) {
+        /*?}*/
+            return false;
+        }
+        /*? if >=26.1 {*//*
+        BlockPos playerPos = player.blockPosition();
+        *//*?} else {*/
+        BlockPos playerPos = player.getBlockPos();
+        /*?}*/
+        if (hasBuildOpportunityFromHere(player, world, false)) {
+            return true;
+        }
+        if (lastWalkTargetZone != null) {
+            int maxVerticalGap = Math.max(2, (int) Math.ceil(range) + 1);
+            if (playerPos.getY() < lastWalkTargetZone.getY() - maxVerticalGap) {
+                return false;
+            }
+        }
+        return false;
+    }
+
+    private void markCurrentBuildApproachFailed(String reason) {
+        if (lastWalkTargetZone != null) {
+            addFailedZoneFootprint(lastWalkTargetZone, 3);
+        }
+        if (lastWalkStandPos != null) {
+            addFailedZoneFootprint(lastWalkStandPos, 4);
+        }
+        if (lastWalkApproachPos != null) {
+            addFailedZoneFootprint(lastWalkApproachPos, 5);
+        }
+        /*? if >=26.1 {*//*
+        Minecraft mc = Minecraft.getInstance();
+        if (mc.player != null) {
+            addFailedZoneFootprint(mc.player.blockPosition(), 4);
+        }
+        *//*?} else {*/
+        MinecraftClient mc = MinecraftClient.getInstance();
+        if (mc.player != null) {
+            addFailedZoneFootprint(mc.player.getBlockPos(), 4);
+        }
+        /*?}*/
+        invalidateBuildStagingPlanCache();
+        walkAttemptCooldown = 0;
+        noProgressTicks = Math.max(noProgressTicks, NO_PROGRESS_WALK_RECHECK_TICKS - 1);
+        PacketTelemetry.mark("build approach failed reason=" + reason
+                + " zone=" + posLabel(lastWalkTargetZone)
+                + " stand=" + posLabel(lastWalkStandPos)
+                + " approach=" + posLabel(lastWalkApproachPos));
+        LOGGER.debug("Marking current build approach failed ({}) zone={} stand={} approach={}",
+                reason,
+                lastWalkTargetZone != null ? posLabel(lastWalkTargetZone) : "null",
+                lastWalkStandPos != null ? posLabel(lastWalkStandPos) : "null",
+                lastWalkApproachPos != null ? posLabel(lastWalkApproachPos) : "null");
+    }
+
+    private void addFailedZoneFootprint(BlockPos center, int radius) {
+        if (center == null) {
+            return;
+        }
+        failedZones.add(center);
+        int r = Math.max(0, radius);
+        int radiusSq = r * r;
+        for (int dx = -r; dx <= r; dx++) {
+            for (int dz = -r; dz <= r; dz++) {
+                if (dx * dx + dz * dz > radiusSq) {
+                    continue;
+                }
+                failedZones.add(center.add(dx, 0, dz));
+            }
+        }
+    }
+
+    private void rememberFailedBuildZone(BlockPos center, int radius) {
+        addFailedZoneFootprint(center, radius);
+        invalidateBuildStagingPlanCache();
+    }
+
+    /*? if >=26.1 {*//*
+    private boolean isAtCurrentBuildStagingPosition(LocalPlayer player) {
+    *//*?} else {*/
+    private boolean isAtCurrentBuildStagingPosition(ClientPlayerEntity player) {
+    /*?}*/
+        if (player == null) {
+            return false;
+        }
+        /*? if >=26.1 {*//*
+        Vec3 playerPos = player.position();
+        *//*?} else if >=1.21.10 {*//*
+        Vec3d playerPos = player.getSyncedPos();
+        *//*?} else {*/
+        Vec3d playerPos = player.getPos();
+        /*?}*/
+        return isNearBuildStagingPosition(playerPos, lastWalkStandPos)
+                || isNearBuildStagingPosition(playerPos, lastWalkApproachPos);
+    }
+
+    /*? if >=26.1 {*//*
+    private boolean isNearBuildStagingPosition(Vec3 playerPos, BlockPos stagingPos) {
+    *//*?} else {*/
+    private boolean isNearBuildStagingPosition(Vec3d playerPos, BlockPos stagingPos) {
+    /*?}*/
+        if (playerPos == null || stagingPos == null) {
+            return false;
+        }
+        /*? if >=26.1 {*//*
+        return playerPos.distanceToSqr(Vec3.atCenterOf(stagingPos)) <= 4.0;
+        *//*?} else {*/
+        return playerPos.squaredDistanceTo(Vec3d.ofCenter(stagingPos)) <= 4.0;
+        /*?}*/
+    }
+
+    /*? if >=26.1 {*//*
+    private boolean shouldResumeBuildFromCurrentWalk(LocalPlayer player, Level world) {
+    *//*?} else {*/
+    private boolean shouldResumeBuildFromCurrentWalk(ClientPlayerEntity player, World world) {
+    /*?}*/
+        if (player == null || world == null) {
+            return false;
+        }
+        if (canBuildFromCurrentStance(player, world)) {
+            return true;
+        }
+        return isAtCurrentBuildStagingPosition(player)
+                && hasBuildHandoffOpportunityFromHere(player, world);
+    }
+
+    /*? if >=26.1 {*//*
+    private boolean canForceBuildEvaluationFromCurrentWalk(LocalPlayer player, Level world) {
+    *//*?} else {*/
+    private boolean canForceBuildEvaluationFromCurrentWalk(ClientPlayerEntity player, World world) {
+    /*?}*/
+        if (player == null || world == null || lastWalkTargetZone == null
+                || schematic == null || anchor == null) {
+            return false;
+        }
+        if (!isAtCurrentBuildStagingPosition(player)) {
+            return false;
+        }
+        if (hasBuildHandoffOpportunityFromHere(player, world)) {
+            return true;
+        }
+        if (lastWalkStandPos == null && lastWalkApproachPos != null
+                && canProbeLastWalkTargetFromCurrentApproach(player, world)) {
+            PacketTelemetry.mark("build approach probe staging="
+                    + posLabel(lastWalkApproachPos)
+                    + " zone=" + posLabel(lastWalkTargetZone));
+            return true;
+        }
+        int sx = lastWalkTargetZone.getX() - anchor.getX();
+        int sy = lastWalkTargetZone.getY() - anchor.getY();
+        int sz = lastWalkTargetZone.getZ() - anchor.getZ();
+        if (!schematic.contains(sx, sy, sz)) {
+            return false;
+        }
+        BlockState target = schematic.getBlockState(sx, sy, sz);
+        if (target.isAir()
+                || isAutoCreatedPart(target)
+                || !matchesCurrentBuildPass(target)
+                || isPlacementTargetCoolingDown(lastWalkTargetZone)
+                || isEffectivelyPlaced(world.getBlockState(lastWalkTargetZone), target)) {
+            return false;
+        }
+        /*? if >=26.1 {*//*
+        BlockPos playerPos = player.blockPosition();
+        *//*?} else {*/
+        BlockPos playerPos = player.getBlockPos();
+        /*?}*/
+        if (!isCandidateStableForPlacement(playerPos, lastWalkTargetZone)
+                || !PlacementEngine.canPlaceFromCurrentPosition(lastWalkTargetZone, target, player, world)) {
+            return false;
+        }
+        /*? if >=26.1 {*//*
+        return player.getEyePosition().distanceToSqr(Vec3.atCenterOf(lastWalkTargetZone))
+                <= (range + 1.0) * (range + 1.0);
+        *//*?} else {*/
+        return player.getEyePos().squaredDistanceTo(Vec3d.ofCenter(lastWalkTargetZone))
+                <= (range + 1.0) * (range + 1.0);
+        /*?}*/
+    }
+
+    /*? if >=26.1 {*//*
+    private boolean canProbeLastWalkTargetFromCurrentApproach(LocalPlayer player, Level world) {
+    *//*?} else {*/
+    private boolean canProbeLastWalkTargetFromCurrentApproach(ClientPlayerEntity player, World world) {
+    /*?}*/
+        if (player == null || world == null || lastWalkTargetZone == null) {
+            return false;
+        }
+        BlockState target = getDesiredBuildStateAt(lastWalkTargetZone);
+        if (target == null
+                || (!isPlaceable(target) && !isLiquidSource(target))
+                || !matchesCurrentBuildPass(target)
+                || isPlacementTargetCoolingDown(lastWalkTargetZone)) {
+            return false;
+        }
+        BlockState current = world.getBlockState(lastWalkTargetZone);
+        if (isEffectivelyPlaced(current, target)) {
+            invalidateChunkDiffCache(lastWalkTargetZone);
+            return false;
+        }
+        /*? if >=26.1 {*//*
+        BlockPos playerPos = player.blockPosition();
+        Vec3 eyePos = player.getEyePosition();
+        *//*?} else {*/
+        BlockPos playerPos = player.getBlockPos();
+        Vec3d eyePos = player.getEyePos();
+        /*?}*/
+        int activeBandTopY = getBottomUpActiveBandTopY(world, getRenderWindow(playerPos));
+        if (lastWalkTargetZone.getY() > activeBandTopY) {
+            return false;
+        }
+        if (!printInAir && !PlacementEngine.hasAdjacentSolid(world, lastWalkTargetZone)) {
+            return false;
+        }
+        if (!BlockDependency.isReadyToPlace(world, lastWalkTargetZone, target)
+                || wouldTrapPlayer(player, lastWalkTargetZone, world)
+                || !isCandidateStableForPlacement(playerPos, lastWalkTargetZone)
+                || !PlacementEngine.canPlaceFromCurrentPosition(
+                        lastWalkTargetZone, target, player, world)) {
+            return false;
+        }
+        double rangeSq = range * range;
+        /*? if >=26.1 {*//*
+        return eyePos.distanceToSqr(Vec3.atCenterOf(lastWalkTargetZone)) <= rangeSq;
+        *//*?} else {*/
+        return eyePos.squaredDistanceTo(Vec3d.ofCenter(lastWalkTargetZone)) <= rangeSq;
+        /*?}*/
+    }
+
+    /*? if >=26.1 {*//*
+    private boolean canBuildSpecificTargetFromCurrentStance(LocalPlayer player,
+                                                            Level world,
+                                                            BlockPos targetPos) {
+    *//*?} else {*/
+    private boolean canBuildSpecificTargetFromCurrentStance(ClientPlayerEntity player,
+                                                            World world,
+                                                            BlockPos targetPos) {
+    /*?}*/
+        if (player == null || world == null || targetPos == null) {
+            return false;
+        }
+        BlockState target = getDesiredBuildStateAt(targetPos);
+        if (target == null
+                || (!isPlaceable(target) && !isLiquidSource(target))
+                || !matchesCurrentBuildPass(target)
+                || isPlacementTargetCoolingDown(targetPos)) {
+            return false;
+        }
+        BlockState current = world.getBlockState(targetPos);
+        if (isEffectivelyPlaced(current, target)) {
+            invalidateChunkDiffCache(targetPos);
+            return false;
+        }
+        /*? if >=26.1 {*//*
+        BlockPos playerPos = player.blockPosition();
+        Vec3 eyePos = player.getEyePosition();
+        *//*?} else {*/
+        BlockPos playerPos = player.getBlockPos();
+        Vec3d eyePos = player.getEyePos();
+        /*?}*/
+        int activeBandTopY = getBottomUpActiveBandTopY(world, getRenderWindow(playerPos));
+        if (targetPos.getY() > activeBandTopY) {
+            return false;
+        }
+        if (!printInAir && !PlacementEngine.hasAdjacentSolid(world, targetPos)) {
+            return false;
+        }
+        if (!BlockDependency.isReadyToPlace(world, targetPos, target)
+                || wouldTrapPlayer(player, targetPos, world)
+                || !isCandidateStableForPlacement(playerPos, targetPos)
+                || !PlacementEngine.canPlaceFromCurrentPosition(targetPos, target, player, world)) {
+            return false;
+        }
+        double rangeSq = range * range;
+        /*? if >=26.1 {*//*
+        return eyePos.distanceToSqr(Vec3.atCenterOf(targetPos)) <= rangeSq;
+        *//*?} else {*/
+        return eyePos.squaredDistanceTo(Vec3d.ofCenter(targetPos)) <= rangeSq;
+        /*?}*/
+    }
+
+    /*? if >=26.1 {*//*
+    private boolean handleBuildSetback(Minecraft mc) {
+    *//*?} else {*/
+    private boolean handleBuildSetback(MinecraftClient mc) {
+    /*?}*/
+        SetbackMonitor setbackMonitor = SetbackMonitor.get();
+        int totalSetbacks = setbackMonitor.totalSetbacks();
+        if (totalSetbacks != observedPlacementSetbacks) {
+            observedPlacementSetbacks = totalSetbacks;
+            PlacementEngine.reset();
+            PlacementEngine.clearCorrectionHistory();
+            PathWalker.stop();
+            refreshPlacementPlannerState();
+            placementFailurePauseTicks = Math.max(
+                    placementFailurePauseTicks, PLACEMENT_FAILURE_PAUSE_TICKS);
+            walkingSetbackPauseTicks = 0;
+            PacketTelemetry.mark("build setback refresh total=" + totalSetbacks);
+            LOGGER.debug("Setback detected while building — refreshing placement planner");
+            return true;
+        }
+        if (!setbackMonitor.isCalm()) {
+            return true;
+        }
+        return false;
+    }
+
+    private void clearPendingContainerAction() {
+        pendingContainerLane = ContainerTransferLane.NONE;
+        pendingContainerSyncId = -1;
+        pendingContainerSlot = -1;
+        pendingContainerSlotSnapshot = ItemStack.EMPTY;
+        pendingContainerTicks = 0;
+    }
+
+    private void resetContainerTransferTracking() {
+        clearPendingContainerAction();
+        blockedRestockSlots.clear();
+        blockedDumpSlots.clear();
+        blockedShulkerSlots.clear();
+    }
+
+    /*? if >=26.1 {*//*
+    private int getContainerSyncId(AbstractContainerMenu handler) {
+        return handler.containerId;
+    }
+    *//*?} else {*/
+    private int getContainerSyncId(ScreenHandler handler) {
+        return handler.syncId;
+    }
+    /*?}*/
+
+    /*? if >=26.1 {*//*
+    private ItemStack copyContainerSlotStack(AbstractContainerMenu handler, int slot) {
+        return handler.getSlot(slot).getItem().copy();
+    }
+    *//*?} else {*/
+    private ItemStack copyContainerSlotStack(ScreenHandler handler, int slot) {
+        return handler.getSlot(slot).getStack().copy();
+    }
+    /*?}*/
+
+    private boolean sameContainerSlotSnapshot(ItemStack a, ItemStack b) {
+        if (a.isEmpty() && b.isEmpty()) return true;
+        if (a.isEmpty() != b.isEmpty()) return false;
+        if (a.getCount() != b.getCount()) return false;
+        return ItemIdentifier.getItemId(a).equals(ItemIdentifier.getItemId(b));
+    }
+
+    /*? if >=26.1 {*//*
+    private void beginPendingContainerAction(AbstractContainerMenu handler, int slot,
+                                             ContainerTransferLane lane) {
+    *//*?} else {*/
+    private void beginPendingContainerAction(ScreenHandler handler, int slot,
+                                             ContainerTransferLane lane) {
+    /*?}*/
+        pendingContainerLane = lane;
+        pendingContainerSyncId = getContainerSyncId(handler);
+        pendingContainerSlot = slot;
+        pendingContainerSlotSnapshot = copyContainerSlotStack(handler, slot);
+        pendingContainerTicks = 0;
+    }
+
+    /*? if >=26.1 {*//*
+    private boolean tickPendingContainerAction(AbstractContainerMenu handler,
+                                               ContainerTransferLane lane,
+                                               Set<Integer> blockedSlots) {
+    *//*?} else {*/
+    private boolean tickPendingContainerAction(ScreenHandler handler,
+                                               ContainerTransferLane lane,
+                                               Set<Integer> blockedSlots) {
+    /*?}*/
+        if (pendingContainerLane != lane) return false;
+        if (handler == null || getContainerSyncId(handler) != pendingContainerSyncId) {
+            clearPendingContainerAction();
+            return false;
+        }
+        if (pendingContainerSlot < 0 || pendingContainerSlot >= handler.slots.size()) {
+            clearPendingContainerAction();
+            return false;
+        }
+
+        ItemStack current = copyContainerSlotStack(handler, pendingContainerSlot);
+        if (!sameContainerSlotSnapshot(current, pendingContainerSlotSnapshot)) {
+            clearPendingContainerAction();
+            return true;
+        }
+
+        pendingContainerTicks++;
+        if (pendingContainerTicks < CONTAINER_ACTION_TIMEOUT_TICKS) {
+            return true;
+        }
+
+        blockedSlots.add(pendingContainerSlot);
+        LOGGER.debug("Container action timed out lane={} slot={} syncId={} item={}",
+                lane, pendingContainerSlot, pendingContainerSyncId,
+                ItemIdentifier.getItemId(pendingContainerSlotSnapshot));
+        clearPendingContainerAction();
+        return true;
+    }
+
+    private void pruneCooledDownPlacementTargets(long now) {
+        if (now < 0 || cooledDownPlacementTargets.isEmpty()) return;
+        cooledDownPlacementTargets.entrySet().removeIf(entry -> entry.getValue() <= now);
+    }
+
+    private boolean isPlacementTargetCoolingDown(BlockPos pos) {
+        if (pos == null) return false;
+        long now = getWorldTick();
+        pruneCooledDownPlacementTargets(now);
+        Long expiry = cooledDownPlacementTargets.get(pos);
+        return expiry != null && expiry > now;
+    }
+
+    private void coolDownPlacementTarget(BlockPos pos, int ticks) {
+        long now = getWorldTick();
+        if (pos == null || ticks <= 0 || now < 0) return;
+        pruneCooledDownPlacementTargets(now);
+        /*? if >=26.1 {*//*
+        cooledDownPlacementTargets.put(pos.immutable(), now + ticks);
+        *//*?} else {*/
+        cooledDownPlacementTargets.put(pos.toImmutable(), now + ticks);
+        /*?}*/
+    }
+
+    private void beginPlacementStartFailurePause(BlockPos pos) {
+        BlockPos immutablePos = null;
+        if (pos != null) {
+            /*? if >=26.1 {*//*
+            immutablePos = pos.immutable();
+            *//*?} else {*/
+            immutablePos = pos.toImmutable();
+            /*?}*/
+        }
+        if (immutablePos != null && immutablePos.equals(lastPlacementStartFailurePos)) {
+            placementStartFailureStreak++;
+        } else {
+            lastPlacementStartFailurePos = immutablePos;
+            placementStartFailureStreak = immutablePos != null ? 1 : 0;
+        }
+        if (pos != null) {
+            coolDownPlacementTarget(pos, PLACEMENT_START_FAILURE_TARGET_COOLDOWN_TICKS);
+        }
+        placementFailurePauseTicks = Math.max(
+                placementFailurePauseTicks, PLACEMENT_START_FAILURE_PAUSE_TICKS);
+        walkAttemptCooldown = Math.max(
+                walkAttemptCooldown, PLACEMENT_START_FAILURE_PAUSE_TICKS);
+        if (immutablePos != null
+                && placementStartFailureStreak >= PLACEMENT_START_REPOSITION_THRESHOLD) {
+            deferredPlacementReposition = true;
+            deferredPlacementRepositionPos = immutablePos;
+            placementFailurePauseTicks = Math.max(
+                    placementFailurePauseTicks, PLACEMENT_FAILURE_PAUSE_TICKS);
+            walkAttemptCooldown = Math.max(
+                    walkAttemptCooldown, PLACEMENT_FAILURE_PAUSE_TICKS);
+        }
+    }
+
+    private void recordBuildPlacementAttempt(BlockPos pos, BlockState state) {
+        if (pos == null || state == null) return;
+        invalidateChunkDiffCache(pos);
+        /*? if >=26.1 {*//*
+        pendingBuildPlacementPos = pos.immutable();
+        *//*?} else {*/
+        pendingBuildPlacementPos = pos.toImmutable();
+        /*?}*/
+        pendingBuildPlacementState = state;
+        pendingBuildPlacementStartTick = getWorldTick();
+    }
+
+    private void clearPlacementStartFailureState() {
+        lastPlacementStartFailurePos = null;
+        placementStartFailureStreak = 0;
+    }
+
+    private long getWorldTick() {
+        /*? if >=26.1 {*//*
+        Minecraft mc = Minecraft.getInstance();
+        if (mc.level == null) return -1;
+        return mc.level.getGameTime();
+        *//*?} else {*/
+        MinecraftClient mc = MinecraftClient.getInstance();
+        if (mc.world == null) return -1;
+        return mc.world.getTime();
+        /*?}*/
+    }
+
+    /*? if >=26.1 {*//*
+    private boolean handlePendingBuildPlacement(Minecraft mc) {
+    *//*?} else {*/
+    private boolean handlePendingBuildPlacement(MinecraftClient mc) {
+    /*?}*/
+        if (pendingBuildPlacementPos == null || pendingBuildPlacementState == null) {
+            return false;
+        }
+
+        PlacementEngine.VerificationStatus status = PlacementEngine.getVerificationStatus(
+                pendingBuildPlacementPos, pendingBuildPlacementState);
+        if (status == PlacementEngine.VerificationStatus.PENDING) {
+            long now = getWorldTick();
+            if (now >= 0 && pendingBuildPlacementStartTick >= 0) {
+                long elapsed = now - pendingBuildPlacementStartTick;
+                if (elapsed == 3 || elapsed == PLACEMENT_START_TIMEOUT_TICKS) {
+                    PacketTelemetry.mark("build wait verification status=PENDING elapsed="
+                            + elapsed + " target=" + pendingBuildPlacementPos);
+                }
+            }
+            return true;
+        }
+
+        if (status == PlacementEngine.VerificationStatus.NONE) {
+            long now = getWorldTick();
+            if (now >= 0 && pendingBuildPlacementStartTick >= 0
+                    && now - pendingBuildPlacementStartTick < PLACEMENT_START_TIMEOUT_TICKS) {
+                long elapsed = now - pendingBuildPlacementStartTick;
+                if (elapsed == 3 || elapsed == PLACEMENT_START_TIMEOUT_TICKS - 1) {
+                    PacketTelemetry.mark("build wait verification status=NONE elapsed="
+                            + elapsed + " target=" + pendingBuildPlacementPos);
+                }
+                return true;
+            }
+            clearPendingBuildPlacement();
+            return false;
+        }
+
+        BlockPos pos = pendingBuildPlacementPos;
+        invalidateChunkDiffCache(pos);
+        if (status == PlacementEngine.VerificationStatus.ACCEPTED) {
+            buildPlacementFailures.remove(pos);
+            cooledDownPlacementTargets.remove(pos);
+            deferredPlacementReposition = false;
+            deferredPlacementRepositionPos = null;
+            clearPlacementStartFailureState();
+            clearPendingBuildPlacement();
+            noProgressTicks = 0;
+            failedZones.clear();
+            walkFailCount = 0;
+            triedPlacementWalk = false;
+            stuckCycles = 0;
+            lastWalkTargetZone = null;
+            PacketTelemetry.mark("build verify accepted target=" + pos);
+            return false;
+        }
+
+        int failures = buildPlacementFailures.merge(pos, 1, Integer::sum);
+        LOGGER.debug("Placement {} at {} {} {} (failure {}/{})",
+                status, pos.getX(), pos.getY(), pos.getZ(),
+                failures, SERVER_TIMEOUT_REPOSITION_THRESHOLD);
+        clearPendingBuildPlacement();
+
+        SetbackMonitor setbackMonitor = SetbackMonitor.get();
+        int recentSetbacks = setbackMonitor.recentSetbackCount(
+                TIMEOUT_SETBACK_REPOSITION_WINDOW_TICKS);
+        boolean unstablePlacementWindow = !setbackMonitor.isCalm() || recentSetbacks > 0;
+        boolean forceReposition = status == PlacementEngine.VerificationStatus.REJECTED
+                || (status == PlacementEngine.VerificationStatus.TIMEOUT && unstablePlacementWindow)
+                || failures >= SERVER_TIMEOUT_REPOSITION_THRESHOLD
+                || PlacementEngine.getConsecutiveFailures() >= SERVER_REJECT_THRESHOLD;
+        beginPlacementFailureRecovery(
+                mc, pos, status, failures, forceReposition, recentSetbacks);
+        return true;
+    }
+
+    /*? if >=26.1 {*//*
+    private void beginPlacementFailureRecovery(Minecraft mc, BlockPos pos,
+                                               PlacementEngine.VerificationStatus status,
+                                               int failureCount,
+                                               boolean forceReposition,
+                                               int recentSetbacks) {
+    *//*?} else {*/
+    private void beginPlacementFailureRecovery(MinecraftClient mc, BlockPos pos,
+                                               PlacementEngine.VerificationStatus status,
+                                               int failureCount,
+                                               boolean forceReposition,
+                                               int recentSetbacks) {
+    /*?}*/
+        boolean softTimeout = status == PlacementEngine.VerificationStatus.TIMEOUT
+                && !forceReposition;
+        int targetCooldown;
+        if (status == PlacementEngine.VerificationStatus.REJECTED) {
+            targetCooldown = REJECTED_TARGET_COOLDOWN_TICKS;
+        } else {
+            int timeoutPenalty = Math.max(0, failureCount - 1) * TIMEOUT_TARGET_COOLDOWN_STEP_TICKS;
+            targetCooldown = Math.min(
+                    MAX_TIMEOUT_TARGET_COOLDOWN_TICKS,
+                    TIMEOUT_TARGET_COOLDOWN_TICKS + timeoutPenalty);
+        }
+        PlacementEngine.reset();
+        if (!softTimeout) {
+            PlacementEngine.clearCorrectionHistory();
+            PathWalker.stop();
+        }
+        coolDownPlacementTarget(pos, targetCooldown);
+        int recoveryPause = softTimeout
+                ? SOFT_TIMEOUT_FAILURE_PAUSE_TICKS
+                : forceReposition
+                ? PLACEMENT_FAILURE_PAUSE_TICKS + Math.min(8, Math.max(0, failureCount - 1) * 2)
+                : PLACEMENT_FAILURE_PAUSE_TICKS;
+        placementFailurePauseTicks = Math.max(placementFailurePauseTicks, recoveryPause);
+        deferredPlacementReposition = forceReposition;
+        /*? if >=26.1 {*//*
+        deferredPlacementRepositionPos = pos != null ? pos.immutable() : null;
+        if (!softTimeout) {
+            failedZones.add(mc.player.blockPosition());
+        }
+        *//*?} else {*/
+        deferredPlacementRepositionPos = pos != null ? pos.toImmutable() : null;
+        if (!softTimeout) {
+            failedZones.add(mc.player.getBlockPos());
+        }
+        /*?}*/
+        if (!softTimeout && pos != null) {
+            failedZones.add(pos);
+        }
+        noProgressTicks = 0;
+        stuckCycles = 0;
+        walkFailCount = 0;
+        triedPlacementWalk = false;
+        if (!softTimeout) {
+            walkingSetbackPauseTicks = Math.max(walkingSetbackPauseTicks, recoveryPause);
+            walkAttemptCooldown = Math.max(walkAttemptCooldown, recoveryPause);
+        }
+        PacketTelemetry.mark("build recovery status=" + status
+                + " failures=" + failureCount
+                + " forceReposition=" + forceReposition
+                + " softTimeout=" + softTimeout
+                + " pause=" + placementFailurePauseTicks
+                + " cooldown=" + targetCooldown
+                + " recentSetbacks=" + recentSetbacks
+                + " target=" + pos);
+        LOGGER.debug("Placement failure recovery: status={} failures={} recentSetbacks={} forceReposition={} pause={} cooldown={} target={} {} {}",
+                status, failureCount, recentSetbacks, forceReposition,
+                placementFailurePauseTicks, targetCooldown,
+                pos != null ? pos.getX() : 0,
+                pos != null ? pos.getY() : 0,
+                pos != null ? pos.getZ() : 0);
+    }
+
+    /*? if >=26.1 {*//*
+    private boolean handlePlacementFailureRecovery(Minecraft mc) {
+    *//*?} else {*/
+    private boolean handlePlacementFailureRecovery(MinecraftClient mc) {
+    /*?}*/
+        if (placementFailurePauseTicks > 0) {
+            placementFailurePauseTicks--;
+            return true;
+        }
+        if (!deferredPlacementReposition || deferredPlacementRepositionPos == null) {
+            return false;
+        }
+        BlockPos target = deferredPlacementRepositionPos;
+        deferredPlacementReposition = false;
+        deferredPlacementRepositionPos = null;
+        PacketTelemetry.mark("build recovery reposition target=" + target);
+        repositionAfterPlacementFailure(mc, target);
+        return true;
+    }
+
+    /*? if >=26.1 {*//*
+    private void repositionAfterPlacementFailure(Minecraft mc, BlockPos pos) {
+    *//*?} else {*/
+    private void repositionAfterPlacementFailure(MinecraftClient mc, BlockPos pos) {
+    /*?}*/
+        PlacementEngine.resetRejectionCounters();
+        clearPlacementStartFailureState();
+        failedZones.add(pos);
+        /*? if >=26.1 {*//*
+        failedZones.add(mc.player.blockPosition());
+        *//*?} else {*/
+        failedZones.add(mc.player.getBlockPos());
+        /*?}*/
+        noProgressTicks = 0;
+        walkAttemptCooldown = 20;
+        if (!tryWalkToNextZone(mc)) {
+            /*? if >=26.1 {*//*
+            BlockPos highZone = findHighBuildZone(mc.player, mc.level);
+            *//*?} else {*/
+            BlockPos highZone = findHighBuildZone(mc.player, mc.world);
+            /*?}*/
+            if (highZone != null) {
+                int radius = (int) Math.ceil(range);
+                walkToZoneWithPlacement(mc.player, highZone, radius);
+                autoState = AutoState.WALKING_TO_BUILD;
+            }
+        } else {
+            autoState = AutoState.WALKING_TO_BUILD;
+        }
+    }
     public boolean isSwapItems()       { return swapItems; }
     public void setSwapItems(boolean v){ this.swapItems = v; }
     public boolean isPrintInAir()      { return printInAir; }
@@ -986,6 +1942,7 @@ public class SchematicPrinter {
     public boolean isStatusMessages()  { return statusMessages; }
     public void setStatusMessages(boolean v){ this.statusMessages = v; }
     public boolean isAutoBuild()       { return autoBuild; }
+    public String getAutoStateName()   { return autoState.name(); }
     public void setAutoBuild(boolean v){
         if (this.autoBuild == v) return;
         this.autoBuild = v;
@@ -1000,12 +1957,19 @@ public class SchematicPrinter {
             walkFailCount = 0;
             triedPlacementWalk = false;
             lastWalkTargetZone = null;
+            lastClearTargetBlock = null;
             walkAttemptCooldown = 0;
             stuckCycles = 0;
             walkingSetbackPauseTicks = 0;
-            observedWalkingSetbacks = SetbackMonitor.get().totalSetbacks();
+            int totalSetbacks = SetbackMonitor.get().totalSetbacks();
+            observedWalkingSetbacks = totalSetbacks;
+            observedPlacementSetbacks = totalSetbacks;
             if (this.autoBuild) {
-                autoState = clearingDone ? AutoState.BUILDING : AutoState.CLEARING_AREA;
+                if (clearingDone) {
+                    enterBuildMode("auto toggled on with clearing already complete");
+                } else {
+                    autoState = AutoState.CLEARING_AREA;
+                }
             } else {
                 autoState = AutoState.IDLE;
             }
@@ -1074,8 +2038,11 @@ public class SchematicPrinter {
             PlacementEngine.pruneCompletedCorrections();
         }
 
-        // Periodically resync the anchor.
-        if (schematic != null && --anchorCorrelationCooldown <= 0) {
+        boolean allowAnchorCorrelation = !autoBuild || autoState == AutoState.IDLE;
+
+        // Only re-correlate while idle/manual so active planning isn't reset
+        // in the middle of a walk/build handoff.
+        if (schematic != null && allowAnchorCorrelation && --anchorCorrelationCooldown <= 0) {
             anchorCorrelationCooldown = ANCHOR_CORRELATION_INTERVAL;
             BlockPos prevAnchor = this.anchor;
             boolean synced = trySyncAnchor();
@@ -1099,6 +2066,7 @@ public class SchematicPrinter {
             }
             // Reset walking if the anchor moved.
             if (anchor != null && !anchor.equals(prevAnchor)) {
+                rebuildSchematicChunkIndex();
                 PathWalker.stop();
                 if (autoBuild) {
                     autoState = clearingDone ? AutoState.BUILDING : AutoState.CLEARING_AREA;
@@ -1112,8 +2080,19 @@ public class SchematicPrinter {
         // Always drive the multi-tick placement pipeline
         PlacementEngine.tickVerification();
         if (PlacementEngine.isBusy()) {
+            boolean staleVerificationGate = autoBuild
+                    && !PlacementEngine.hasActivePhase()
+                    && pendingBuildPlacementPos == null
+                    && pendingBuildPlacementState == null;
+            if (staleVerificationGate) {
+                PacketTelemetry.mark("tick gate clear stale verification");
+                PlacementEngine.resetRejectionCounters();
+            }
             boolean placed = PlacementEngine.tick();
             if (placed) {
+                recordBuildPlacementAttempt(
+                        PlacementEngine.getLastVerificationPos(),
+                        PlacementEngine.getLastVerificationState());
                 blocksPlaced++;
                 noProgressTicks = 0;
                 // Invalidate cached remaining counts so the next query
@@ -1129,7 +2108,9 @@ public class SchematicPrinter {
                     /*?}*/
                 }
             }
-            return;
+            if (PlacementEngine.hasActivePhase() || !PlacementEngine.canPlace()) {
+                return;
+            }
         }
 
         if (autoBuild) {
@@ -1140,6 +2121,8 @@ public class SchematicPrinter {
             *//*?} else {*/
             if (mc.currentScreen != null) return;
             /*?}*/
+            if (handlePendingBuildPlacement(mc)) return;
+            if (handlePlacementFailureRecovery(mc)) return;
             if (!PlacementEngine.canPlace()) return;
             /*? if >=26.1 {*//*
             tryPlaceNextBlock(mc.player, mc.level);
@@ -1185,7 +2168,7 @@ public class SchematicPrinter {
 
         switch (autoState) {
             case CLEARING_AREA       -> tickClearingArea(mc);
-            case WALKING_TO_CLEAR    -> tickWalking(mc, AutoState.CLEARING_AREA);
+            case WALKING_TO_CLEAR    -> tickWalkingToClear(mc);
             case WALKING_TO_DUMP     -> tickWalking(mc, AutoState.DUMPING);
             case DUMPING             -> tickDumping(mc);
             case BUILDING            -> tickBuilding(mc);
@@ -1209,7 +2192,52 @@ public class SchematicPrinter {
         *//*?} else {*/
         if (mc.currentScreen != null) return;
         /*?}*/
-        if (!PlacementEngine.canPlace()) return;
+        if (handleBuildSetback(mc)) return;
+        if (handlePendingBuildPlacement(mc)) return;
+        if (handlePlacementFailureRecovery(mc)) return;
+        if (!PlacementEngine.canPlace()) {
+            boolean staleVerificationGate = PlacementEngine.isBusy()
+                    && !PlacementEngine.hasActivePhase()
+                    && pendingBuildPlacementPos == null
+                    && pendingBuildPlacementState == null;
+            if (staleVerificationGate) {
+                PacketTelemetry.mark("build gate clear stale verification");
+                PlacementEngine.resetRejectionCounters();
+            }
+            if (PlacementEngine.isBusy()
+                    || placementFailurePauseTicks > 0
+                    || !"IDLE".equals(PlacementEngine.getPhase())
+                    || !SetbackMonitor.get().isCalm()) {
+                buildGateStallTicks = 0;
+                return;
+            }
+            buildGateStallTicks++;
+            if (buildGateStallTicks == BUILD_GATE_STALL_RECHECK_TICKS
+                    || buildGateStallTicks == BUILD_GATE_STALL_TIMEOUT_TICKS) {
+                PacketTelemetry.mark("build gate stalled ticks=" + buildGateStallTicks
+                        + " busy=" + PlacementEngine.isBusy()
+                        + " phase=" + PlacementEngine.getPhase()
+                        + " pause=" + placementFailurePauseTicks
+                        + " calm=" + SetbackMonitor.get().isCalm()
+                        + " pendingBuild=" + (pendingBuildPlacementPos != null));
+            }
+            if (buildGateStallTicks == BUILD_GATE_STALL_RECHECK_TICKS
+                    && walkAttemptCooldown <= 0
+                    && tryWalkToNextZone(mc)) {
+                buildGateStallTicks = 0;
+                return;
+            }
+            if (buildGateStallTicks >= BUILD_GATE_STALL_TIMEOUT_TICKS) {
+                LOGGER.debug("Build gate stalled from current stance — refreshing planner");
+                prepareForBuildFromCurrentStance();
+                if (tryWalkToNextZone(mc)) {
+                    return;
+                }
+                buildGateStallTicks = 0;
+            }
+            return;
+        }
+        buildGateStallTicks = 0;
         if (missingItemMsgCooldown > 0) missingItemMsgCooldown--;
 
         // entrapment safety
@@ -1274,6 +2302,11 @@ public class SchematicPrinter {
                 BlockPos wbStand = findStandingPosition(wbZone, mc.level, mc.player);
                 *//*?} else {*/
                 BlockPos wbStand = findStandingPosition(wbZone, mc.world, mc.player);
+                /*?}*/
+                /*? if >=26.1 {*//*
+                wbStand = sanitizeBuildStandingPosition(wbZone, wbStand, mc.player.blockPosition());
+                *//*?} else {*/
+                wbStand = sanitizeBuildStandingPosition(wbZone, wbStand, mc.player.getBlockPos());
                 /*?}*/
                 // Reject standing positions that are also in water
                 if (wbStand != null
@@ -1354,16 +2387,15 @@ public class SchematicPrinter {
         if (started) {
             // Pipeline started — block will be placed over next ticks
             noProgressTicks = 0;
-            failedZones.clear();
-            walkFailCount = 0;
-            triedPlacementWalk = false;
-            stuckCycles = 0;
             // NOTE: do NOT reset restockFailures here — placing a block we
             // already had materials for doesn't mean the supply chests have
             // the items we're still missing.  Resetting here causes an
             // infinite restock loop (place some → restock fail → reset → repeat).
             // restockFailures only resets on *successful* restock (got items).
-            lastWalkTargetZone = null; // zone was productive — allow re-targeting
+            return;
+        }
+
+        if (placementFailurePauseTicks > 0) {
             return;
         }
 
@@ -1375,6 +2407,12 @@ public class SchematicPrinter {
             return;
         }
 
+        // Case 1b: nothing started from this stance, but the nearby working set
+        // is understocked enough that continuing to walk/build will just churn.
+        if (tryStartProactiveRestock(mc)) {
+            return;
+        }
+
         // Case 2: no placeable candidates in reach — look for the next zone
         if (walkAttemptCooldown > 0) walkAttemptCooldown--;
         noProgressTicks++;
@@ -1383,7 +2421,8 @@ public class SchematicPrinter {
             // for a nearby zone to walk to.  Don't mark the current area as
             // failed yet — the miss might be transient (player settling after
             // a walk, blocks temporarily out of angle, etc.).
-            if (noProgressTicks == 10 && walkAttemptCooldown <= 0) {
+            if (noProgressTicks == NO_PROGRESS_WALK_RECHECK_TICKS
+                    && walkAttemptCooldown <= 0) {
                 if (!tryWalkToNextZone(mc)) {
                     // No loaded zones — check for unloaded build zones
                     // so we start walking immediately instead of waiting
@@ -1425,6 +2464,7 @@ public class SchematicPrinter {
                 }
                 stuckCycles = 0;
                 failedZones.clear();
+                idleScanCooldown = 0;
                 autoState = AutoState.IDLE;
                 return;
             }
@@ -1439,6 +2479,7 @@ public class SchematicPrinter {
             }
             stuckCycles = 0;
             failedZones.clear();
+            idleScanCooldown = 0;
             autoState = AutoState.IDLE;
             return;
         }
@@ -1478,6 +2519,11 @@ public class SchematicPrinter {
                             *//*?} else {*/
                             nearbyZone, mc.world, mc.player);
                             /*?}*/
+                    /*? if >=26.1 {*//*
+                    standPos = sanitizeBuildStandingPosition(nearbyZone, standPos, mc.player.blockPosition());
+                    *//*?} else {*/
+                    standPos = sanitizeBuildStandingPosition(nearbyZone, standPos, mc.player.getBlockPos());
+                    /*?}*/
                     if (standPos != null) {
                         /*? if >=26.1 {*//*
                         Level w = mc.level;
@@ -1530,6 +2576,11 @@ public class SchematicPrinter {
                                 *//*?} else {*/
                                 highZone, mc.world, mc.player);
                                 /*?}*/
+                        /*? if >=26.1 {*//*
+                        standPos = sanitizeBuildStandingPosition(highZone, standPos, mc.player.blockPosition());
+                        *//*?} else {*/
+                        standPos = sanitizeBuildStandingPosition(highZone, standPos, mc.player.getBlockPos());
+                        /*?}*/
                         if (standPos != null) {
                             /*? if >=26.1 {*//*
                             Level w = mc.level;
@@ -1571,7 +2622,7 @@ public class SchematicPrinter {
                     if (statusMessages) {
                         ChatHelper.info("§bStructural blocks done — placing redstone components...");
                     }
-                    autoState = AutoState.BUILDING;
+                    enterBuildMode("structural pass complete -> redstone");
                     return;
                 }
                 /*? if >=26.1 {*//*
@@ -1593,7 +2644,7 @@ public class SchematicPrinter {
                     if (statusMessages) {
                         ChatHelper.info("§bRedstone done — placing liquids...");
                     }
-                    autoState = AutoState.BUILDING;
+                    enterBuildMode("redstone pass complete -> liquids");
                     return;
                 }
 
@@ -1696,9 +2747,15 @@ public class SchematicPrinter {
     private boolean tryWalkToNextZone(MinecraftClient mc) {
     /*?}*/
         /*? if >=26.1 {*//*
-        BlockPos nextZone = findNextBuildZone(mc.player, mc.level);
+        BuildStagingPlan preferredPlan = findBuildStagingPlan(mc.player, mc.level, Math.max(0, walkFailCount));
+        BlockPos nextZone = preferredPlan != null
+                ? preferredPlan.zone()
+                : findNextBuildZone(mc.player, mc.level);
         *//*?} else {*/
-        BlockPos nextZone = findNextBuildZone(mc.player, mc.world);
+        BuildStagingPlan preferredPlan = findBuildStagingPlan(mc.player, mc.world, Math.max(0, walkFailCount));
+        BlockPos nextZone = preferredPlan != null
+                ? preferredPlan.zone()
+                : findNextBuildZone(mc.player, mc.world);
         /*?}*/
         if (nextZone == null) {
             // During liquid pass, don't try elevated zones — liquids don't
@@ -1748,28 +2805,20 @@ public class SchematicPrinter {
         // If this is the exact same zone we just tried, mark it failed
         // and search again to avoid an infinite loop
         if (lastWalkTargetZone != null && nextZone.equals(lastWalkTargetZone)) {
-            failedZones.add(nextZone);
+            rememberFailedBuildZone(nextZone, 2);
             /*? if >=26.1 {*//*
-            nextZone = findNextBuildZone(mc.player, mc.level);
+            preferredPlan = findBuildStagingPlan(mc.player, mc.level, Math.max(0, walkFailCount));
+            nextZone = preferredPlan != null
+                    ? preferredPlan.zone()
+                    : findNextBuildZone(mc.player, mc.level);
             *//*?} else {*/
-            nextZone = findNextBuildZone(mc.player, mc.world);
+            preferredPlan = findBuildStagingPlan(mc.player, mc.world, Math.max(0, walkFailCount));
+            nextZone = preferredPlan != null
+                    ? preferredPlan.zone()
+                    : findNextBuildZone(mc.player, mc.world);
             /*?}*/
             if (nextZone == null) return false;
         }
-
-        /*? if >=26.1 {*//*
-        lastBuildPos = mc.player.blockPosition();
-        *//*?} else {*/
-        lastBuildPos = mc.player.getBlockPos();
-        /*?}*/
-        /*? if >=26.1 {*//*
-        lastWalkTargetZone = nextZone.immutable();
-        *//*?} else {*/
-        lastWalkTargetZone = nextZone.toImmutable();
-        /*?}*/
-
-        noProgressTicks = 0;
-        walkAttemptCooldown = NO_PROGRESS_TIMEOUT; // don't re-scan immediately if this fails
 
         // Check vertical reachability from the best standing position
         /*? if >=26.1 {*//*
@@ -1779,11 +2828,98 @@ public class SchematicPrinter {
         /*?}*/
         int targetY = nextZone.getY();
         int maxReach = (int) Math.ceil(range);
+        BlockPos standPos;
+        BlockPos approachStandPos;
+        if (preferredPlan != null) {
+            if (preferredPlan.approachOnly()) {
+                standPos = null;
+                approachStandPos = preferredPlan.standPos();
+            } else {
+                standPos = preferredPlan.standPos();
+                approachStandPos = preferredPlan.standPos();
+            }
+        } else {
+            /*? if >=26.1 {*//*
+            standPos = findStandingPosition(nextZone, mc.level, mc.player);
+            approachStandPos = standPos != null
+                    ? standPos
+                    : findApproachStandingPosition(nextZone, mc.level, mc.player, walkFailCount);
+            *//*?} else {*/
+            standPos = findStandingPosition(nextZone, mc.world, mc.player);
+            approachStandPos = standPos != null
+                    ? standPos
+                    : findApproachStandingPosition(nextZone, mc.world, mc.player, walkFailCount);
+            /*?}*/
+        }
         /*? if >=26.1 {*//*
-        BlockPos standPos = findStandingPosition(nextZone, mc.level, mc.player);
+        BlockPos playerPos = mc.player.blockPosition();
         *//*?} else {*/
-        BlockPos standPos = findStandingPosition(nextZone, mc.world, mc.player);
+        BlockPos playerPos = mc.player.getBlockPos();
         /*?}*/
+        standPos = sanitizeBuildStandingPosition(nextZone, standPos, playerPos);
+        approachStandPos = sanitizeBuildStandingPosition(nextZone, approachStandPos, playerPos);
+        if (standPos == null && approachStandPos != null
+                /*? if >=26.1 {*//*
+                && !canProbeBuildTargetFromStagingPosition(approachStandPos, nextZone, mc.level)) {
+                *//*?} else {*/
+                && !canProbeBuildTargetFromStagingPosition(approachStandPos, nextZone, mc.world)) {
+                /*?}*/
+            addFailedZoneFootprint(nextZone, 2);
+            addFailedZoneFootprint(approachStandPos, 2);
+            approachStandPos = null;
+            invalidateBuildStagingPlanCache();
+        }
+        if (standPos == null && approachStandPos == null) {
+            /*? if >=26.1 {*//*
+            BuildStagingPlan stagingPlan = findBuildStagingPlan(mc.player, mc.level, walkFailCount);
+            *//*?} else {*/
+            BuildStagingPlan stagingPlan = findBuildStagingPlan(mc.player, mc.world, walkFailCount);
+            /*?}*/
+            if (stagingPlan != null) {
+                nextZone = stagingPlan.zone();
+                if (stagingPlan.approachOnly()) {
+                    approachStandPos = stagingPlan.standPos();
+                } else {
+                    standPos = stagingPlan.standPos();
+                }
+                LOGGER.debug("Resolved interior build start via staging zone {} {} {} -> stand {} {} {}",
+                        nextZone.getX(), nextZone.getY(), nextZone.getZ(),
+                        stagingPlan.standPos().getX(),
+                        stagingPlan.standPos().getY(),
+                        stagingPlan.standPos().getZ());
+            }
+        }
+        PacketTelemetry.mark("build walk choice zone=" + posLabel(nextZone)
+                + " stand=" + posLabel(standPos)
+                + " approach=" + posLabel(approachStandPos)
+                + " player=" + posLabel(playerPos));
+
+        if (standPos == null && approachStandPos == null) {
+            if (startAccessMiningToBuildPocket(mc, nextZone)) {
+                return true;
+            }
+            PacketTelemetry.mark("build access none zone=" + posLabel(nextZone)
+                    + " player=" + posLabel(playerPos));
+        }
+
+        /*? if >=26.1 {*//*
+        lastBuildPos = mc.player.blockPosition();
+        *//*?} else {*/
+        lastBuildPos = mc.player.getBlockPos();
+        /*?}*/
+        /*? if >=26.1 {*//*
+        lastWalkTargetZone = nextZone.immutable();
+        lastWalkStandPos = standPos != null ? standPos.immutable() : null;
+        lastWalkApproachPos = approachStandPos != null ? approachStandPos.immutable() : null;
+        *//*?} else {*/
+        lastWalkTargetZone = nextZone.toImmutable();
+        lastWalkStandPos = standPos != null ? standPos.toImmutable() : null;
+        lastWalkApproachPos = approachStandPos != null ? approachStandPos.toImmutable() : null;
+        /*?}*/
+
+        noProgressTicks = 0;
+        walkAttemptCooldown = NO_PROGRESS_TIMEOUT; // don't re-scan immediately if this fails
+
         int effectiveStandY = standPos != null ? standPos.getY() : playerY;
 
         // Determine if the target is vertically unreachable from ground.
@@ -1843,6 +2979,19 @@ public class SchematicPrinter {
                 autoState = AutoState.WALKING_TO_BUILD;
                 LOGGER.debug("Target above — walking to standing position {} {} {} (on placed structure)",
                         standPos.getX(), standPos.getY(), standPos.getZ());
+            } else if (approachStandPos != null) {
+                /*? if >=26.1 {*//*
+                Level w = mc.level;
+                *//*?} else {*/
+                World w = mc.world;
+                /*?}*/
+                if (w != null) {
+                    PathWalker.setReservedItems(getNeededItemsNearby(mc.player, w, 200));
+                }
+                PathWalker.walkToWithPlacement(approachStandPos, maxReach, mc.player);
+                autoState = AutoState.WALKING_TO_BUILD;
+                LOGGER.debug("Target above — approaching staging position {} {} {}",
+                        approachStandPos.getX(), approachStandPos.getY(), approachStandPos.getZ());
             } else {
                 // No standing position found — let Baritone scaffold its own
                 // path to the build zone via waypoints.
@@ -1856,7 +3005,19 @@ public class SchematicPrinter {
 
         // Target is too far below — navigate down.
         if (targetY < effectiveStandY - maxReach) {
-            PathWalker.walkToNearby(nextZone, maxReach);
+            if (approachStandPos != null) {
+                /*? if >=26.1 {*//*
+                Level w = mc.level;
+                *//*?} else {*/
+                World w = mc.world;
+                /*?}*/
+                if (w != null) {
+                    PathWalker.setReservedItems(getNeededItemsNearby(mc.player, w, 200));
+                }
+                PathWalker.walkToWithPlacement(approachStandPos, maxReach, mc.player);
+            } else {
+                PathWalker.walkToNearby(nextZone, maxReach);
+            }
             autoState = AutoState.WALKING_TO_BUILD;
             LOGGER.debug("Target below — navigating to {} {} {}",
                     nextZone.getX(), nextZone.getY(), nextZone.getZ());
@@ -1885,11 +3046,22 @@ public class SchematicPrinter {
                     .squaredDistanceTo(Vec3d.ofCenter(standPos));
             /*?}*/
             if (standDist <= 2.25) { // 1.5 blocks
-                // Already at the standing spot — just build
-                autoState = AutoState.BUILDING;
-                return true;
+                /*? if >=26.1 {*//*
+                if (hasBuildHandoffOpportunityFromHere(mc.player, mc.level)) {
+                *//*?} else {*/
+                if (hasBuildHandoffOpportunityFromHere(mc.player, mc.world)) {
+                /*?}*/
+                    resumeBuildFromCurrentStance("already at viable stand position");
+                    return true;
+                }
             }
             PathWalker.walkTo(standPos);
+        } else if (approachStandPos != null) {
+            if (standPos == null) {
+                PathWalker.walkToNearby(approachStandPos, 1);
+            } else {
+                PathWalker.walkTo(approachStandPos);
+            }
         } else {
             // No standing position or repeated failures — walk near the target
             // zone directly.  With air-placement enabled, the player doesn't
@@ -1912,6 +3084,7 @@ public class SchematicPrinter {
         int totalSetbacks = setbackMonitor.totalSetbacks();
         if (totalSetbacks != observedWalkingSetbacks) {
             observedWalkingSetbacks = totalSetbacks;
+            observedPlacementSetbacks = totalSetbacks;
             walkingSetbackPauseTicks = WALK_SETBACK_PAUSE_TICKS;
             if (PathWalker.isActive()) {
                 PathWalker.stop();
@@ -1919,6 +3092,23 @@ public class SchematicPrinter {
             PlacementEngine.reset();
             noProgressTicks = 0;
             walkAttemptCooldown = Math.max(walkAttemptCooldown, WALK_SETBACK_PAUSE_TICKS);
+            if (arrivalState == AutoState.BUILDING) {
+                /*? if >=26.1 {*//*
+                if (canBuildFromCurrentStance(mc.player, mc.level)) {
+                *//*?} else {*/
+                if (canBuildFromCurrentStance(mc.player, mc.world)) {
+                /*?}*/
+                    placementFailurePauseTicks = Math.max(
+                            placementFailurePauseTicks, PLACEMENT_FAILURE_PAUSE_TICKS);
+                    resumeBuildFromCurrentStance("walking setback stabilized current stance");
+                    LOGGER.debug("Setback detected while walking to build — resuming from stable current stance");
+                } else {
+                    refreshPlacementPlannerState();
+                    autoState = AutoState.WALKING_TO_BUILD;
+                    LOGGER.debug("Setback detected while walking to build — current stance unstable, replanning build approach");
+                }
+                return;
+            }
             LOGGER.debug("Setback detected while walking — pausing before replanning");
             return;
         }
@@ -1932,6 +3122,42 @@ public class SchematicPrinter {
         }
 
         if (!PathWalker.isActive()) {
+            if (arrivalState == AutoState.BUILDING) {
+                /*? if >=26.1 {*//*
+                if (shouldResumeBuildFromCurrentWalk(mc.player, mc.level)) {
+                *//*?} else {*/
+                if (shouldResumeBuildFromCurrentWalk(mc.player, mc.world)) {
+                /*?}*/
+                    PacketTelemetry.mark("build walk handoff staging="
+                            + posLabel(lastWalkStandPos != null ? lastWalkStandPos : lastWalkApproachPos)
+                            + " zone=" + posLabel(lastWalkTargetZone));
+                    resumeBuildFromCurrentStance("walk finished at build staging");
+                    LOGGER.debug("Walk finished at build staging — resuming build evaluation from current stance");
+                    return;
+                }
+                /*? if >=26.1 {*//*
+                if (canForceBuildEvaluationFromCurrentWalk(mc.player, mc.level)) {
+                *//*?} else {*/
+                if (canForceBuildEvaluationFromCurrentWalk(mc.player, mc.world)) {
+                /*?}*/
+                    PacketTelemetry.mark("build walk handoff staging="
+                            + posLabel(lastWalkStandPos != null ? lastWalkStandPos : lastWalkApproachPos)
+                            + " zone=" + posLabel(lastWalkTargetZone));
+                    resumeBuildFromCurrentStance("arrived at build staging position");
+                    LOGGER.debug("Walk ended at build staging position — forcing build evaluation from current stance");
+                    return;
+                }
+                if (isAtCurrentBuildStagingPosition(mc.player)) {
+                    markCurrentBuildApproachFailed("walk ended at non-buildable staging position");
+                }
+                walkFailCount = 0;
+                triedPlacementWalk = false;
+                if (tryWalkToNextZone(mc)) {
+                    return;
+                }
+                LOGGER.debug("Walk ended without a stable build stance; waiting to re-acquire a valid approach");
+                return;
+            }
             // multi-phase descent continuation
             // walkToZoneWithPlacement may have set up a descent for
             // WALKING_BACK or WALKING_TO_BUILD.  Handle phase transitions
@@ -2006,6 +3232,36 @@ public class SchematicPrinter {
                 unreachableChests.clear();
                 shulkerNoSpaceSkipped = false;
                 LOGGER.debug("Arrived at target");
+                if (arrivalState == AutoState.BUILDING) {
+                    /*? if >=26.1 {*//*
+                    if (!shouldResumeBuildFromCurrentWalk(mc.player, mc.level)) {
+                    *//*?} else {*/
+                    if (!shouldResumeBuildFromCurrentWalk(mc.player, mc.world)) {
+                    /*?}*/
+                        /*? if >=26.1 {*//*
+                        if (canForceBuildEvaluationFromCurrentWalk(mc.player, mc.level)) {
+                        *//*?} else {*/
+                        if (canForceBuildEvaluationFromCurrentWalk(mc.player, mc.world)) {
+                        /*?}*/
+                            PacketTelemetry.mark("build arrive handoff staging="
+                                    + posLabel(lastWalkStandPos != null ? lastWalkStandPos : lastWalkApproachPos)
+                                    + " zone=" + posLabel(lastWalkTargetZone));
+                            resumeBuildFromCurrentStance("arrived at staging target");
+                            return;
+                        }
+                        if (isAtCurrentBuildStagingPosition(mc.player)) {
+                            markCurrentBuildApproachFailed("arrived at non-buildable staging position");
+                        }
+                        if (tryWalkToNextZone(mc)) {
+                            return;
+                        }
+                        autoState = AutoState.WALKING_TO_BUILD;
+                        LOGGER.debug("Arrived near target but stance is not buildable; holding walking state for replan");
+                        return;
+                    }
+                    resumeBuildFromCurrentStance("arrived at build target");
+                    return;
+                }
                 autoState = arrivalState;
                 noProgressTicks = 0;
             } else {
@@ -2020,6 +3276,20 @@ public class SchematicPrinter {
                 boolean clearingRetry = arrivalState == AutoState.CLEARING_AREA;
                 if ((clearingRetry || !pathImpossible)
                         && walkFailCount < MAX_WALK_RETRIES) {
+                    if (clearingRetry && lastClearTargetBlock != null) {
+                        boolean restartedClearWalk;
+                        /*? if >=26.1 {*//*
+                        restartedClearWalk = startClearWalk(mc.player, mc.level, lastClearTargetBlock);
+                        *//*?} else {*/
+                        restartedClearWalk = startClearWalk(mc.player, mc.world, lastClearTargetBlock);
+                        /*?}*/
+                        if (restartedClearWalk) {
+                            LOGGER.debug("Path blocked, replanning clear approach");
+                            return;
+                        }
+                        autoState = AutoState.CLEARING_AREA;
+                        return;
+                    }
                     // Retry near the BUILD ZONE (not the standing position
                     // that may be across a gap) with increasing radius.
                     BlockPos retryTarget = lastWalkTargetZone != null
@@ -2041,20 +3311,25 @@ public class SchematicPrinter {
                 if (arrivalState == AutoState.BUILDING
                         || arrivalState == AutoState.CLEARING_AREA) {
                     boolean inRange = false;
-                    if (lastWalkTargetZone != null) {
+                    if (arrivalState == AutoState.CLEARING_AREA && lastClearTargetBlock != null) {
+                        /*? if >=26.1 {*//*
+                        inRange = canClearTargetFromHere(mc.player, mc.level, lastClearTargetBlock);
+                        *//*?} else {*/
+                        inRange = canClearTargetFromHere(mc.player, mc.world, lastClearTargetBlock);
+                        /*?}*/
+                    } else if (lastWalkTargetZone != null) {
                         /*? if >=26.1 {*//*
                         double d = mc.player.getEyePosition()
+                                .distanceToSqr(Vec3.atCenterOf(lastWalkTargetZone));
                         *//*?} else {*/
                         double d = mc.player.getEyePos()
-                        /*?}*/
-                                /*? if >=26.1 {*//*
-                                .distanceToSqr(Vec3.atCenterOf(lastWalkTargetZone));
-                                *//*?} else {*/
                                 .squaredDistanceTo(Vec3d.ofCenter(lastWalkTargetZone));
-                                /*?}*/
+                        /*?}*/
                         if (d <= range * range) inRange = true;
                     }
-                    if (!inRange && walkTarget != null) {
+                    if (!inRange
+                            && arrivalState != AutoState.CLEARING_AREA
+                            && walkTarget != null) {
                         /*? if >=26.1 {*//*
                         double d = mc.player.position()
                                 .distanceToSqr(Vec3.atCenterOf(walkTarget));
@@ -2068,10 +3343,43 @@ public class SchematicPrinter {
                         if (d <= (range + 1) * (range + 1)) inRange = true;
                     }
                     if (inRange) {
+                        if (arrivalState == AutoState.BUILDING
+                                /*? if >=26.1 {*//*
+                                && !shouldResumeBuildFromCurrentWalk(mc.player, mc.level)) {
+                                *//*?} else {*/
+                                && !shouldResumeBuildFromCurrentWalk(mc.player, mc.world)) {
+                                /*?}*/
+                            /*? if >=26.1 {*//*
+                            if (canForceBuildEvaluationFromCurrentWalk(mc.player, mc.level)) {
+                            *//*?} else {*/
+                            if (canForceBuildEvaluationFromCurrentWalk(mc.player, mc.world)) {
+                            /*?}*/
+                                PacketTelemetry.mark("build close handoff staging="
+                                        + posLabel(lastWalkStandPos != null ? lastWalkStandPos : lastWalkApproachPos)
+                                        + " zone=" + posLabel(lastWalkTargetZone));
+                                resumeBuildFromCurrentStance("close enough at staging target");
+                                return;
+                            }
+            if (isAtCurrentBuildStagingPosition(mc.player)) {
+                                markCurrentBuildApproachFailed("close enough but staging stance is not buildable");
+                            }
+                            if (lastWalkTargetZone != null) rememberFailedBuildZone(lastWalkTargetZone, 2);
+                            if (walkTarget != null) rememberFailedBuildZone(walkTarget, 1);
+                            if (tryWalkToNextZone(mc)) {
+                                return;
+                            }
+                            autoState = AutoState.WALKING_TO_BUILD;
+                            LOGGER.debug("Walk retries exhausted near target, but stance is not buildable; holding walking state");
+                            return;
+                        }
                         triedPlacementWalk = false;
-                        if (lastWalkTargetZone != null) failedZones.add(lastWalkTargetZone);
-                        if (walkTarget != null) failedZones.add(walkTarget);
-                        autoState = arrivalState;
+                        if (lastWalkTargetZone != null) rememberFailedBuildZone(lastWalkTargetZone, 2);
+                        if (walkTarget != null) rememberFailedBuildZone(walkTarget, 1);
+                        if (arrivalState == AutoState.BUILDING) {
+                            resumeBuildFromCurrentStance("walk retries exhausted but target is in range");
+                        } else {
+                            autoState = arrivalState;
+                        }
                         return;
                     }
                 }
@@ -2109,14 +3417,26 @@ public class SchematicPrinter {
 
                 triedPlacementWalk = false;
                 if (statusMessages) {
-                    ChatHelper.info("§eWalking timed out, building from here.");
+                    ChatHelper.info("§eWalking timed out, replanning from a new build zone.");
                 }
-                // Mark BOTH the walk target and the build target zone as failed
-                if (walkTarget != null) failedZones.add(walkTarget);
-                if (lastWalkTargetZone != null) failedZones.add(lastWalkTargetZone);
-                if (arrivalState == AutoState.CLEARING_AREA && lastWalkTargetZone != null) {
-                    failedClearTargets.add(lastWalkTargetZone);
+                // Mark the approach and the blocked target as failed, then
+                // immediately try to acquire a different zone before falling
+                // back into the same dead area.
+                if (walkTarget != null) rememberFailedBuildZone(walkTarget, 1);
+                if (lastWalkTargetZone != null) rememberFailedBuildZone(lastWalkTargetZone, 2);
+                if (arrivalState == AutoState.CLEARING_AREA && lastClearTargetBlock != null) {
+                    failedClearTargets.add(lastClearTargetBlock);
                     consecutiveClearFailures++;
+                }
+                if (arrivalState == AutoState.BUILDING) {
+                    walkAttemptCooldown = 0;
+                    if (tryWalkToNextZone(mc)) {
+                        return;
+                    }
+                    autoState = AutoState.WALKING_TO_BUILD;
+                    LOGGER.debug("Walking timed out without finding a fresh build approach; staying in build-approach mode");
+                    noProgressTicks = 0;
+                    return;
                 }
                 autoState = arrivalState;
                 noProgressTicks = 0;
@@ -2135,18 +3455,21 @@ public class SchematicPrinter {
                 && PathWalker.getTicksWalking() >= 30) {
             boolean closeEnough = false;
 
-            // Check 1: player eye is within placement reach of the build zone
-            if (lastWalkTargetZone != null) {
+            // Check 1: only stop early if the target is actually interactable now.
+            if (arrivalState == AutoState.CLEARING_AREA && lastClearTargetBlock != null) {
+                /*? if >=26.1 {*//*
+                closeEnough = canClearTargetFromHere(mc.player, mc.level, lastClearTargetBlock);
+                *//*?} else {*/
+                closeEnough = canClearTargetFromHere(mc.player, mc.world, lastClearTargetBlock);
+                /*?}*/
+            } else if (lastWalkTargetZone != null) {
                 /*? if >=26.1 {*//*
                 double distSq = mc.player.getEyePosition()
+                        .distanceToSqr(Vec3.atCenterOf(lastWalkTargetZone));
                 *//*?} else {*/
                 double distSq = mc.player.getEyePos()
-                /*?}*/
-                        /*? if >=26.1 {*//*
-                        .distanceToSqr(Vec3.atCenterOf(lastWalkTargetZone));
-                        *//*?} else {*/
                         .squaredDistanceTo(Vec3d.ofCenter(lastWalkTargetZone));
-                        /*?}*/
+                /*?}*/
                 if (distSq <= range * range) {
                     closeEnough = true;
                 }
@@ -2155,7 +3478,7 @@ public class SchematicPrinter {
             // Check 2: player is within a few blocks of the walk target
             if (!closeEnough) {
                 BlockPos walkTarget = PathWalker.getTarget();
-                if (walkTarget != null) {
+                if (arrivalState != AutoState.CLEARING_AREA && walkTarget != null) {
                     /*? if >=26.1 {*//*
                     double walkDistSq = mc.player.position()
                             .distanceToSqr(Vec3.atCenterOf(walkTarget));
@@ -2173,12 +3496,93 @@ public class SchematicPrinter {
             }
 
             if (closeEnough) {
+                if (arrivalState == AutoState.BUILDING
+                        /*? if >=26.1 {*//*
+                        && !shouldResumeBuildFromCurrentWalk(mc.player, mc.level)) {
+                        *//*?} else {*/
+                        && !shouldResumeBuildFromCurrentWalk(mc.player, mc.world)) {
+                        /*?}*/
+                    if (isAtCurrentBuildStagingPosition(mc.player)) {
+                        markCurrentBuildApproachFailed("stopped early at non-buildable staging position");
+                    }
+                    if (tryWalkToNextZone(mc)) {
+                        return;
+                    }
+                    autoState = AutoState.WALKING_TO_BUILD;
+                    LOGGER.debug("Stopped early near target, but stance is not buildable; keeping walker in build-approach mode");
+                    return;
+                }
                 PathWalker.stop();
                 walkFailCount = 0;
                 triedPlacementWalk = false;
-                if (lastWalkTargetZone != null) failedZones.add(lastWalkTargetZone);
-                autoState = arrivalState;
+                if (lastWalkTargetZone != null) rememberFailedBuildZone(lastWalkTargetZone, 2);
+                if (arrivalState == AutoState.BUILDING) {
+                    resumeBuildFromCurrentStance("stopped early near build target");
+                } else {
+                    autoState = arrivalState;
+                }
                 return;
+            }
+
+            if (arrivalState == AutoState.BUILDING
+                    && lastWalkTargetZone != null
+                    && PathWalker.getTicksWalking() >= 80) {
+                double targetDistSq;
+                double walkDistSq = Double.MAX_VALUE;
+                BlockPos walkTarget = PathWalker.getTarget();
+                /*? if >=26.1 {*//*
+                targetDistSq = mc.player.position()
+                        .distanceToSqr(Vec3.atCenterOf(lastWalkTargetZone));
+                if (walkTarget != null) {
+                    walkDistSq = mc.player.position()
+                            .distanceToSqr(Vec3.atCenterOf(walkTarget));
+                }
+                boolean hasHandoff = hasBuildHandoffOpportunityFromHere(mc.player, mc.level)
+                        || canForceBuildEvaluationFromCurrentWalk(mc.player, mc.level);
+                *//*?} else if >=1.21.10 {*//*
+                targetDistSq = mc.player.getSyncedPos()
+                        .squaredDistanceTo(Vec3d.ofCenter(lastWalkTargetZone));
+                if (walkTarget != null) {
+                    walkDistSq = mc.player.getSyncedPos()
+                            .squaredDistanceTo(Vec3d.ofCenter(walkTarget));
+                }
+                boolean hasHandoff = hasBuildHandoffOpportunityFromHere(mc.player, mc.world)
+                        || canForceBuildEvaluationFromCurrentWalk(mc.player, mc.world);
+                *//*?} else {*/
+                targetDistSq = mc.player.getPos()
+                        .squaredDistanceTo(Vec3d.ofCenter(lastWalkTargetZone));
+                if (walkTarget != null) {
+                    walkDistSq = mc.player.getPos()
+                            .squaredDistanceTo(Vec3d.ofCenter(walkTarget));
+                }
+                boolean hasHandoff = hasBuildHandoffOpportunityFromHere(mc.player, mc.world)
+                        || canForceBuildEvaluationFromCurrentWalk(mc.player, mc.world);
+                /*?}*/
+                double targetNearSq = (range + 4.0) * (range + 4.0);
+                boolean nearBadApproach = targetDistSq <= targetNearSq
+                        || walkDistSq <= 9.0;
+                if (nearBadApproach && !hasHandoff) {
+                    /*? if >=26.1 {*//*
+                    BlockPos playerBlockPos = mc.player.blockPosition();
+                    *//*?} else {*/
+                    BlockPos playerBlockPos = mc.player.getBlockPos();
+                    /*?}*/
+                    PacketTelemetry.mark("build handoff chokepoint"
+                            + " zone=" + posLabel(lastWalkTargetZone)
+                            + " stand=" + posLabel(lastWalkStandPos)
+                            + " approach=" + posLabel(lastWalkApproachPos)
+                            + " player=" + posLabel(playerBlockPos));
+                    PathWalker.stop();
+                    markCurrentBuildApproachFailed("chokepoint without placeable handoff");
+                    walkFailCount = 0;
+                    triedPlacementWalk = false;
+                    if (tryWalkToNextZone(mc)) {
+                        return;
+                    }
+                    autoState = AutoState.WALKING_TO_BUILD;
+                    LOGGER.debug("Build handoff chokepoint detected; waiting for a fresh build approach");
+                    return;
+                }
             }
         }
 
@@ -2195,6 +3599,131 @@ public class SchematicPrinter {
                 /*?}*/
             }
         }
+        PathWalker.tick();
+    }
+
+    /*? if >=26.1 {*//*
+    private void tickWalkingToClear(Minecraft mc) {
+    *//*?} else {*/
+    private void tickWalkingToClear(MinecraftClient mc) {
+    /*?}*/
+        SetbackMonitor setbackMonitor = SetbackMonitor.get();
+        int totalSetbacks = setbackMonitor.totalSetbacks();
+        if (totalSetbacks != observedWalkingSetbacks) {
+            observedWalkingSetbacks = totalSetbacks;
+            walkingSetbackPauseTicks = WALK_SETBACK_PAUSE_TICKS;
+            if (PathWalker.isActive()) {
+                PathWalker.stop();
+            }
+            PlacementEngine.reset();
+            noProgressTicks = 0;
+            walkAttemptCooldown = Math.max(walkAttemptCooldown, WALK_SETBACK_PAUSE_TICKS);
+            LOGGER.debug("Setback detected while clearing — pausing before replanning");
+            return;
+        }
+
+        if (walkingSetbackPauseTicks > 0) {
+            walkingSetbackPauseTicks--;
+            return;
+        }
+        if (!setbackMonitor.isCalm()) {
+            return;
+        }
+
+        if (!PathWalker.isActive()) {
+            if (lastClearTargetBlock != null) {
+                /*? if >=26.1 {*//*
+                if (canClearTargetFromHere(mc.player, mc.level, lastClearTargetBlock)) {
+                *//*?} else {*/
+                if (canClearTargetFromHere(mc.player, mc.world, lastClearTargetBlock)) {
+                /*?}*/
+                    walkFailCount = 0;
+                    triedPlacementWalk = false;
+                    walkingSetbackPauseTicks = 0;
+                    LOGGER.debug("Clear target is now in range");
+                    autoState = AutoState.CLEARING_AREA;
+                    noProgressTicks = 0;
+                    return;
+                }
+            }
+
+            walkFailCount++;
+            if (lastClearTargetBlock != null && walkFailCount < MAX_WALK_RETRIES) {
+                boolean restartedClearWalk;
+                /*? if >=26.1 {*//*
+                restartedClearWalk = startClearWalk(mc.player, mc.level, lastClearTargetBlock);
+                *//*?} else {*/
+                restartedClearWalk = startClearWalk(mc.player, mc.world, lastClearTargetBlock);
+                /*?}*/
+                if (restartedClearWalk) {
+                    LOGGER.debug("Clear walk ended early, replanning exact approach");
+                    return;
+                }
+            }
+
+            BlockPos walkTarget = PathWalker.getTarget();
+            if (!triedPlacementWalk && lastWalkTargetZone != null) {
+                triedPlacementWalk = true;
+                LOGGER.debug("Can't path to clear target — trying vanilla walk");
+                PathWalker.walkToVanilla(lastWalkTargetZone);
+                return;
+            }
+
+            triedPlacementWalk = false;
+            walkFailCount = 0;
+            if (statusMessages) {
+                ChatHelper.info("§eWalking timed out, clearing from here.");
+            }
+            if (walkTarget != null) failedZones.add(walkTarget);
+            if (lastWalkTargetZone != null) failedZones.add(lastWalkTargetZone);
+            if (lastClearTargetBlock != null) {
+                failedClearTargets.add(lastClearTargetBlock);
+                consecutiveClearFailures++;
+            }
+            autoState = AutoState.CLEARING_AREA;
+            noProgressTicks = 0;
+            return;
+        }
+
+        if (PathWalker.getTicksWalking() >= 30 && lastClearTargetBlock != null) {
+            boolean closeEnough;
+            /*? if >=26.1 {*//*
+            closeEnough = canClearTargetFromHere(mc.player, mc.level, lastClearTargetBlock);
+            *//*?} else {*/
+            closeEnough = canClearTargetFromHere(mc.player, mc.world, lastClearTargetBlock);
+            /*?}*/
+            if (closeEnough) {
+                PathWalker.stop();
+                walkFailCount = 0;
+                triedPlacementWalk = false;
+                autoState = AutoState.CLEARING_AREA;
+                return;
+            }
+        }
+
+        if (!triedPlacementWalk
+                && lastClearTargetBlock != null
+                && PathWalker.getTicksWalking() >= 20) {
+            /*? if >=26.1 {*//*
+            double clearDistSq = mc.player.position().distanceToSqr(Vec3.atCenterOf(lastClearTargetBlock));
+            boolean canClear = canClearTargetFromHere(mc.player, mc.level, lastClearTargetBlock);
+            *//*?} else if >=1.21.10 {*//*
+            double clearDistSq = mc.player.getSyncedPos().squaredDistanceTo(Vec3d.ofCenter(lastClearTargetBlock));
+            boolean canClear = canClearTargetFromHere(mc.player, mc.world, lastClearTargetBlock);
+            *//*?} else {*/
+            double clearDistSq = mc.player.getPos().squaredDistanceTo(Vec3d.ofCenter(lastClearTargetBlock));
+            boolean canClear = canClearTargetFromHere(mc.player, mc.world, lastClearTargetBlock);
+            /*?}*/
+            if (!canClear && clearDistSq <= CLEAR_FINAL_APPROACH_TRIGGER_SQ) {
+                triedPlacementWalk = true;
+                LOGGER.debug("Clear target nearby but unresolved — forcing vanilla final approach");
+                PathWalker.walkToVanillaExact(
+                        lastClearTargetBlock,
+                        CLEAR_PATH_ARRIVAL_DISTANCE * CLEAR_PATH_ARRIVAL_DISTANCE);
+                return;
+            }
+        }
+
         PathWalker.tick();
     }
 
@@ -2267,8 +3796,9 @@ public class SchematicPrinter {
     *//*?} else {*/
     private boolean tryClearNextBlock(ClientPlayerEntity player, World world) {
     /*?}*/
-        double rangeSq = range * range;
-        int maxReach = (int) Math.ceil(range);
+        double clearReach = getClearReach();
+        double rangeSq = clearReach * clearReach;
+        int maxReach = (int) Math.ceil(clearReach);
         Set<BlockPos> protectedStorage = getProtectedStoragePositions();
 
         /*? if >=26.1 {*//*
@@ -2352,6 +3882,7 @@ public class SchematicPrinter {
         *//*?} else {*/
         clearBreakTarget = best.toImmutable();
         /*?}*/
+        lastClearTargetBlock = clearBreakTarget;
         clearBreakTicks = 0;
         /*? if >=26.1 {*//*
         clearSavedYaw = mc.player.getYRot();
@@ -2481,6 +4012,116 @@ public class SchematicPrinter {
         return best;
     }
 
+    // Reuse the build standing scan so clearing walks to a mineable spot.
+    /*? if >=26.1 {*//*
+    private BlockPos findClearApproachPosition(BlockPos target, Level world, LocalPlayer player) {
+    *//*?} else {*/
+    private BlockPos findClearApproachPosition(BlockPos target, World world, ClientPlayerEntity player) {
+    /*?}*/
+        return findStandingPosition(target, world, player, getClearReach());
+    }
+
+    // Only stop walking when the current position can really break this block.
+    /*? if >=26.1 {*//*
+    private boolean canClearTargetFromHere(LocalPlayer player, Level world, BlockPos target) {
+    *//*?} else {*/
+    private boolean canClearTargetFromHere(ClientPlayerEntity player, World world, BlockPos target) {
+    /*?}*/
+        if (player == null || world == null || target == null) return false;
+        double clearReach = getClearReach();
+        BlockState existing = world.getBlockState(target);
+        if (isStorageBlacklistedForClearing(existing, target, getProtectedStoragePositions())) return false;
+        if (existing.isAir()) return false;
+        /*? if >=26.1 {*//*
+        if (existing.canBeReplaced()) return false;
+        return player.getEyePosition().distanceToSqr(Vec3.atCenterOf(target)) <= clearReach * clearReach;
+        *//*?} else {*/
+        if (existing.isReplaceable()) return false;
+        return player.getEyePos().squaredDistanceTo(Vec3d.ofCenter(target)) <= clearReach * clearReach;
+        /*?}*/
+    }
+
+    // Start a clearing walk that ends in actual mining range.
+    /*? if >=26.1 {*//*
+    private boolean startClearWalk(LocalPlayer player, Level world, BlockPos target) {
+    *//*?} else {*/
+    private boolean startClearWalk(ClientPlayerEntity player, World world, BlockPos target) {
+    /*?}*/
+        if (target == null) return false;
+
+        /*? if >=26.1 {*//*
+        lastClearTargetBlock = target.immutable();
+        *//*?} else {*/
+        lastClearTargetBlock = target.toImmutable();
+        /*?}*/
+
+        if (canClearTargetFromHere(player, world, target)) {
+            return false;
+        }
+
+        /*? if >=26.1 {*//*
+        lastWalkTargetZone = target.immutable();
+        *//*?} else {*/
+        lastWalkTargetZone = target.toImmutable();
+        /*?}*/
+        PathWalker.walkToAdjacentExact(target, CLEAR_PATH_ARRIVAL_DISTANCE);
+        return true;
+    }
+
+    /*? if >=26.1 {*//*
+    private boolean startSpecificClearBreak(Minecraft mc, LocalPlayer player, Level world, BlockPos target) {
+    *//*?} else {*/
+    private boolean startSpecificClearBreak(MinecraftClient mc, ClientPlayerEntity player, World world, BlockPos target) {
+    /*?}*/
+        if (mc == null || player == null || world == null || target == null) return false;
+        if (!canClearTargetFromHere(player, world, target)) return false;
+
+        /*? if >=26.1 {*//*
+        clearBreakTarget = target.immutable();
+        *//*?} else {*/
+        clearBreakTarget = target.toImmutable();
+        /*?}*/
+        lastClearTargetBlock = clearBreakTarget;
+        clearBreakTicks = 0;
+        /*? if >=26.1 {*//*
+        clearSavedYaw = mc.player.getYRot();
+        clearSavedPitch = mc.player.getXRot();
+        Vec3 eye = player.getEyePosition();
+        Vec3 blockCenter = Vec3.atCenterOf(clearBreakTarget);
+        Vec3 toBlock = blockCenter.subtract(eye);
+        *//*?} else {*/
+        clearSavedYaw = mc.player.getYaw();
+        clearSavedPitch = mc.player.getPitch();
+        Vec3d eye = player.getEyePos();
+        Vec3d blockCenter = Vec3d.ofCenter(clearBreakTarget);
+        Vec3d toBlock = blockCenter.subtract(eye);
+        /*?}*/
+
+        BlockState clearState = world.getBlockState(clearBreakTarget);
+        PlacementEngine.selectBestTool(mc.player, mc, clearState);
+
+        double horizDist = Math.sqrt(toBlock.x * toBlock.x + toBlock.z * toBlock.z);
+        /*? if >=26.1 {*//*
+        float breakYaw = (float) (Mth.atan2(toBlock.z, toBlock.x) * (180.0 / Math.PI)) - 90.0f;
+        float breakPitch = (float) -(Mth.atan2(toBlock.y, horizDist) * (180.0 / Math.PI));
+        PlacementEngine.setLookRotation(mc.player, breakYaw, Mth.clamp(breakPitch, -90.0f, 90.0f));
+        mc.gameMode.startDestroyBlock(clearBreakTarget, Direction.UP);
+        mc.player.swing(InteractionHand.MAIN_HAND);
+        *//*?} else {*/
+        float breakYaw = (float) (MathHelper.atan2(toBlock.z, toBlock.x) * (180.0 / Math.PI)) - 90.0f;
+        float breakPitch = (float) -(MathHelper.atan2(toBlock.y, horizDist) * (180.0 / Math.PI));
+        PlacementEngine.setLookRotation(mc.player, breakYaw, MathHelper.clamp(breakPitch, -90.0f, 90.0f));
+        mc.interactionManager.attackBlock(clearBreakTarget, Direction.UP);
+        mc.player.swingHand(Hand.MAIN_HAND);
+        /*?}*/
+
+        PacketTelemetry.mark("clear direct target=" + posLabel(clearBreakTarget)
+                + " access=" + accessClearInProgress);
+        LOGGER.debug("Clearing targeted block at {} {} {}",
+                clearBreakTarget.getX(), clearBreakTarget.getY(), clearBreakTarget.getZ());
+        return true;
+    }
+
     // Clears illegal blocks from the schematic footprint.
     // Mirrors the building tick: try breaking in-reach blocks first
     // (tryClearNextBlock), then walk to the nearest remaining illegal
@@ -2511,6 +4152,11 @@ public class SchematicPrinter {
                 mc.interactionManager.cancelBlockBreaking();
                 /*?}*/
                 clearBreakTarget = null;
+                lastClearTargetBlock = null;
+                if (accessClearInProgress) {
+                    accessClearInProgress = false;
+                    resumeBuildFromCurrentStance("access clear target became invalid");
+                }
                 clearBreakTicks = 0;
                 return;
             }
@@ -2539,8 +4185,13 @@ public class SchematicPrinter {
                 consecutiveClearFailures = 0;
                 clearStallResets = 0;
                 clearBreakTarget = null;
+                lastClearTargetBlock = null;
                 clearBreakTicks = 0;
                 clearCooldownTicks = BREAK_COOLDOWN_TICKS;
+                if (accessClearInProgress) {
+                    accessClearInProgress = false;
+                    resumeBuildFromCurrentStance("access clear complete");
+                }
                 return;
             }
 
@@ -2568,8 +4219,13 @@ public class SchematicPrinter {
                 failedClearTargets.add(clearBreakTarget);
                 consecutiveClearFailures++;
                 clearBreakTarget = null;
+                lastClearTargetBlock = null;
                 clearBreakTicks = 0;
                 clearCooldownTicks = BREAK_COOLDOWN_TICKS;
+                if (accessClearInProgress) {
+                    accessClearInProgress = false;
+                    enterBuildMode("access clear timed out");
+                }
                 return;
             }
 
@@ -2626,6 +4282,31 @@ public class SchematicPrinter {
             return;
         }
 
+        if (lastClearTargetBlock != null) {
+            BlockState targetedState = world.getBlockState(lastClearTargetBlock);
+            /*? if >=26.1 {*//*
+            boolean targetedGone = targetedState.isAir() || targetedState.canBeReplaced();
+            *//*?} else {*/
+            boolean targetedGone = targetedState.isAir() || targetedState.isReplaceable();
+            /*?}*/
+            if (targetedGone) {
+                lastClearTargetBlock = null;
+                if (accessClearInProgress) {
+                    accessClearInProgress = false;
+                    resumeBuildFromCurrentStance("access clear complete");
+                    return;
+                }
+            } else {
+                if (startSpecificClearBreak(mc, mc.player, world, lastClearTargetBlock)) {
+                    return;
+                }
+                if (startClearWalk(mc.player, world, lastClearTargetBlock)) {
+                    autoState = AutoState.WALKING_TO_CLEAR;
+                    return;
+                }
+            }
+        }
+
         // Dump inventory if nearly full
         if (MoarMod.getChestManager().dumpChestCount() > 0
                 && MoarMod.getChestManager().isInventoryFull(mc)) {
@@ -2648,8 +4329,8 @@ public class SchematicPrinter {
                 LOGGER.warn("Clearing gave up after {} stall resets ({} blocks broken)",
                         clearStallResets - 1, clearBlocksBroken);
                 clearingDone = true;
-                autoState = AutoState.BUILDING;
-                noProgressTicks = 0;
+                lastClearTargetBlock = null;
+                enterBuildMode("clearing gave up after stall resets");
                 return;
             }
             // Recovery: reset failed targets and retry
@@ -2682,6 +4363,7 @@ public class SchematicPrinter {
         }
         if (target == null) {
             clearingDone = true;
+            lastClearTargetBlock = null;
             if (statusMessages) {
                 if (clearBlocksBroken > 0) {
                     ChatHelper.info("§aArea cleared! §7Removed §e" + clearBlocksBroken
@@ -2690,18 +4372,18 @@ public class SchematicPrinter {
                     ChatHelper.info("§aNo illegal blocks found. Commencing build...");
                 }
             }
-            autoState = AutoState.BUILDING;
-            noProgressTicks = 0;
+            enterBuildMode("clearing complete");
             return;
         }
 
-        // Walk to the zone — same pattern as building
-        PathWalker.walkToNearby(target, (int) Math.ceil(range) + 2);
         /*? if >=26.1 {*//*
-        lastWalkTargetZone = target.immutable();
+        if (!startClearWalk(mc.player, world, target)) {
         *//*?} else {*/
-        lastWalkTargetZone = target.toImmutable();
+        if (!startClearWalk(mc.player, world, target)) {
         /*?}*/
+            autoState = AutoState.CLEARING_AREA;
+            return;
+        }
         autoState = AutoState.WALKING_TO_CLEAR;
     }
 
@@ -3008,6 +4690,8 @@ public class SchematicPrinter {
             // if Baritone stopped slightly outside PathWalker's strict
             // arrival threshold.
             if (supplyTarget != null && tryOpenChest(mc, supplyTarget)) {
+                clearPendingContainerAction();
+                blockedRestockSlots.clear();
                 autoState = AutoState.RESTOCKING;
                 restockWaitTicks = 0;
                 chestSyncDelay = 0;
@@ -3159,7 +4843,7 @@ public class SchematicPrinter {
                 // Skip these items and continue building
                 skippedItems.addAll(lastMissingItems);
                 addNeededToSkipped();
-                autoState = AutoState.BUILDING;
+                enterBuildMode("restock walk failed too many times");
             } else {
                 if (statusMessages) {
                     ChatHelper.info("§eSupply chest at §f"
@@ -3169,9 +4853,8 @@ public class SchematicPrinter {
                             + "/" + MAX_RESTOCK_FAILURES + ") — trying another."
                             + "\n§7Looking for: " + formatNeededItemIds(neededItems));
                 }
-                autoState = AutoState.BUILDING;
+                enterBuildMode("restock walk failed, trying another chest");
             }
-            noProgressTicks = 0;
             return;
         }
         // While Baritone is walking with placement enabled, periodically
@@ -3207,6 +4890,9 @@ public class SchematicPrinter {
         *//*?} else {*/
         if (handler instanceof GenericContainerScreenHandler containerHandler) {
         /*?}*/
+            if (tickPendingContainerAction(containerHandler, ContainerTransferLane.RESTOCK, blockedRestockSlots)) {
+                return;
+            }
             // Wait for the server to sync chest contents — the handler is
             // created by OpenScreenS2CPacket, but slot data arrives via a
             // separate InventoryS2CPacket that may lag by 1-2 ticks.
@@ -3221,7 +4907,10 @@ public class SchematicPrinter {
                 MoarMod.getChestManager().scanOpenChest(supplyTarget, containerHandler);
             }
 
-            takeNeededItems(mc, mc.player, containerHandler);
+            boolean transferDone = takeNeededItems(mc, mc.player, containerHandler);
+            if (!transferDone) {
+                return;
+            }
             /*? if >=26.1 {*//*
             mc.player.clientSideCloseContainer();
             *//*?} else {*/
@@ -3253,14 +4942,12 @@ public class SchematicPrinter {
                     }
                     skippedItems.addAll(lastMissingItems);
                     addNeededToSkipped();
-                    autoState = AutoState.BUILDING;
-                    noProgressTicks = 0;
+                    enterBuildMode("opened chest but got no needed items");
                     return;
                 }
                 LOGGER.debug("Chest had no needed items, trying another chest");
                 // Try a different chest next time
-                autoState = AutoState.BUILDING;
-                noProgressTicks = 0;
+                enterBuildMode("restock chest empty for current working set");
                 return;
             }
 
@@ -3295,6 +4982,8 @@ public class SchematicPrinter {
                 shulkerUnloadTicks = 0;
                 shulkerTotalTicks = 0;
                 shulkerUnloadFailures = 0;
+                clearPendingContainerAction();
+                blockedShulkerSlots.clear();
                 autoState = AutoState.UNLOADING_SHULKER;
                 return;
             }
@@ -3323,8 +5012,7 @@ public class SchematicPrinter {
                 }
                 autoState = AutoState.WALKING_BACK;
             } else {
-                autoState = AutoState.BUILDING;
-                noProgressTicks = 0;
+                enterBuildMode("restock complete without return walk");
             }
             return;
         }
@@ -3333,8 +5021,7 @@ public class SchematicPrinter {
             if (statusMessages) {
                 ChatHelper.info("§eChest didn't open, resuming build.");
             }
-            autoState = AutoState.BUILDING;
-            noProgressTicks = 0;
+            enterBuildMode("restock chest open timeout");
         }
     }
 
@@ -3345,6 +5032,11 @@ public class SchematicPrinter {
     *//*?} else {*/
     private void tickDumping(MinecraftClient mc) {
     /*?}*/
+        if (dumpMode == DumpMode.LOCAL_SHULKER) {
+            tickDumpingToLocalShulker(mc);
+            return;
+        }
+
         dumpWaitTicks++;
 
         /*? if >=26.1 {*//*
@@ -3357,6 +5049,9 @@ public class SchematicPrinter {
         *//*?} else {*/
         if (handler instanceof GenericContainerScreenHandler containerHandler) {
         /*?}*/
+            if (tickPendingContainerAction(containerHandler, ContainerTransferLane.DUMP, blockedDumpSlots)) {
+                return;
+            }
             dumpSyncDelay++;
             if (dumpSyncDelay < DUMP_SYNC_DELAY) return;
 
@@ -3369,6 +5064,7 @@ public class SchematicPrinter {
             int playerSlotEnd = chestSlots + 36;
 
             for (int slot = playerSlotStart; slot < playerSlotEnd; slot++) {
+                if (blockedDumpSlots.contains(slot)) continue;
                 /*? if >=26.1 {*//*
                 ItemStack stack = containerHandler.getSlot(slot).getItem();
                 *//*?} else {*/
@@ -3395,6 +5091,9 @@ public class SchematicPrinter {
                         *//*?} else {*/
                         SlotActionType.QUICK_MOVE, mc.player);
                         /*?}*/
+                beginPendingContainerAction(containerHandler, slot, ContainerTransferLane.DUMP);
+                dumpSyncDelay = 0;
+                return;
             }
 
             /*? if >=26.1 {*//*
@@ -3429,6 +5128,334 @@ public class SchematicPrinter {
         }
     }
 
+    /*? if >=26.1 {*//*
+    private void tickDumpingToLocalShulker(Minecraft mc) {
+        if (mc.player == null || mc.level == null) return;
+        LocalPlayer player = mc.player;
+        Level world = mc.level;
+    *//*?} else {*/
+    private void tickDumpingToLocalShulker(MinecraftClient mc) {
+        if (mc.player == null || mc.world == null) return;
+        ClientPlayerEntity player = mc.player;
+        World world = mc.world;
+    /*?}*/
+        dumpWaitTicks++;
+
+        switch (dumpShulkerPhase) {
+            case 0 -> {
+                int slot = findAnyShulkerInInventory(player);
+                if (slot < 0) {
+                    resumeAfterDump(mc, false);
+                    return;
+                }
+                BlockPos placePos = findShulkerPlaceSpot(player, world);
+                if (placePos == null) {
+                    if (statusMessages) {
+                        ChatHelper.info("§eNo solid shulker placement spot nearby — resuming clearing.");
+                    }
+                    resumeAfterDump(mc, false);
+                    return;
+                }
+                dumpShulkerSlot = slot;
+                dumpShulkerPos = placePos;
+                dumpWaitTicks = 0;
+                dumpShulkerPhase = 1;
+            }
+            case 1 -> {
+                /*? if >=26.1 {*//*
+                Inventory inv = player.getInventory();
+                *//*?} else {*/
+                PlayerInventory inv = player.getInventory();
+                /*?}*/
+                if (dumpWaitTicks == 1) {
+                    if (dumpShulkerSlot >= 9) {
+                        /*? if >=26.1 {*//*
+                        mc.gameMode.handleContainerInput(
+                                player.containerMenu.containerId,
+                                dumpShulkerSlot,
+                                inv.getSelectedSlot(),
+                                ContainerInput.SWAP,
+                                player
+                        );
+                        *//*?} else {*/
+                        mc.interactionManager.clickSlot(
+                                player.currentScreenHandler.syncId,
+                                dumpShulkerSlot,
+                                /*? if >=1.21.5 {*//*
+                                inv.getSelectedSlot(),
+                                *//*?} else {*/
+                                inv.selectedSlot,
+                                /*?}*/
+                                SlotActionType.SWAP,
+                                player
+                        );
+                        /*?}*/
+                        return;
+                    }
+                    /*? if >=1.21.5 {*//*
+                    inv.setSelectedSlot(dumpShulkerSlot);
+                    *//*?} else {*/
+                    inv.selectedSlot = dumpShulkerSlot;
+                    /*?}*/
+                    return;
+                }
+                if (dumpWaitTicks < 3) return;
+
+                /*? if >=26.1 {*//*
+                ItemStack held = inv.getItem(inv.getSelectedSlot());
+                Vec3 eyePos = player.getEyePosition();
+                Vec3 target = Vec3.atCenterOf(dumpShulkerPos.below()).add(0, 0.5, 0);
+                Vec3 toTarget = target.subtract(eyePos);
+                float placeYaw = (float) (Mth.atan2(toTarget.z, toTarget.x) * (180.0 / Math.PI)) - 90.0f;
+                float placePitch = (float) -(Mth.atan2(toTarget.y,
+                        Math.sqrt(toTarget.x * toTarget.x + toTarget.z * toTarget.z)) * (180.0 / Math.PI));
+                *//*?} else {*/
+                ItemStack held = inv.getStack(
+                        /*? if >=1.21.5 {*//* inv.getSelectedSlot() *//*?} else {*/inv.selectedSlot/*?}*/);
+                Vec3d eyePos = player.getEyePos();
+                Vec3d target = Vec3d.ofCenter(dumpShulkerPos.down()).add(0, 0.5, 0);
+                Vec3d toTarget = target.subtract(eyePos);
+                float placeYaw = (float) (MathHelper.atan2(toTarget.z, toTarget.x) * (180.0 / Math.PI)) - 90.0f;
+                float placePitch = (float) -(MathHelper.atan2(toTarget.y,
+                        Math.sqrt(toTarget.x * toTarget.x + toTarget.z * toTarget.z)) * (180.0 / Math.PI));
+                /*?}*/
+                if (!isShulkerBox(held)) {
+                    dumpShulkerPhase = 0;
+                    dumpWaitTicks = 0;
+                    return;
+                }
+
+                PlacementEngine.sendLookPacket(player, placeYaw,
+                        /*? if >=26.1 {*//* Mth.clamp(placePitch, -90.0f, 90.0f) *//*?} else {*/MathHelper.clamp(placePitch, -90.0f, 90.0f)/*?}*/);
+                if (dumpWaitTicks < 5) return;
+
+                Runnable restoreSneak = PlacementEngine.ensureSneakForPlacement(player);
+                BlockHitResult hit = new BlockHitResult(
+                        /*? if >=26.1 {*//* Vec3.atCenterOf(dumpShulkerPos.below()) *//*?} else {*/Vec3d.ofCenter(dumpShulkerPos.down())/*?}*/
+                                .add(0, 0.5, 0),
+                        Direction.UP,
+                        /*? if >=26.1 {*//* dumpShulkerPos.below() *//*?} else {*/dumpShulkerPos.down()/*?}*/,
+                        false);
+                /*? if >=26.1 {*//*
+                mc.gameMode.useItemOn(player, InteractionHand.MAIN_HAND, hit);
+                *//*?} else {*/
+                mc.interactionManager.interactBlock(player, Hand.MAIN_HAND, hit);
+                /*?}*/
+                restoreSneak.run();
+                dumpShulkerPhase = 2;
+                dumpWaitTicks = 0;
+            }
+            case 2 -> {
+                BlockState st = world.getBlockState(dumpShulkerPos);
+                if (st.getBlock() instanceof ShulkerBoxBlock) {
+                    dumpShulkerPhase = 3;
+                    dumpWaitTicks = 0;
+                    dumpShulkerOpenRetries = 0;
+                    return;
+                }
+                if (dumpWaitTicks >= SHULKER_PLACE_DELAY) {
+                    dumpShulkerPhase = 0;
+                    dumpWaitTicks = 0;
+                }
+            }
+            case 3 -> {
+                /*? if >=26.1 {*//*
+                Vec3 eyePos = player.getEyePosition();
+                Vec3 shulkerCenter = Vec3.atCenterOf(dumpShulkerPos);
+                Vec3 toShulker = shulkerCenter.subtract(eyePos);
+                float openYaw = (float) (Mth.atan2(toShulker.z, toShulker.x) * (180.0 / Math.PI)) - 90.0f;
+                float openPitch = (float) -(Mth.atan2(toShulker.y,
+                        Math.sqrt(toShulker.x * toShulker.x + toShulker.z * toShulker.z)) * (180.0 / Math.PI));
+                *//*?} else {*/
+                Vec3d eyePos = player.getEyePos();
+                Vec3d shulkerCenter = Vec3d.ofCenter(dumpShulkerPos);
+                Vec3d toShulker = shulkerCenter.subtract(eyePos);
+                float openYaw = (float) (MathHelper.atan2(toShulker.z, toShulker.x) * (180.0 / Math.PI)) - 90.0f;
+                float openPitch = (float) -(MathHelper.atan2(toShulker.y,
+                        Math.sqrt(toShulker.x * toShulker.x + toShulker.z * toShulker.z)) * (180.0 / Math.PI));
+                /*?}*/
+                PlacementEngine.sendLookPacket(player, openYaw,
+                        /*? if >=26.1 {*//* Mth.clamp(openPitch, -90.0f, 90.0f) *//*?} else {*/MathHelper.clamp(openPitch, -90.0f, 90.0f)/*?}*/);
+                if (dumpWaitTicks < 3) return;
+
+                Runnable restoreSneak = PlacementEngine.releaseForInteraction(player);
+                /*? if >=26.1 {*//*
+                Direction hitFace = Direction.getApproximateNearest(
+                *//*?} else {*/
+                Direction hitFace = Direction.getFacing(
+                /*?}*/
+                        (float) -toShulker.x, (float) -toShulker.y, (float) -toShulker.z);
+                BlockHitResult hit = new BlockHitResult(
+                        shulkerCenter,
+                        hitFace,
+                        dumpShulkerPos,
+                        false);
+                /*? if >=26.1 {*//*
+                mc.gameMode.useItemOn(player, InteractionHand.MAIN_HAND, hit);
+                *//*?} else {*/
+                mc.interactionManager.interactBlock(player, Hand.MAIN_HAND, hit);
+                /*?}*/
+                restoreSneak.run();
+                dumpShulkerPhase = 4;
+                dumpWaitTicks = 0;
+                dumpSyncDelay = 0;
+            }
+            case 4 -> {
+                /*? if >=26.1 {*//*
+                AbstractContainerMenu handler = player.containerMenu;
+                if (handler instanceof ShulkerBoxMenu shulkerHandler) {
+                *//*?} else {*/
+                ScreenHandler handler = player.currentScreenHandler;
+                if (handler instanceof ShulkerBoxScreenHandler shulkerHandler) {
+                /*?}*/
+                    int blockedBefore = blockedDumpSlots.size();
+                    if (tickPendingContainerAction(shulkerHandler, ContainerTransferLane.DUMP, blockedDumpSlots)) {
+                        if (blockedDumpSlots.size() > blockedBefore) {
+                            dumpShulkerTransferTimeouts++;
+                            if (dumpShulkerTransferTimeouts >= MAX_DUMP_SHULKER_TRANSFER_TIMEOUTS) {
+                                /*? if >=26.1 {*//*
+                                if (mc.screen != null) player.clientSideCloseContainer();
+                                *//*?} else {*/
+                                if (mc.currentScreen != null) player.closeHandledScreen();
+                                /*?}*/
+                                if (statusMessages) {
+                                    ChatHelper.info("§eOverflow shulker transfer stalled — aborting dump and resuming clearing.");
+                                }
+                                resumeAfterDump(mc, true);
+                            }
+                        }
+                        return;
+                    }
+                    dumpSyncDelay++;
+                    if (dumpSyncDelay < CHEST_SYNC_DELAY) return;
+
+                    int playerSlotStart = 27;
+                    int playerSlotEnd = 63;
+                    Map<String, Integer> inventoryCounts = new HashMap<>();
+                    for (int slot = playerSlotStart; slot < playerSlotEnd; slot++) {
+                        if (blockedDumpSlots.contains(slot)) continue;
+                        /*? if >=26.1 {*//*
+                        ItemStack stack = shulkerHandler.getSlot(slot).getItem();
+                        *//*?} else {*/
+                        ItemStack stack = shulkerHandler.getSlot(slot).getStack();
+                        /*?}*/
+                        if (stack.isEmpty()) continue;
+                        inventoryCounts.merge(ItemIdentifier.getItemId(stack), stack.getCount(), Integer::sum);
+                    }
+
+                    boolean movedAnything = false;
+                    for (int slot = playerSlotStart; slot < playerSlotEnd; slot++) {
+                        if (blockedDumpSlots.contains(slot)) continue;
+                        /*? if >=26.1 {*//*
+                        ItemStack stack = shulkerHandler.getSlot(slot).getItem();
+                        *//*?} else {*/
+                        ItemStack stack = shulkerHandler.getSlot(slot).getStack();
+                        /*?}*/
+                        if (!shouldDumpOverflowStack(stack, inventoryCounts)) continue;
+                        /*? if >=26.1 {*//*
+                        mc.gameMode.handleContainerInput(
+                                shulkerHandler.containerId, slot, 0,
+                                ContainerInput.QUICK_MOVE, player);
+                        *//*?} else {*/
+                        mc.interactionManager.clickSlot(
+                                shulkerHandler.syncId, slot, 0,
+                                SlotActionType.QUICK_MOVE, player);
+                        /*?}*/
+                        inventoryCounts.merge(ItemIdentifier.getItemId(stack), -stack.getCount(), Integer::sum);
+                        beginPendingContainerAction(shulkerHandler, slot, ContainerTransferLane.DUMP);
+                        dumpSyncDelay = 0;
+                        dumpShulkerTransferTimeouts = 0;
+                        return;
+                    }
+
+                    snapshotDumpShulkerSlots(player);
+                    /*? if >=26.1 {*//*
+                    player.clientSideCloseContainer();
+                    *//*?} else {*/
+                    player.closeHandledScreen();
+                    /*?}*/
+                    dumpShulkerPhase = 5;
+                    dumpWaitTicks = 0;
+                    if (!movedAnything && statusMessages) {
+                        ChatHelper.info("§eOverflow shulker had no dumpable stacks to take.");
+                    }
+                    return;
+                }
+
+                if (dumpWaitTicks >= MAX_SHULKER_PHASE_TICKS) {
+                    /*? if >=26.1 {*//*
+                    if (mc.screen != null) player.clientSideCloseContainer();
+                    *//*?} else {*/
+                    if (mc.currentScreen != null) player.closeHandledScreen();
+                    /*?}*/
+                    if (dumpShulkerOpenRetries++ < MAX_DUMP_SHULKER_OPEN_RETRIES) {
+                        dumpShulkerPhase = 3;
+                        dumpWaitTicks = 0;
+                    } else {
+                        dumpShulkerPhase = 5;
+                        dumpWaitTicks = 0;
+                    }
+                }
+            }
+            case 5 -> {
+                /*? if >=26.1 {*//*
+                if (mc.screen != null) {
+                    player.clientSideCloseContainer();
+                    return;
+                }
+                *//*?} else {*/
+                if (mc.currentScreen != null) {
+                    player.closeHandledScreen();
+                    return;
+                }
+                /*?}*/
+                BlockState st = world.getBlockState(dumpShulkerPos);
+                if (!(st.getBlock() instanceof ShulkerBoxBlock)) {
+                    dumpShulkerPhase = 7;
+                    dumpWaitTicks = 0;
+                    return;
+                }
+                /*? if >=26.1 {*//*
+                mc.gameMode.continueDestroyBlock(dumpShulkerPos, Direction.UP);
+                player.swing(InteractionHand.MAIN_HAND);
+                *//*?} else {*/
+                mc.interactionManager.updateBlockBreakingProgress(dumpShulkerPos, Direction.UP);
+                player.swingHand(Hand.MAIN_HAND);
+                /*?}*/
+                dumpShulkerPhase = 6;
+                dumpWaitTicks = 0;
+            }
+            case 6 -> {
+                BlockState st = world.getBlockState(dumpShulkerPos);
+                if (!(st.getBlock() instanceof ShulkerBoxBlock)) {
+                    /*? if >=26.1 {*//* mc.gameMode.stopDestroyBlock(); *//*?} else {*/mc.interactionManager.cancelBlockBreaking();/*?}*/
+                    dumpShulkerPhase = 7;
+                    dumpWaitTicks = 0;
+                    return;
+                }
+                if (dumpWaitTicks >= MAX_SHULKER_PHASE_TICKS) {
+                    /*? if >=26.1 {*//* mc.gameMode.stopDestroyBlock(); *//*?} else {*/mc.interactionManager.cancelBlockBreaking();/*?}*/
+                    resumeAfterDump(mc, true);
+                    return;
+                }
+                /*? if >=26.1 {*//*
+                mc.gameMode.continueDestroyBlock(dumpShulkerPos, Direction.UP);
+                player.swing(InteractionHand.MAIN_HAND);
+                *//*?} else {*/
+                mc.interactionManager.updateBlockBreakingProgress(dumpShulkerPos, Direction.UP);
+                player.swingHand(Hand.MAIN_HAND);
+                /*?}*/
+            }
+            case 7 -> {
+                int recoveredSlot = findNewDumpShulkerSlot(player);
+                if (recoveredSlot >= 0 || dumpWaitTicks >= SHULKER_PICKUP_DELAY + 40) {
+                    resumeAfterDump(mc, dumpWaitTicks >= SHULKER_PICKUP_DELAY + 40 && recoveredSlot < 0);
+                }
+            }
+            default -> resumeAfterDump(mc, false);
+        }
+    }
+
     // SHULKER UNLOADING — place → open → take items → break → pickup
 
     // Finds the first inventory shulker containing needed items, or -1.
@@ -3452,6 +5479,27 @@ public class SchematicPrinter {
             if (isShulkerBox(stack) && shulkerContainsNeeded(stack, neededItems)) {
                 return i;
             }
+        }
+        return -1;
+    }
+
+    /*? if >=26.1 {*//*
+    private int findAnyShulkerInInventory(LocalPlayer player) {
+    *//*?} else {*/
+    private int findAnyShulkerInInventory(ClientPlayerEntity player) {
+    /*?}*/
+        /*? if >=26.1 {*//*
+        Inventory inv = player.getInventory();
+        *//*?} else {*/
+        PlayerInventory inv = player.getInventory();
+        /*?}*/
+        for (int i = 0; i < 36; i++) {
+            /*? if >=26.1 {*//*
+            ItemStack stack = inv.getItem(i);
+            *//*?} else {*/
+            ItemStack stack = inv.getStack(i);
+            /*?}*/
+            if (isShulkerBox(stack)) return i;
         }
         return -1;
     }
@@ -3506,9 +5554,9 @@ public class SchematicPrinter {
                     if ((state.isAir() || state.isReplaceable())
                     /*?}*/
                             /*? if >=26.1 {*//*
-                            && !below.getCollisionShape(world, pos.below()).isEmpty()
+                            && below.isFaceSturdy(world, pos.below(), Direction.UP)
                             *//*?} else {*/
-                            && !below.getCollisionShape(world, pos.down()).isEmpty()
+                            && below.isSideSolidFullSquare(world, pos.down(), Direction.UP)
                             /*?}*/
                             /*? if >=26.1 {*//*
                             && (above.isAir() || above.canBeReplaced())) {
@@ -3555,10 +5603,26 @@ public class SchematicPrinter {
     /*?}*/
         if (protectedStorage.contains(pos)) return true;
         Block b = state.getBlock();
+        if (isLightSourceProtectedForClearing(b)) return true;
         return b instanceof AbstractChestBlock
                 || b instanceof BarrelBlock
                 || b instanceof ShulkerBoxBlock
                 || b instanceof HopperBlock;
+    }
+
+    private static boolean isLightSourceProtectedForClearing(Block block) {
+        return block instanceof TorchBlock
+                || block instanceof WallTorchBlock
+                || block instanceof LanternBlock
+                || block == Blocks.GLOWSTONE
+                || block == Blocks.SEA_LANTERN
+                || block == Blocks.SHROOMLIGHT
+                || block == Blocks.JACK_O_LANTERN
+                || block == Blocks.REDSTONE_LAMP
+                || block == Blocks.OCHRE_FROGLIGHT
+                || block == Blocks.VERDANT_FROGLIGHT
+                || block == Blocks.PEARLESCENT_FROGLIGHT
+                || block == Blocks.END_ROD;
     }
 
     // Places a solid block adjacent to the player to create a shulker platform.
@@ -4210,6 +6274,9 @@ public class SchematicPrinter {
                 *//*?} else {*/
                 if (handler instanceof ShulkerBoxScreenHandler shulkerHandler) {
                 /*?}*/
+                    if (tickPendingContainerAction(shulkerHandler, ContainerTransferLane.SHULKER, blockedShulkerSlots)) {
+                        return;
+                    }
                     // Wait for server sync
                     shulkerSyncDelay++;
                     if (shulkerSyncDelay < CHEST_SYNC_DELAY) return;
@@ -4229,6 +6296,19 @@ public class SchematicPrinter {
                         if (inv.getStack(i).isEmpty()) freeSlots++;
                         /*?}*/
                     }
+                    Map<String, Integer> remainingNeed = new LinkedHashMap<>(neededItemCounts);
+                    for (int i = 0; i < 36; i++) {
+                        /*? if >=26.1 {*//*
+                        ItemStack invStack = inv.getItem(i);
+                        *//*?} else {*/
+                        ItemStack invStack = inv.getStack(i);
+                        /*?}*/
+                        if (invStack.isEmpty()) continue;
+                        String invItemId = ItemIdentifier.getItemId(invStack);
+                        if (!remainingNeed.containsKey(invItemId)) continue;
+                        remainingNeed.put(invItemId, Math.max(0,
+                                remainingNeed.getOrDefault(invItemId, 0) - invStack.getCount()));
+                    }
                     // We need at least 1 slot free for the broken shulker.
                     // QUICK_MOVE stacks with existing items first, so only
                     // count items that would consume a NEW slot.
@@ -4236,6 +6316,7 @@ public class SchematicPrinter {
 
                     // Take needed items — shulker boxes always have 27 slots (3×9)
                     for (int slot = 0; slot < 27; slot++) {
+                        if (blockedShulkerSlots.contains(slot)) continue;
                         /*? if >=26.1 {*//*
                         ItemStack stack = shulkerHandler.getSlot(slot).getItem();
                         *//*?} else {*/
@@ -4247,7 +6328,8 @@ public class SchematicPrinter {
                         *//*?} else {*/
                         String itemId = Registries.ITEM.getId(stack.getItem()).toString();
                         /*?}*/
-                        if (neededItems.contains(itemId)) {
+                        int shortage = remainingNeed.getOrDefault(itemId, 0);
+                        if (shortage > 0) {
                             // Check if this item would stack with something
                             // already in the player's inventory.
                             boolean wouldStack = false;
@@ -4295,6 +6377,10 @@ public class SchematicPrinter {
                                     *//*?} else {*/
                                     SlotActionType.QUICK_MOVE, player);
                                     /*?}*/
+                            remainingNeed.put(itemId, Math.max(0, shortage - stack.getCount()));
+                            beginPendingContainerAction(shulkerHandler, slot, ContainerTransferLane.SHULKER);
+                            shulkerSyncDelay = 0;
+                            return;
                         }
                     }
 
@@ -4558,6 +6644,8 @@ public class SchematicPrinter {
     *//*?} else {*/
     private void finishShulkerUnloading(MinecraftClient mc) {
     /*?}*/
+        clearPendingContainerAction();
+        blockedShulkerSlots.clear();
         shulkerUnloadPhase = 0;
         shulkerPlacePos = null;
         shulkerHotbarSlot = -1;
@@ -4605,8 +6693,7 @@ public class SchematicPrinter {
             }
             autoState = AutoState.WALKING_BACK;
         } else {
-            autoState = AutoState.BUILDING;
-            noProgressTicks = 0;
+            enterBuildMode("shulker unload finished at build site");
         }
     }
 
@@ -4615,6 +6702,14 @@ public class SchematicPrinter {
     *//*?} else {*/
     private void tickIdle(MinecraftClient mc) {
     /*?}*/
+        SetbackMonitor setbackMonitor = SetbackMonitor.get();
+        int totalSetbacks = setbackMonitor.totalSetbacks();
+        if (totalSetbacks != observedPlacementSetbacks) {
+            observedPlacementSetbacks = totalSetbacks;
+            refreshPlacementPlannerState();
+            idleScanCooldown = 0;
+        }
+
         idleScanCooldown--;
         if (idleScanCooldown > 0) return;
         idleScanCooldown = IDLE_SCAN_INTERVAL;
@@ -4630,8 +6725,7 @@ public class SchematicPrinter {
                 // Reset unreachable set — the player may have moved
                 // since the last failed attempt.
                 unreachableChests.clear();
-                autoState = AutoState.BUILDING;
-                noProgressTicks = 0;
+                enterBuildMode("idle resume after supply chest became available");
                 return;
             }
             // Check if the player picked up any of the missing items
@@ -4642,8 +6736,7 @@ public class SchematicPrinter {
                     ChatHelper.info("§aMaterials detected — resuming build.");
                 }
                 lastMissingItems.clear();
-                autoState = AutoState.BUILDING;
-                noProgressTicks = 0;
+                enterBuildMode("idle resume after materials detected");
                 return;
             }
             return; // still missing, stay idle
@@ -4667,7 +6760,7 @@ public class SchematicPrinter {
             if (statusMessages) {
                 ChatHelper.info("§bResuming — placing redstone components...");
             }
-            autoState = AutoState.BUILDING;
+            enterBuildMode("idle -> redstone pass");
             return;
         }
         /*? if >=26.1 {*//*
@@ -4689,7 +6782,7 @@ public class SchematicPrinter {
             if (statusMessages) {
                 ChatHelper.info("§bResuming — placing remaining liquids...");
             }
-            autoState = AutoState.BUILDING;
+            enterBuildMode("idle -> liquid pass");
             return;
         }
         /*? if >=26.1 {*//*
@@ -4697,39 +6790,32 @@ public class SchematicPrinter {
         *//*?} else {*/
         BlockPos nextZone = findNextBuildZone(mc.player, mc.world);
         /*?}*/
+        // Idle should not trust stale diff state for long.
+        // If work remains but no zone is visible, rebuild the chunk view
+        // and retry once before sitting still again.
+        if (nextZone == null && countRemaining() > 0) {
+            rebuildSchematicChunkIndex();
+            failedZones.clear();
+            /*? if >=26.1 {*//*
+            nextZone = findNextBuildZone(mc.player, mc.level);
+            *//*?} else {*/
+            nextZone = findNextBuildZone(mc.player, mc.world);
+            /*?}*/
+        }
         if (nextZone != null) {
             failedZones.clear();
             walkFailCount = 0;
             lastWalkTargetZone = null;
             walkAttemptCooldown = 0;
-            /*? if >=26.1 {*//*
-            lastBuildPos = mc.player.blockPosition();
-            *//*?} else {*/
-            lastBuildPos = mc.player.getBlockPos();
-            /*?}*/
-            /*? if >=26.1 {*//*
-            int playerY = mc.player.blockPosition().getY();
-            *//*?} else {*/
-            int playerY = mc.player.getBlockPos().getY();
-            /*?}*/
-            int dy = nextZone.getY() - playerY;
-            // If the build zone is significantly above or below us,
-            // use the waypoint-based placement walk to get there.
-            if (Math.abs(dy) > (int) Math.ceil(range) + 2) {
-                walkToZoneWithPlacement(mc.player, nextZone, (int) Math.ceil(range));
-            } else {
-                /*? if >=26.1 {*//*
-                BlockPos standPos = findStandingPosition(nextZone, mc.level, mc.player);
-                *//*?} else {*/
-                BlockPos standPos = findStandingPosition(nextZone, mc.world, mc.player);
-                /*?}*/
-                if (standPos != null) {
-                    PathWalker.walkTo(standPos);
-                } else {
-                    PathWalker.walkToNearby(nextZone, (int) Math.ceil(range));
-                }
+            // Reuse the main build-zone walk logic so idle recovery
+            // respects the same "already in range, just build" rules.
+            if (tryWalkToNextZone(mc)) {
+                return;
             }
-            autoState = AutoState.WALKING_TO_BUILD;
+            if (statusMessages) {
+                ChatHelper.info("§eBuild zone found but no reposition was needed — retrying from here.");
+            }
+            enterBuildMode("idle found build zone already reachable");
             return;
         }
 
@@ -4745,6 +6831,17 @@ public class SchematicPrinter {
                     unloadedZone.getX(), unloadedZone.getY(), unloadedZone.getZ());
             PathWalker.walkToNearby(unloadedZone, (int) Math.ceil(range));
             autoState = AutoState.WALKING_TO_BUILD;
+            return;
+        }
+
+        // If we still have work but couldn't resolve a zone this pass,
+        // bounce back into BUILDING immediately so the live world scan
+        // can try again next tick instead of idling for seconds.
+        if (countRemaining() > 0) {
+            if (!setbackMonitor.isCalm()) {
+                return;
+            }
+            enterBuildMode("idle bounce after unresolved work remains");
         }
     }
 
@@ -4764,6 +6861,286 @@ public class SchematicPrinter {
         return isEffectivelyPlaced(world.getBlockState(worldPos), expected);
     }
 
+    private int resolveRenderDistanceChunks() {
+        /*? if >=26.1 {*//*
+        Minecraft mc = Minecraft.getInstance();
+        *//*?} else {*/
+        MinecraftClient mc = MinecraftClient.getInstance();
+        /*?}*/
+        if (mc == null || mc.options == null) return 8;
+
+        Object options = mc.options;
+        Integer value = invokeInteger(options, "getClampedViewDistance");
+        if (value != null) return Math.max(2, value);
+
+        value = invokeOptionInteger(options, "getViewDistance");
+        if (value != null) return Math.max(2, value);
+
+        value = readOptionInteger(options, "viewDistance");
+        if (value != null) return Math.max(2, value);
+
+        value = readOptionInteger(options, "renderDistance");
+        if (value != null) return Math.max(2, value);
+
+        return 8;
+    }
+
+    private static Integer invokeInteger(Object target, String methodName) {
+        try {
+            Object value = target.getClass().getMethod(methodName).invoke(target);
+            return value instanceof Number ? ((Number) value).intValue() : null;
+        } catch (ReflectiveOperationException ignored) {
+            return null;
+        }
+    }
+
+    private static Integer invokeOptionInteger(Object target, String methodName) {
+        try {
+            Object option = target.getClass().getMethod(methodName).invoke(target);
+            if (option == null) return null;
+            Integer value = invokeInteger(option, "get");
+            if (value != null) return value;
+            value = invokeInteger(option, "getValue");
+            if (value != null) return value;
+            return readOptionInteger(option, "value");
+        } catch (ReflectiveOperationException ignored) {
+            return null;
+        }
+    }
+
+    private static Integer readOptionInteger(Object target, String fieldName) {
+        try {
+            Object value = target.getClass().getField(fieldName).get(target);
+            if (value instanceof Number) return ((Number) value).intValue();
+            if (value == null) return null;
+            Integer nested = invokeInteger(value, "get");
+            if (nested != null) return nested;
+            nested = invokeInteger(value, "getValue");
+            if (nested != null) return nested;
+            return null;
+        } catch (ReflectiveOperationException ignored) {
+            return null;
+        }
+    }
+
+    private RenderWindow getRenderWindow(BlockPos playerPos) {
+        int radius = resolveRenderDistanceChunks() + RENDER_SCAN_EXTRA_CHUNKS;
+        int chunkX = playerPos.getX() >> 4;
+        int chunkZ = playerPos.getZ() >> 4;
+        return new RenderWindow(radius,
+                chunkX - radius, chunkX + radius,
+                chunkZ - radius, chunkZ + radius);
+    }
+
+    private static boolean isWithinRenderWindow(RenderWindow window, int wx, int wz) {
+        int chunkX = wx >> 4;
+        int chunkZ = wz >> 4;
+        return chunkX >= window.minChunkX() && chunkX <= window.maxChunkX()
+                && chunkZ >= window.minChunkZ() && chunkZ <= window.maxChunkZ();
+    }
+
+    private static long chunkKey(int chunkX, int chunkZ) {
+        return (((long) chunkX) << 32) ^ (chunkZ & 0xffffffffL);
+    }
+
+    private static long chunkKey(BlockPos pos) {
+        return chunkKey(pos.getX() >> 4, pos.getZ() >> 4);
+    }
+
+    private static int chunkXFromKey(long chunkKey) {
+        return (int) (chunkKey >> 32);
+    }
+
+    private static int chunkZFromKey(long chunkKey) {
+        return (int) chunkKey;
+    }
+
+    private void rebuildSchematicChunkIndex() {
+        schematicBlocksByChunk.clear();
+        chunkDiffCache.clear();
+        invalidateBuildStagingPlanCache();
+        remainingCacheTick = Long.MIN_VALUE;
+        cachedCountRemaining = -1;
+        solidsCacheTick = Long.MIN_VALUE;
+        liquidsCacheTick = Long.MIN_VALUE;
+        redstoneCacheTick = Long.MIN_VALUE;
+
+        if (schematic == null || anchor == null) return;
+
+        for (LitematicaSchematic.Region region : schematic.getRegions()) {
+            for (int y = 0; y < region.absY; y++) {
+                for (int z = 0; z < region.absZ; z++) {
+                    for (int x = 0; x < region.absX; x++) {
+                        BlockState target = region.getBlockState(x, y, z);
+                        if (target.isAir()) continue;
+                        if (!isPlaceable(target) && !isLiquidSource(target)) continue;
+                        if (isAutoCreatedPart(target)) continue;
+
+                        int wx = anchor.getX() + region.originX + x;
+                        int wy = anchor.getY() + region.originY + y;
+                        int wz = anchor.getZ() + region.originZ + z;
+                        boolean liquid = isLiquidSource(target);
+                        boolean redstone = !liquid && BlockDependency.isRedstoneComponent(target);
+                        Item item = liquid ? getLiquidBucketItem(target) : target.getBlock().asItem();
+                        BlockPos pos = new BlockPos(wx, wy, wz);
+                        long key = chunkKey(wx >> 4, wz >> 4);
+                        schematicBlocksByChunk
+                                .computeIfAbsent(key, ignored -> new ArrayList<>())
+                                .add(new SchematicBlockRef(pos, target, item, liquid, redstone));
+                    }
+                }
+            }
+        }
+    }
+
+    private void invalidateChunkDiffCache(BlockPos pos) {
+        if (pos == null) return;
+        chunkDiffCache.remove(chunkKey(pos));
+        invalidateBuildStagingPlanCache();
+        remainingCacheTick = Long.MIN_VALUE;
+        cachedCountRemaining = -1;
+        solidsCacheTick = Long.MIN_VALUE;
+        liquidsCacheTick = Long.MIN_VALUE;
+        redstoneCacheTick = Long.MIN_VALUE;
+    }
+
+    private void invalidateBuildStagingPlanCache() {
+        cachedBuildStagingPlanTick = Long.MIN_VALUE;
+        cachedBuildStagingPlanPlayerPos = null;
+        cachedBuildStagingPlanExtraReachBonus = Integer.MIN_VALUE;
+        cachedBuildStagingPlan = null;
+    }
+
+    private void rememberRepairPriorityTarget(BlockPos pos) {
+        if (pos == null) return;
+        /*? if >=26.1 {*//*
+        BlockPos immutablePos = pos.immutable();
+        *//*?} else {*/
+        BlockPos immutablePos = pos.toImmutable();
+        /*?}*/
+        repairPriorityTargets.remove(immutablePos);
+        repairPriorityTargets.add(immutablePos);
+        invalidateChunkDiffCache(immutablePos);
+    }
+
+    /*? if >=26.1 {*//*
+    private void rememberRepairPriorityIfPlaced(BlockPos pos, Level world) {
+    *//*?} else {*/
+    private void rememberRepairPriorityIfPlaced(BlockPos pos, World world) {
+    /*?}*/
+        if (pos == null || world == null) return;
+        BlockState desired = getDesiredBuildStateAt(pos);
+        if (desired == null || desired.isAir()) return;
+        if (!isEffectivelyPlaced(world.getBlockState(pos), desired)) return;
+        rememberRepairPriorityTarget(pos);
+    }
+
+    /*? if >=26.1 {*//*
+    private void rememberRepairPriorityNeighborhood(BlockPos center, Level world, int radius) {
+    *//*?} else {*/
+    private void rememberRepairPriorityNeighborhood(BlockPos center, World world, int radius) {
+    /*?}*/
+        if (center == null || world == null) return;
+        int r = Math.max(0, radius);
+        for (int dx = -r; dx <= r; dx++) {
+            for (int dz = -r; dz <= r; dz++) {
+                for (int dy = -1; dy <= 1; dy++) {
+                    /*? if >=26.1 {*//*
+                    rememberRepairPriorityIfPlaced(center.offset(dx, dy, dz), world);
+                    *//*?} else {*/
+                    rememberRepairPriorityIfPlaced(center.add(dx, dy, dz), world);
+                    /*?}*/
+                }
+            }
+        }
+    }
+
+    /*? if >=26.1 {*//*
+    private void rememberRepairPriorityCorridor(BlockPos fromFeet, BlockPos toFeet, Level world) {
+    *//*?} else {*/
+    private void rememberRepairPriorityCorridor(BlockPos fromFeet, BlockPos toFeet, World world) {
+    /*?}*/
+        if (fromFeet == null || toFeet == null || world == null) return;
+        int dx = toFeet.getX() - fromFeet.getX();
+        int dy = toFeet.getY() - fromFeet.getY();
+        int dz = toFeet.getZ() - fromFeet.getZ();
+        int steps = Math.max(1, Math.max(Math.abs(dx), Math.max(Math.abs(dy), Math.abs(dz))));
+        for (int i = 0; i <= steps; i++) {
+            double t = (double) i / (double) steps;
+            BlockPos sample = new BlockPos(
+                    fromFeet.getX() + (int) Math.round(dx * t),
+                    fromFeet.getY() + (int) Math.round(dy * t),
+                    fromFeet.getZ() + (int) Math.round(dz * t));
+            rememberRepairPriorityNeighborhood(sample, world, ACCESS_REPAIR_MEMORY_RADIUS);
+        }
+    }
+
+    /*? if >=26.1 {*//*
+    private void seedAccessRepairTargets(BlockPos fromFeet, BuildAccessTarget access,
+                                         BlockPos targetPos, Level world) {
+    *//*?} else {*/
+    private void seedAccessRepairTargets(BlockPos fromFeet, BuildAccessTarget access,
+                                         BlockPos targetPos, World world) {
+    /*?}*/
+        if (access == null || access.feetPos() == null || world == null) return;
+        rememberRepairPriorityCorridor(fromFeet, access.feetPos(), world);
+        rememberRepairPriorityNeighborhood(access.feetPos(), world, ACCESS_REPAIR_MEMORY_RADIUS);
+        rememberRepairPriorityNeighborhood(targetPos, world, ACCESS_REPAIR_MEMORY_RADIUS);
+        if (access.clearPos() != null) {
+            rememberRepairPriorityNeighborhood(access.clearPos(), world, ACCESS_REPAIR_MEMORY_RADIUS);
+        }
+    }
+
+    private boolean isPendingSchematicPlacement(SchematicBlockRef ref) {
+        return pendingBuildPlacementPos != null
+                && pendingBuildPlacementState != null
+                && pendingBuildPlacementPos.equals(ref.pos())
+                && pendingBuildPlacementState.equals(ref.target());
+    }
+
+    /*? if >=26.1 {*//*
+    private boolean isCurrentlyUnresolved(SchematicBlockRef ref, Level world) {
+    *//*?} else {*/
+    private boolean isCurrentlyUnresolved(SchematicBlockRef ref, World world) {
+    /*?}*/
+        if (ref == null || world == null || isPendingSchematicPlacement(ref)) {
+            return false;
+        }
+        if (isEffectivelyPlaced(world.getBlockState(ref.pos()), ref.target())) {
+            repairPriorityTargets.remove(ref.pos());
+            invalidateChunkDiffCache(ref.pos());
+            return false;
+        }
+        return true;
+    }
+
+    /*? if >=26.1 {*//*
+    private List<SchematicBlockRef> getUnresolvedChunkEntries(Level world, long tick, long chunkKey) {
+    *//*?} else {*/
+    private List<SchematicBlockRef> getUnresolvedChunkEntries(World world, long tick, long chunkKey) {
+    /*?}*/
+        List<SchematicBlockRef> indexed = schematicBlocksByChunk.get(chunkKey);
+        if (indexed == null || indexed.isEmpty()) return List.of();
+
+        ChunkDiffSnapshot cached = chunkDiffCache.get(chunkKey);
+        if (cached != null && tick - cached.scanTick() < CHUNK_DIFF_CACHE_TTL) {
+            return cached.unresolved();
+        }
+
+        List<SchematicBlockRef> unresolved = new ArrayList<>();
+        for (SchematicBlockRef ref : indexed) {
+            if (isPendingSchematicPlacement(ref)) continue;
+            if (isEffectivelyPlaced(world.getBlockState(ref.pos()), ref.target())) {
+                repairPriorityTargets.remove(ref.pos());
+                continue;
+            }
+            unresolved.add(ref);
+        }
+        List<SchematicBlockRef> snapshot = List.copyOf(unresolved);
+        chunkDiffCache.put(chunkKey, new ChunkDiffSnapshot(tick, snapshot));
+        return snapshot;
+    }
+
     // Finds the lowest unbuilt block above the player's reach.
     // Among same-Y candidates, prefers nearest by horizontal distance.
     /*? if >=26.1 {*//*
@@ -4778,9 +7155,15 @@ public class SchematicPrinter {
         *//*?} else {*/
         int playerY = player.getBlockPos().getY();
         /*?}*/
-        BlockPos best = null;
-        int bestY = Integer.MAX_VALUE;
-        double bestDist = Double.MAX_VALUE;
+        RenderWindow renderWindow =
+                getRenderWindow(/*? if >=26.1 {*//* player.blockPosition() *//*?} else {*/player.getBlockPos()/*?}*/);
+        BlockPos bestVisible = null;
+        int bestVisibleY = Integer.MAX_VALUE;
+        double bestVisibleDist = Double.MAX_VALUE;
+        BlockPos bestFallback = null;
+        int bestFallbackY = Integer.MAX_VALUE;
+        double bestFallbackDist = Double.MAX_VALUE;
+        int activeBandTopY = getBottomUpActiveBandTopY(world, renderWindow);
 
         /*? if >=26.1 {*//*
         Vec3 playerPos = player.position();
@@ -4790,61 +7173,48 @@ public class SchematicPrinter {
         Vec3d playerPos = player.getPos();
         /*?}*/
 
-        for (LitematicaSchematic.Region region : schematic.getRegions()) {
-            for (int y = 0; y < region.absY; y++) {
-                int wy = anchor.getY() + region.originY + y;
-                // Only look for blocks that are above the player's reach
+        long tick = getWorldTick();
+        for (long key : schematicBlocksByChunk.keySet()) {
+            int chunkX = chunkXFromKey(key);
+            int chunkZ = chunkZFromKey(key);
+            /*? if >=26.1 {*//*
+            if (!world.hasChunk(chunkX, chunkZ)) continue;
+            *//*?} else {*/
+            if (!world.isChunkLoaded(chunkX, chunkZ)) continue;
+            /*?}*/
+
+            for (SchematicBlockRef ref : getUnresolvedChunkEntries(world, tick, key)) {
+                if (!matchesCurrentBuildPass(ref)) continue;
+                if (!isCurrentlyUnresolved(ref, world)) continue;
+                BlockPos worldPos = ref.pos();
+                if (worldPos.getY() > activeBandTopY) continue;
+                if (!printInAir && !PlacementEngine.hasAdjacentSolid(world, worldPos)) continue;
+                if (!BlockDependency.isReadyToPlace(world, worldPos, ref.target())) continue;
+                if (isNearFailedZone(worldPos)) continue;
+
+                int wy = worldPos.getY();
                 if (wy <= playerY + 2) continue;
-                // Skip Y-levels higher than the best we've found so far
-                // (we want the LOWEST unbuilt layer above the player)
-                if (wy > bestY) continue;
-
-                for (int z = 0; z < region.absZ; z++) {
-                    for (int x = 0; x < region.absX; x++) {
-                        BlockState target = region.getBlockState(x, y, z);
-                        if (target.isAir()) continue;
-                        if (!isPlaceable(target)) continue;
-                        if (isAutoCreatedPart(target)) continue;
-
-                        // Only target solid blocks.  Liquid source blocks
-                        // are placed via buckets from within reach and don't
-                        // require vertical pathing.
-                        if (isLiquidSource(target)) continue;
-
-                        int wx = anchor.getX() + region.originX + x;
-                        int wz = anchor.getZ() + region.originZ + z;
-
-                        /*? if >=26.1 {*//*
-                        if (!world.hasChunk(wx >> 4, wz >> 4)) continue;
-                        *//*?} else {*/
-                        if (!world.isChunkLoaded(wx >> 4, wz >> 4)) continue;
-                        /*?}*/
-
-                        BlockPos worldPos = new BlockPos(wx, wy, wz);
-
-                        if (isEffectivelyPlaced(world.getBlockState(worldPos), target)) continue;
-                        // NOTE: do NOT filter by hasAdjacentSolid here — these
-                        // are blocks above the player, and Baritone will place
-                        // support blocks as needed to path there.
-
-                        // Prefer lowest Y; among same Y, prefer closest
-                        /*? if >=26.1 {*//*
-                        double dist = playerPos.distanceToSqr(Vec3.atCenterOf(worldPos));
-                        *//*?} else {*/
-                        double dist = playerPos.squaredDistanceTo(Vec3d.ofCenter(worldPos));
-                        /*?}*/
-                        if (wy < bestY || (wy == bestY && dist < bestDist)) {
-                            bestY = wy;
-                            bestDist = dist;
-                            best = worldPos;
-                        }
+                /*? if >=26.1 {*//*
+                double dist = playerPos.distanceToSqr(Vec3.atCenterOf(worldPos));
+                *//*?} else {*/
+                double dist = playerPos.squaredDistanceTo(Vec3d.ofCenter(worldPos));
+                /*?}*/
+                if (isWithinRenderWindow(renderWindow, worldPos.getX(), worldPos.getZ())) {
+                    if (wy < bestVisibleY || (wy == bestVisibleY && dist < bestVisibleDist)) {
+                        bestVisibleY = wy;
+                        bestVisibleDist = dist;
+                        bestVisible = worldPos;
                     }
+                } else if (wy < bestFallbackY || (wy == bestFallbackY && dist < bestFallbackDist)) {
+                    bestFallbackY = wy;
+                    bestFallbackDist = dist;
+                    bestFallback = worldPos;
                 }
             }
         }
 
-        // Return the lowest unbuilt block above the player.
-        return best;
+        // Prefer the rendered window; fall back to other loaded chunks.
+        return bestVisible != null ? bestVisible : bestFallback;
     }
 
     // INVENTORY & RESTOCK
@@ -4868,6 +7238,58 @@ public class SchematicPrinter {
         return false;
     }
 
+    /*? if >=26.1 {*//*
+    private boolean tryStartProactiveRestock(Minecraft mc) {
+    *//*?} else {*/
+    private boolean tryStartProactiveRestock(MinecraftClient mc) {
+    /*?}*/
+        if (mc == null || mc.player == null) return false;
+        if (restockFailures >= MAX_RESTOCK_FAILURES) return false;
+        if (MoarMod.getChestManager().supplyChestCount() == 0) return false;
+
+        /*? if >=26.1 {*//*
+        if (!shouldRestock(mc.player, mc.level)) {
+        *//*?} else {*/
+        if (!shouldRestock(mc.player, mc.world)) {
+        /*?}*/
+            return false;
+        }
+
+        if (statusMessages && missingItemMsgCooldown <= 0) {
+            ChatHelper.info("§eBuild materials running low — restocking from supply.");
+            missingItemMsgCooldown = MISSING_MSG_COOLDOWN;
+        }
+        noProgressTicks = 0;
+        /*? if >=26.1 {*//*
+        startRestockRun(mc.player, mc.level);
+        *//*?} else {*/
+        startRestockRun(mc.player, mc.world);
+        /*?}*/
+        return autoState == AutoState.WALKING_TO_SUPPLY
+                || autoState == AutoState.RESTOCKING
+                || autoState == AutoState.UNLOADING_SHULKER;
+    }
+
+    private boolean shulkerContainsNeeded(ItemStack shulkerStack, Map<String, Integer> remainingNeed) {
+        if (remainingNeed == null || remainingNeed.isEmpty()) return false;
+        /*? if >=26.1 {*//*
+        ItemContainerContents cc = shulkerStack.get(DataComponents.CONTAINER);
+        *//*?} else {*/
+        ContainerComponent cc = shulkerStack.get(DataComponentTypes.CONTAINER);
+        /*?}*/
+        if (cc == null) return false;
+
+        /*? if >=26.1 {*//*
+        for (ItemStack inner : cc.nonEmptyItemCopyStream().toList()) {
+        *//*?} else {*/
+        for (ItemStack inner : cc.iterateNonEmpty()) {
+        /*?}*/
+            String innerId = ItemIdentifier.getItemId(inner);
+            if (remainingNeed.getOrDefault(innerId, 0) > 0) return true;
+        }
+        return false;
+    }
+
     // DUMP — deposit mined items into a dump chest when inventory is full
 
     /*? if >=26.1 {*//*
@@ -4880,17 +7302,42 @@ public class SchematicPrinter {
         *//*?} else {*/
         BlockPos playerPos = mc.player.getBlockPos();
         /*?}*/
+
+        int shulkerSlot = findAnyShulkerInInventory(mc.player);
+        if (shulkerSlot >= 0) {
+            dumpMode = DumpMode.LOCAL_SHULKER;
+            dumpShulkerSlot = shulkerSlot;
+            dumpShulkerPhase = 0;
+            dumpShulkerPos = null;
+            dumpShulkerOpenRetries = 0;
+            dumpShulkerTransferTimeouts = 0;
+            clearPendingContainerAction();
+            blockedDumpSlots.clear();
+            dumpWaitTicks = 0;
+            dumpSyncDelay = 0;
+            preDumpClearPos =
+                    /*? if >=26.1 {*//* playerPos.immutable() *//*?} else {*/playerPos.toImmutable()/*?}*/;
+            autoState = AutoState.DUMPING;
+            if (statusMessages) {
+                ChatHelper.info("§7Inventory nearly full — stashing overflow into a local shulker.");
+            }
+            return;
+        }
+
         BlockPos nearest = MoarMod.getChestManager().findNearestDumpChest(playerPos);
         if (nearest == null) {
             // No reachable dump chests — continue clearing
             return;
         }
+        dumpMode = DumpMode.CHEST;
         dumpTarget = nearest;
         /*? if >=26.1 {*//*
         preDumpClearPos = playerPos.immutable();
         *//*?} else {*/
         preDumpClearPos = playerPos.toImmutable();
         /*?}*/
+        clearPendingContainerAction();
+        blockedDumpSlots.clear();
         dumpWaitTicks = 0;
         dumpSyncDelay = 0;
 
@@ -4922,35 +7369,26 @@ public class SchematicPrinter {
     *//*?} else {*/
     private void startRestockRun(ClientPlayerEntity player, World world) {
     /*?}*/
-        Map<Item, Integer> needed = getNeededItemsNearby(player, world, 500);
+        Map<Item, Integer> needed = getNeededItemsNearby(player, world, RESTOCK_WORKING_SET_SCAN_LIMIT);
         Map<Item, Integer> inventory = PlacementEngine.getInventoryContentsCached();
 
+        clearPendingContainerAction();
+        blockedRestockSlots.clear();
         neededItems = new LinkedHashSet<>();
-        for (var entry : needed.entrySet()) {
-            int have = inventory.getOrDefault(entry.getKey(), 0);
-            if (have < entry.getValue()) {
-                /*? if >=26.1 {*//*
-                neededItems.add(BuiltInRegistries.ITEM.getKey(entry.getKey()).toString());
-                *//*?} else {*/
-                neededItems.add(Registries.ITEM.getId(entry.getKey()).toString());
-                /*?}*/
-            }
-        }
+        neededItemCounts = new LinkedHashMap<>();
 
-        // Always include items that tryPlaceNextBlock couldn't find —
-        // the 500-block scan uses schematic order (Y/Z/X) which may miss
-        // items that are nearby in world space but far in scan order.
+        // Prioritize the concrete items the build loop already proved are missing,
+        // then stage the nearest additional types into a bounded working set.
         for (Item missing : lastMissingItems) {
-            /*? if >=26.1 {*//*
-            String id = BuiltInRegistries.ITEM.getKey(missing).toString();
-            *//*?} else {*/
-            String id = Registries.ITEM.getId(missing).toString();
-            /*?}*/
-            neededItems.add(id);
+            addWorkingSetNeed(missing, 1, inventory);
+        }
+        for (var entry : needed.entrySet()) {
+            if (neededItems.size() >= RESTOCK_WORKING_SET_TYPES) break;
+            addWorkingSetNeed(entry.getKey(), entry.getValue(), inventory);
         }
 
         if (neededItems.isEmpty()) {
-            autoState = AutoState.BUILDING;
+            enterBuildMode("restock found inventory already sufficient");
             return;
         }
 
@@ -4974,6 +7412,7 @@ public class SchematicPrinter {
             shulkerUnloadTicks = 0;
             shulkerTotalTicks = 0;
             shulkerUnloadFailures = 0;
+            blockedShulkerSlots.clear();
             autoState = AutoState.UNLOADING_SHULKER;
             return;
         }
@@ -5353,75 +7792,111 @@ public class SchematicPrinter {
         *//*?} else {*/
         BlockPos playerPos = player.getBlockPos();
         /*?}*/
+        RenderWindow renderWindow = getRenderWindow(playerPos);
 
         // Collect all unbuilt positions with their distances, then sort
         // by proximity so we scan nearest blocks first — critical for
         // large builds where schematic-order scanning may pick up blocks
         // hundreds of blocks away.
-        record Candidate(int wx, int wy, int wz, double distSq, BlockState target) {}
-        List<Candidate> candidates = new ArrayList<>();
+        record Candidate(SchematicBlockRef ref, double distSq) {}
+        List<Candidate> renderedCandidates = new ArrayList<>();
+        List<Candidate> fallbackCandidates = new ArrayList<>();
+        int activeBandTopY = getBottomUpActiveBandTopY(world, renderWindow);
+        Integer frontierY = null;
 
-        for (LitematicaSchematic.Region region : schematic.getRegions()) {
-            for (int y = 0; y < region.absY; y++) {
-                for (int z = 0; z < region.absZ; z++) {
-                    for (int x = 0; x < region.absX; x++) {
-                        BlockState target = region.getBlockState(x, y, z);
-                        if (target.isAir()) continue;
-                        if (isAutoCreatedPart(target)) continue;
+        long tick = getWorldTick();
+        for (long key : schematicBlocksByChunk.keySet()) {
+            int chunkX = chunkXFromKey(key);
+            int chunkZ = chunkZFromKey(key);
+            /*? if >=26.1 {*//*
+            if (!world.hasChunk(chunkX, chunkZ)) continue;
+            *//*?} else {*/
+            if (!world.isChunkLoaded(chunkX, chunkZ)) continue;
+            /*?}*/
 
-                        int wx = anchor.getX() + region.originX + x;
-                        int wy = anchor.getY() + region.originY + y;
-                        int wz = anchor.getZ() + region.originZ + z;
-
-                        /*? if >=26.1 {*//*
-                        if (!world.hasChunk(wx >> 4, wz >> 4)) continue;
-                        *//*?} else {*/
-                        if (!world.isChunkLoaded(wx >> 4, wz >> 4)) continue;
-                        /*?}*/
-                        if (isEffectivelyPlaced(world.getBlockState(new BlockPos(wx, wy, wz)), target)) continue;
-
-                        // Three-pass deferral — only count items for the current pass
-                        boolean isLiquid = isLiquidSource(target);
-                        boolean isRedstone = !isLiquid && BlockDependency.isRedstoneComponent(target);
-                        if (liquidPass) {
-                            if (!isLiquid) continue;
-                        } else if (redstonePass) {
-                            if (!isRedstone) continue;
-                        } else {
-                            if (isLiquid || isRedstone) continue;
-                        }
-
-                        /*? if >=26.1 {*//*
-                        double distSq = playerPos.distSqr(new BlockPos(wx, wy, wz));
-                        *//*?} else {*/
-                        double distSq = playerPos.getSquaredDistance(wx, wy, wz);
-                        /*?}*/
-                        candidates.add(new Candidate(wx, wy, wz, distSq, target));
-                    }
+            for (SchematicBlockRef ref : getUnresolvedChunkEntries(world, tick, key)) {
+                if (liquidPass) {
+                    if (!ref.liquid()) continue;
+                } else if (redstonePass) {
+                    if (!ref.redstone()) continue;
+                } else {
+                    if (ref.liquid() || ref.redstone()) continue;
+                }
+                if (!isCurrentlyUnresolved(ref, world)) continue;
+                if (ref.pos().getY() > activeBandTopY) continue;
+                if (!printInAir && !PlacementEngine.hasAdjacentSolid(world, ref.pos())) continue;
+                if (!BlockDependency.isReadyToPlace(world, ref.pos(), ref.target())) continue;
+                if (isNearFailedZone(ref.pos())) continue;
+                if (frontierY == null || isBetterBuildLayer(ref.pos().getY(), frontierY)) {
+                    frontierY = ref.pos().getY();
                 }
             }
         }
 
-        // Sort by distance to player — nearest first
-        candidates.sort(Comparator.comparingDouble(c -> c.distSq));
+        if (frontierY == null) {
+            return needed;
+        }
+
+        for (long key : schematicBlocksByChunk.keySet()) {
+            int chunkX = chunkXFromKey(key);
+            int chunkZ = chunkZFromKey(key);
+            /*? if >=26.1 {*//*
+            if (!world.hasChunk(chunkX, chunkZ)) continue;
+            *//*?} else {*/
+            if (!world.isChunkLoaded(chunkX, chunkZ)) continue;
+            /*?}*/
+
+            for (SchematicBlockRef ref : getUnresolvedChunkEntries(world, tick, key)) {
+                if (liquidPass) {
+                    if (!ref.liquid()) continue;
+                } else if (redstonePass) {
+                    if (!ref.redstone()) continue;
+                } else {
+                    if (ref.liquid() || ref.redstone()) continue;
+                }
+                if (!isCurrentlyUnresolved(ref, world)) continue;
+                if (ref.pos().getY() > activeBandTopY) continue;
+                if (!isWithinActiveBuildFrontier(ref.pos().getY(), frontierY, activeBandTopY)) continue;
+                if (!printInAir && !PlacementEngine.hasAdjacentSolid(world, ref.pos())) continue;
+                if (!BlockDependency.isReadyToPlace(world, ref.pos(), ref.target())) continue;
+                if (isNearFailedZone(ref.pos())) continue;
+
+                /*? if >=26.1 {*//*
+                double distSq = playerPos.distSqr(ref.pos());
+                *//*?} else {*/
+                double distSq = playerPos.getSquaredDistance(ref.pos().getX(), ref.pos().getY(), ref.pos().getZ());
+                /*?}*/
+                Candidate candidate = new Candidate(ref, distSq);
+                if (isWithinRenderWindow(renderWindow, ref.pos().getX(), ref.pos().getZ())) {
+                    renderedCandidates.add(candidate);
+                } else {
+                    fallbackCandidates.add(candidate);
+                }
+            }
+        }
+
+        renderedCandidates.sort(Comparator.comparingDouble(c -> c.distSq));
+        fallbackCandidates.sort(Comparator.comparingDouble(c -> c.distSq));
 
         int count = 0;
-        for (Candidate c : candidates) {
-            if (count >= limit) break;
+        for (List<Candidate> candidates : List.of(renderedCandidates, fallbackCandidates)) {
+            for (Candidate c : candidates) {
+                if (count >= limit) break;
 
-            if (isLiquidSource(c.target)) {
-                Item bucket = getLiquidBucketItem(c.target);
-                if (bucket != null) {
-                    needed.merge(bucket, 1, Integer::sum);
+                if (c.ref.liquid()) {
+                    Item bucket = c.ref.item();
+                    if (bucket != null) {
+                        needed.merge(bucket, 1, Integer::sum);
+                        count++;
+                    }
+                    continue;
+                }
+
+                Item item = c.ref.item();
+                if (item != Items.AIR) {
+                    needed.merge(item, 1, Integer::sum);
                     count++;
                 }
-                continue;
-            }
-
-            Item item = c.target.getBlock().asItem();
-            if (item != Items.AIR) {
-                needed.merge(item, 1, Integer::sum);
-                count++;
             }
         }
         return needed;
@@ -5573,16 +8048,16 @@ public class SchematicPrinter {
     }
 
     /*? if >=26.1 {*//*
-    private void takeNeededItems(Minecraft mc, LocalPlayer player,
+    private boolean takeNeededItems(Minecraft mc, LocalPlayer player,
     *//*?} else {*/
-    private void takeNeededItems(MinecraftClient mc, ClientPlayerEntity player,
+    private boolean takeNeededItems(MinecraftClient mc, ClientPlayerEntity player,
     /*?}*/
                                  /*? if >=26.1 {*//*
                                  ChestMenu handler) {
                                  *//*?} else {*/
                                  GenericContainerScreenHandler handler) {
                                  /*?}*/
-        if (neededItems == null || neededItems.isEmpty()) return;
+        if (neededItems == null || neededItems.isEmpty()) return true;
 
         /*? if >=26.1 {*//*
         int chestSlots = handler.getRowCount() * 9;
@@ -5597,7 +8072,27 @@ public class SchematicPrinter {
         // screen, player inventory slots start at chestSlots.
         int playerSlotStart = chestSlots;      // main inv (slots 9-35)
         int playerSlotEnd = chestSlots + 36;   // through hotbar (slots 0-8)
+        Map<String, Integer> remainingNeed = new LinkedHashMap<>(neededItemCounts);
+
         for (int slot = playerSlotStart; slot < playerSlotEnd; slot++) {
+            if (blockedRestockSlots.contains(slot)) continue;
+            /*? if >=26.1 {*//*
+            ItemStack stack = handler.getSlot(slot).getItem();
+            *//*?} else {*/
+            ItemStack stack = handler.getSlot(slot).getStack();
+            /*?}*/
+            if (stack.isEmpty()) continue;
+            /*? if >=26.1 {*//*
+            String itemId = BuiltInRegistries.ITEM.getKey(stack.getItem()).toString();
+            *//*?} else {*/
+            String itemId = Registries.ITEM.getId(stack.getItem()).toString();
+            /*?}*/
+            if (!remainingNeed.containsKey(itemId)) continue;
+            remainingNeed.put(itemId, Math.max(0, remainingNeed.get(itemId) - stack.getCount()));
+        }
+
+        for (int slot = playerSlotStart; slot < playerSlotEnd; slot++) {
+            if (blockedRestockSlots.contains(slot)) continue;
             /*? if >=26.1 {*//*
             ItemStack stack = handler.getSlot(slot).getItem();
             *//*?} else {*/
@@ -5623,11 +8118,15 @@ public class SchematicPrinter {
                     *//*?} else {*/
                     SlotActionType.QUICK_MOVE, player);
                     /*?}*/
+            beginPendingContainerAction(handler, slot, ContainerTransferLane.RESTOCK);
+            chestSyncDelay = 0;
+            return false;
         }
 
         // Reserve a slot for the shulker if one is needed from this chest.
         boolean hasNeededShulker = false;
         for (int slot = 0; slot < chestSlots; slot++) {
+            if (blockedRestockSlots.contains(slot)) continue;
             /*? if >=26.1 {*//*
             ItemStack stack = handler.getSlot(slot).getItem();
             *//*?} else {*/
@@ -5638,10 +8137,95 @@ public class SchematicPrinter {
                 break;
             }
         }
-        int reservedFreeSlots = hasNeededShulker ? 1 : 0;
+        // When a needed shulker is involved, keep one slot for the shulker
+        // itself and another for the loose items that must come out of it.
+        int reservedFreeSlots = RESTOCK_RESERVED_FREE_SLOTS + (hasNeededShulker ? 2 : 0);
 
-        // Pass 1: grab all loose (non-shulker) needed items
+        // Pass 1: stage one hotbar stack per needed item when possible.
         for (int slot = 0; slot < chestSlots; slot++) {
+            if (blockedRestockSlots.contains(slot)) continue;
+            /*? if >=26.1 {*//*
+            ItemStack stack = handler.getSlot(slot).getItem();
+            *//*?} else {*/
+            ItemStack stack = handler.getSlot(slot).getStack();
+            /*?}*/
+            if (stack.isEmpty() || isShulkerBox(stack)) continue;
+
+            /*? if >=26.1 {*//*
+            String itemId = BuiltInRegistries.ITEM.getKey(stack.getItem()).toString();
+            *//*?} else {*/
+            String itemId = Registries.ITEM.getId(stack.getItem()).toString();
+            /*?}*/
+            if (!neededItems.contains(itemId)) continue;
+            if (remainingNeed.getOrDefault(itemId, 0) <= 0) continue;
+            if (hasNeededItemInHotbar(player, stack.getItem())) continue;
+
+            int hotbarSlot = findReusableBuilderHotbarSlot(player, itemId);
+            if (hotbarSlot < 0) continue;
+
+            /*? if >=26.1 {*//*
+            mc.gameMode.handleContainerInput(
+                    handler.containerId, slot, hotbarSlot,
+                    ContainerInput.SWAP, player);
+            *//*?} else {*/
+            mc.interactionManager.clickSlot(
+                    handler.syncId, slot, hotbarSlot,
+                    SlotActionType.SWAP, player);
+            /*?}*/
+            remainingNeed.put(itemId, Math.max(0,
+                    remainingNeed.getOrDefault(itemId, 0) - stack.getCount()));
+            beginPendingContainerAction(handler, slot, ContainerTransferLane.RESTOCK);
+            chestSyncDelay = 0;
+            return false;
+        }
+
+        // Pass 2: if the chest has a needed shulker, prefer taking ONE shulker
+        // before greedily pulling more loose stacks. This keeps inventory
+        // pressure low and gives the unloading playbook room to work.
+        int freeSlotsAfterHotbarStage = 0;
+        for (int slot = playerSlotStart; slot < playerSlotEnd; slot++) {
+            /*? if >=26.1 {*//*
+            ItemStack stack = handler.getSlot(slot).getItem();
+            *//*?} else {*/
+            ItemStack stack = handler.getSlot(slot).getStack();
+            /*?}*/
+            if (stack.isEmpty()) freeSlotsAfterHotbarStage++;
+        }
+        if (hasNeededShulker && freeSlotsAfterHotbarStage > RESTOCK_RESERVED_FREE_SLOTS) {
+            for (int slot = 0; slot < chestSlots; slot++) {
+                if (blockedRestockSlots.contains(slot)) continue;
+                /*? if >=26.1 {*//*
+                ItemStack stack = handler.getSlot(slot).getItem();
+                *//*?} else {*/
+                ItemStack stack = handler.getSlot(slot).getStack();
+                /*?}*/
+                if (stack.isEmpty()) continue;
+                if (!isShulkerBox(stack)) continue;
+                if (!shulkerContainsNeeded(stack, remainingNeed)) continue;
+                /*? if >=26.1 {*//*
+                mc.gameMode.handleContainerInput(
+                *//*?} else {*/
+                mc.interactionManager.clickSlot(
+                /*?}*/
+                        /*? if >=26.1 {*//*
+                        handler.containerId, slot, 0,
+                        *//*?} else {*/
+                        handler.syncId, slot, 0,
+                        /*?}*/
+                        /*? if >=26.1 {*//*
+                        ContainerInput.QUICK_MOVE, player);
+                        *//*?} else {*/
+                        SlotActionType.QUICK_MOVE, player);
+                        /*?}*/
+                beginPendingContainerAction(handler, slot, ContainerTransferLane.RESTOCK);
+                chestSyncDelay = 0;
+                return false; // only one shulker per visit
+            }
+        }
+
+        // Pass 3: grab loose needed items to support the staged working set.
+        for (int slot = 0; slot < chestSlots; slot++) {
+            if (blockedRestockSlots.contains(slot)) continue;
             /*? if >=26.1 {*//*
             ItemStack stack = handler.getSlot(slot).getItem();
             *//*?} else {*/
@@ -5654,7 +8238,8 @@ public class SchematicPrinter {
             *//*?} else {*/
             String itemId = Registries.ITEM.getId(stack.getItem()).toString();
             /*?}*/
-            if (neededItems.contains(itemId) && !isShulkerBox(stack)) {
+            int shortage = remainingNeed.getOrDefault(itemId, 0);
+            if (shortage > 0 && !isShulkerBox(stack)) {
                 boolean wouldStack = false;
                 int freeSlots = 0;
                 for (int pi = playerSlotStart; pi < playerSlotEnd; pi++) {
@@ -5700,14 +8285,28 @@ public class SchematicPrinter {
                         *//*?} else {*/
                         SlotActionType.QUICK_MOVE, player);
                         /*?}*/
+                remainingNeed.put(itemId, Math.max(0, shortage - stack.getCount()));
+                beginPendingContainerAction(handler, slot, ContainerTransferLane.RESTOCK);
+                chestSyncDelay = 0;
+                return false;
             }
         }
 
-        // Pass 2: grab at most ONE shulker that has needed items
+        // Pass 4: grab at most ONE shulker that has needed items
         // Taking only one shulker per chest visit prevents inventory
         // flooding.  The unloading state machine will empty it, then
         // the printer can come back for another shulker if still needed.
+        int freeSlotsAfterLoosePulls = 0;
+        for (int slot = playerSlotStart; slot < playerSlotEnd; slot++) {
+            /*? if >=26.1 {*//*
+            ItemStack stack = handler.getSlot(slot).getItem();
+            *//*?} else {*/
+            ItemStack stack = handler.getSlot(slot).getStack();
+            /*?}*/
+            if (stack.isEmpty()) freeSlotsAfterLoosePulls++;
+        }
         for (int slot = 0; slot < chestSlots; slot++) {
+            if (blockedRestockSlots.contains(slot)) continue;
             /*? if >=26.1 {*//*
             ItemStack stack = handler.getSlot(slot).getItem();
             *//*?} else {*/
@@ -5715,7 +8314,10 @@ public class SchematicPrinter {
             /*?}*/
             if (stack.isEmpty()) continue;
 
-            if (isShulkerBox(stack) && shulkerContainsNeeded(stack, neededItems)) {
+            if (freeSlotsAfterLoosePulls <= RESTOCK_RESERVED_FREE_SLOTS) {
+                break;
+            }
+            if (isShulkerBox(stack) && shulkerContainsNeeded(stack, remainingNeed)) {
                 /*? if >=26.1 {*//*
                 mc.gameMode.handleContainerInput(
                 *//*?} else {*/
@@ -5731,15 +8333,215 @@ public class SchematicPrinter {
                         *//*?} else {*/
                         SlotActionType.QUICK_MOVE, player);
                         /*?}*/
-                break; // only one shulker per visit
+                beginPendingContainerAction(handler, slot, ContainerTransferLane.RESTOCK);
+                chestSyncDelay = 0;
+                return false; // only one shulker per visit
             }
         }
+        return true;
+    }
+
+    private void addWorkingSetNeed(Item item, int desiredCount, Map<Item, Integer> inventoryCounts) {
+        if (item == null || item == Items.AIR) return;
+        /*? if >=26.1 {*//*
+        String itemId = BuiltInRegistries.ITEM.getKey(item).toString();
+        *//*?} else {*/
+        String itemId = Registries.ITEM.getId(item).toString();
+        /*?}*/
+        if (!neededItems.contains(itemId) && neededItems.size() >= RESTOCK_WORKING_SET_TYPES) {
+            return;
+        }
+        int targetCount = restockTargetCount(item, desiredCount);
+        int have = inventoryCounts.getOrDefault(item, 0);
+        int shortage = Math.max(0, targetCount - have);
+        if (shortage <= 0) return;
+        neededItems.add(itemId);
+        neededItemCounts.merge(itemId, shortage, Integer::sum);
+    }
+
+    private int restockTargetCount(Item item, int desiredCount) {
+        if (item == null || item == Items.AIR) return 0;
+        /*? if >=26.1 {*//*
+        ItemStack defaultStack = item.getDefaultInstance();
+        *//*?} else {*/
+        ItemStack defaultStack = item.getDefaultStack();
+        /*?}*/
+        String itemId = ItemIdentifier.getItemId(defaultStack);
+        if ("minecraft:water_bucket".equals(itemId)
+                || "minecraft:lava_bucket".equals(itemId)
+                || "minecraft:powder_snow_bucket".equals(itemId)) {
+            return 1;
+        }
+        return Math.min(desiredCount,
+                Math.max(1, defaultStack.getMaxCount() * RESTOCK_TARGET_STACKS_PER_ITEM));
+    }
+
+    /*? if >=26.1 {*//*
+    private boolean hasNeededItemInHotbar(LocalPlayer player, Item item) {
+        Inventory inv = player.getInventory();
+        for (int i = 0; i < 9; i++) {
+            if (inv.getItem(i).getItem() == item) return true;
+        }
+        return false;
+    }
+    *//*?} else {*/
+    private boolean hasNeededItemInHotbar(ClientPlayerEntity player, Item item) {
+        PlayerInventory inv = player.getInventory();
+        for (int i = 0; i < 9; i++) {
+            if (inv.getStack(i).getItem() == item) return true;
+        }
+        return false;
+    }
+    /*?}*/
+
+    /*? if >=26.1 {*//*
+    private int findReusableBuilderHotbarSlot(LocalPlayer player, String neededItemId) {
+        Inventory inv = player.getInventory();
+        for (int i = 0; i < 9; i++) {
+            if (inv.getItem(i).isEmpty()) return i;
+        }
+        for (int i = 0; i < 9; i++) {
+            ItemStack stack = inv.getItem(i);
+            if (isReusableBuilderHotbarStack(stack, neededItemId)) return i;
+        }
+        return -1;
+    }
+    *//*?} else {*/
+    private int findReusableBuilderHotbarSlot(ClientPlayerEntity player, String neededItemId) {
+        PlayerInventory inv = player.getInventory();
+        for (int i = 0; i < 9; i++) {
+            if (inv.getStack(i).isEmpty()) return i;
+        }
+        for (int i = 0; i < 9; i++) {
+            ItemStack stack = inv.getStack(i);
+            if (isReusableBuilderHotbarStack(stack, neededItemId)) return i;
+        }
+        return -1;
+    }
+    /*?}*/
+
+    private boolean isReusableBuilderHotbarStack(ItemStack stack, String neededItemId) {
+        if (stack == null || stack.isEmpty()) return true;
+        if (
+                /*? if >=26.1 {*//*
+                stack.isDamageableItem()
+                *//*?} else {*/
+                stack.isDamageable()
+                /*?}*/
+        ) {
+            return false;
+        }
+        if (isShulkerBox(stack)) return false;
+        if (stack.getItem() == Items.TOTEM_OF_UNDYING) return false;
+        if (stack.getItem() == Items.ENDER_CHEST) return false;
+        if (stack.getItem() == Items.ENDER_PEARL) return false;
+        if (stack.getItem() == Items.FIREWORK_ROCKET) return false;
+        /*? if >=26.1 {*//*
+        String stackId = BuiltInRegistries.ITEM.getKey(stack.getItem()).toString();
+        *//*?} else {*/
+        String stackId = Registries.ITEM.getId(stack.getItem()).toString();
+        /*?}*/
+        if (neededItems.contains(stackId) || stackId.equals(neededItemId)) return false;
+        return stack.getItem() instanceof BlockItem || isBuildUtilityItem(stack.getItem());
+    }
+
+    private boolean isBuildUtilityItem(Item item) {
+        return item == Items.WATER_BUCKET
+                || item == Items.LAVA_BUCKET
+                || item == Items.POWDER_SNOW_BUCKET;
     }
 
     private boolean isShulkerBox(ItemStack stack) {
         if (stack == null || stack.isEmpty()) return false;
         return stack.getItem() instanceof BlockItem bi
                 && bi.getBlock() instanceof ShulkerBoxBlock;
+    }
+
+    private boolean shouldDumpOverflowStack(ItemStack stack, Map<String, Integer> inventoryCounts) {
+        if (stack == null || stack.isEmpty()) return false;
+        if (isShulkerBox(stack)) return false;
+        /*? if >=26.1 {*//*
+        if (stack.isDamageableItem()) return false;
+        *//*?} else {*/
+        if (stack.isDamageable()) return false;
+        /*?}*/
+        if (MoarMod.getChestManager().getKeepItems().contains(stack.getItem())) return false;
+
+        String itemId = ItemIdentifier.getItemId(stack);
+        if ("minecraft:ender_chest".equals(itemId)) return false;
+
+        int reserve = neededItemCounts.getOrDefault(itemId, 0);
+        if (reserve <= 0) return true;
+        return inventoryCounts.getOrDefault(itemId, 0) - stack.getCount() >= reserve;
+    }
+
+    /*? if >=26.1 {*//*
+    private void snapshotDumpShulkerSlots(LocalPlayer player) {
+        Inventory inv = player.getInventory();
+    *//*?} else {*/
+    private void snapshotDumpShulkerSlots(ClientPlayerEntity player) {
+        PlayerInventory inv = player.getInventory();
+    /*?}*/
+        preDumpShulkerSlots.clear();
+        for (int i = 0; i < 36; i++) {
+            /*? if >=26.1 {*//*
+            if (isShulkerBox(inv.getItem(i))) {
+            *//*?} else {*/
+            if (isShulkerBox(inv.getStack(i))) {
+            /*?}*/
+                preDumpShulkerSlots.add(i);
+            }
+        }
+    }
+
+    /*? if >=26.1 {*//*
+    private int findNewDumpShulkerSlot(LocalPlayer player) {
+        Inventory inv = player.getInventory();
+    *//*?} else {*/
+    private int findNewDumpShulkerSlot(ClientPlayerEntity player) {
+        PlayerInventory inv = player.getInventory();
+    /*?}*/
+        for (int i = 0; i < 36; i++) {
+            if (preDumpShulkerSlots.contains(i)) continue;
+            /*? if >=26.1 {*//*
+            if (isShulkerBox(inv.getItem(i))) {
+            *//*?} else {*/
+            if (isShulkerBox(inv.getStack(i))) {
+            /*?}*/
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    /*? if >=26.1 {*//*
+    private void resumeAfterDump(Minecraft mc, boolean warnPickup) {
+    *//*?} else {*/
+    private void resumeAfterDump(MinecraftClient mc, boolean warnPickup) {
+    /*?}*/
+        if (warnPickup && statusMessages) {
+            ChatHelper.info("§eOverflow shulker may not have been picked up cleanly.");
+        }
+
+        clearPendingContainerAction();
+        blockedDumpSlots.clear();
+        dumpMode = DumpMode.NONE;
+        dumpShulkerPhase = 0;
+        dumpShulkerPos = null;
+        dumpShulkerSlot = -1;
+        dumpShulkerOpenRetries = 0;
+        dumpShulkerTransferTimeouts = 0;
+        dumpWaitTicks = 0;
+        dumpSyncDelay = 0;
+        dumpTarget = null;
+        preDumpShulkerSlots.clear();
+
+        if (preDumpClearPos != null) {
+            PathWalker.walkToNearby(preDumpClearPos, (int) Math.ceil(range));
+            autoState = AutoState.WALKING_TO_CLEAR;
+        } else {
+            autoState = AutoState.CLEARING_AREA;
+        }
     }
 
     private boolean shulkerContainsNeeded(ItemStack shulkerStack, Set<String> needSet) {
@@ -5765,6 +8567,777 @@ public class SchematicPrinter {
         return false;
     }
 
+    private boolean matchesCurrentBuildPass(SchematicBlockRef ref) {
+        if (ref == null) return false;
+        if (liquidPass) return ref.liquid();
+        if (redstonePass) return ref.redstone();
+        return !ref.liquid() && !ref.redstone();
+    }
+
+    private boolean matchesCurrentBuildPass(BlockState target) {
+        if (target == null) return false;
+        boolean isLiquid = isLiquidSource(target);
+        boolean isRedstone = !isLiquid && BlockDependency.isRedstoneComponent(target);
+        if (liquidPass) return isLiquid;
+        if (redstonePass) return isRedstone;
+        return !isLiquid && !isRedstone;
+    }
+
+    /*? if >=26.1 {*//*
+    private int getBottomUpActiveBandTopY(Level world) {
+        return getBottomUpActiveBandTopY(world, null);
+    }
+    *//*?} else {*/
+    private int getBottomUpActiveBandTopY(World world) {
+        return getBottomUpActiveBandTopY(world, null);
+    }
+    /*?}*/
+
+    /*? if >=26.1 {*//*
+    private int getBottomUpActiveBandTopY(Level world, RenderWindow renderWindow) {
+    *//*?} else {*/
+    private int getBottomUpActiveBandTopY(World world, RenderWindow renderWindow) {
+    /*?}*/
+        if (sortMode != SortMode.BOTTOM_UP || world == null) {
+            return Integer.MAX_VALUE;
+        }
+
+        Integer localLowestActionableY = null;
+        Integer globalLowestActionableY = null;
+        long tick = getWorldTick();
+        for (long key : schematicBlocksByChunk.keySet()) {
+            int chunkX = chunkXFromKey(key);
+            int chunkZ = chunkZFromKey(key);
+            /*? if >=26.1 {*//*
+            if (!world.hasChunk(chunkX, chunkZ)) continue;
+            *//*?} else {*/
+            if (!world.isChunkLoaded(chunkX, chunkZ)) continue;
+            /*?}*/
+
+            for (SchematicBlockRef ref : getUnresolvedChunkEntries(world, tick, key)) {
+                if (!matchesCurrentBuildPass(ref)) continue;
+                if (!isCurrentlyUnresolved(ref, world)) continue;
+                BlockPos worldPos = ref.pos();
+                if (!printInAir && !PlacementEngine.hasAdjacentSolid(world, worldPos)) continue;
+                if (!BlockDependency.isReadyToPlace(world, worldPos, ref.target())) continue;
+                if (isNearFailedZone(worldPos)) continue;
+
+                int y = worldPos.getY();
+                if (globalLowestActionableY == null || y < globalLowestActionableY) {
+                    globalLowestActionableY = y;
+                }
+                if (renderWindow != null
+                        && isWithinRenderWindow(renderWindow, worldPos.getX(), worldPos.getZ())
+                        && (localLowestActionableY == null || y < localLowestActionableY)) {
+                    localLowestActionableY = y;
+                }
+            }
+        }
+
+        Integer lowestActionableY = localLowestActionableY != null
+                ? localLowestActionableY
+                : globalLowestActionableY;
+        if (lowestActionableY == null) {
+            return Integer.MAX_VALUE;
+        }
+        return lowestActionableY + BOTTOM_UP_ACTIVE_BAND_HEIGHT - 1;
+    }
+
+    private boolean prefersHigherBuildLayers() {
+        return sortMode == SortMode.TOP_DOWN;
+    }
+
+    private boolean isBetterBuildLayer(int candidateY, int bestY) {
+        return prefersHigherBuildLayers() ? candidateY > bestY : candidateY < bestY;
+    }
+
+    private boolean isWithinActiveBuildFrontier(int y, int frontierY, int activeBandTopY) {
+        if (sortMode == SortMode.BOTTOM_UP && activeBandTopY != Integer.MAX_VALUE) {
+            int bandBottomY = activeBandTopY - BOTTOM_UP_ACTIVE_BAND_HEIGHT + 1;
+            return y >= bandBottomY && y <= activeBandTopY;
+        }
+        return y == frontierY;
+    }
+
+    /*? if >=26.1 {*//*
+    private BuildStagingPlan findBuildStagingPlan(LocalPlayer player, Level world,
+                                                  int extraReachBonus) {
+    *//*?} else {*/
+    private BuildStagingPlan findBuildStagingPlan(ClientPlayerEntity player, World world,
+                                                  int extraReachBonus) {
+    /*?}*/
+        if (player == null || world == null) return null;
+
+        /*? if >=26.1 {*//*
+        BlockPos playerBlockPos = player.blockPosition();
+        Vec3 playerPos = player.position();
+        *//*?} else if >=1.21.10 {*//*
+        BlockPos playerBlockPos = player.getBlockPos();
+        Vec3d playerPos = player.getSyncedPos();
+        *//*?} else {*/
+        BlockPos playerBlockPos = player.getBlockPos();
+        Vec3d playerPos = player.getPos();
+        /*?}*/
+        long tick = getWorldTick();
+        if (cachedBuildStagingPlanTick != Long.MIN_VALUE
+                && tick - cachedBuildStagingPlanTick < STAGING_PLAN_CACHE_TTL
+                && extraReachBonus == cachedBuildStagingPlanExtraReachBonus
+                && playerBlockPos.equals(cachedBuildStagingPlanPlayerPos)) {
+            return cachedBuildStagingPlan;
+        }
+        RenderWindow renderWindow = getRenderWindow(playerBlockPos);
+        int activeBandTopY = getBottomUpActiveBandTopY(world, renderWindow);
+        boolean preferExterior = shouldPreferExteriorBuildTargets(playerBlockPos);
+        List<StagingTargetCandidate> repairVisibleExteriorCandidates = new ArrayList<>(STAGING_PLAN_MAX_CANDIDATES);
+        List<StagingTargetCandidate> repairVisibleInteriorCandidates = new ArrayList<>(STAGING_PLAN_MAX_CANDIDATES);
+        List<StagingTargetCandidate> repairFallbackExteriorCandidates = new ArrayList<>(STAGING_PLAN_MAX_CANDIDATES);
+        List<StagingTargetCandidate> repairFallbackInteriorCandidates = new ArrayList<>(STAGING_PLAN_MAX_CANDIDATES);
+        List<StagingTargetCandidate> visibleExteriorCandidates = new ArrayList<>(STAGING_PLAN_MAX_CANDIDATES);
+        List<StagingTargetCandidate> visibleInteriorCandidates = new ArrayList<>(STAGING_PLAN_MAX_CANDIDATES);
+        List<StagingTargetCandidate> fallbackExteriorCandidates = new ArrayList<>(STAGING_PLAN_MAX_CANDIDATES);
+        List<StagingTargetCandidate> fallbackInteriorCandidates = new ArrayList<>(STAGING_PLAN_MAX_CANDIDATES);
+
+        for (long key : schematicBlocksByChunk.keySet()) {
+            int chunkX = chunkXFromKey(key);
+            int chunkZ = chunkZFromKey(key);
+            /*? if >=26.1 {*//*
+            if (!world.hasChunk(chunkX, chunkZ)) continue;
+            *//*?} else {*/
+            if (!world.isChunkLoaded(chunkX, chunkZ)) continue;
+            /*?}*/
+
+            for (SchematicBlockRef ref : getUnresolvedChunkEntries(world, tick, key)) {
+                if (!matchesCurrentBuildPass(ref)) continue;
+                if (!isCurrentlyUnresolved(ref, world)) continue;
+
+                BlockPos worldPos = ref.pos();
+                if (worldPos.getY() > activeBandTopY) continue;
+                if (!printInAir && !PlacementEngine.hasAdjacentSolid(world, worldPos)) continue;
+                if (!BlockDependency.isReadyToPlace(world, worldPos, ref.target())) continue;
+                if (isNearFailedZone(worldPos)) continue;
+
+                /*? if >=26.1 {*//*
+                double targetDist = playerPos.distanceToSqr(Vec3.atCenterOf(worldPos));
+                *//*?} else {*/
+                double targetDist = playerPos.squaredDistanceTo(Vec3d.ofCenter(worldPos));
+	                /*?}*/
+	                boolean visible = isWithinRenderWindow(renderWindow, worldPos.getX(), worldPos.getZ());
+	                boolean exterior = isExteriorBuildTarget(worldPos);
+	                boolean repair = repairPriorityTargets.contains(worldPos);
+	                insertStagingCandidate(
+	                        visible
+	                                ? (repair
+	                                ? (exterior ? repairVisibleExteriorCandidates : repairVisibleInteriorCandidates)
+	                                : (exterior ? visibleExteriorCandidates : visibleInteriorCandidates))
+	                                : (repair
+	                                ? (exterior ? repairFallbackExteriorCandidates : repairFallbackInteriorCandidates)
+	                                : (exterior ? fallbackExteriorCandidates : fallbackInteriorCandidates)),
+	                        ref,
+	                        targetDist);
+	            }
+	        }
+	        BuildStagingPlan result = findBestStagingPlanByBuildSide(
+	                preferExterior,
+	                repairVisibleExteriorCandidates,
+	                repairVisibleInteriorCandidates,
+	                repairFallbackExteriorCandidates,
+	                repairFallbackInteriorCandidates,
+	                player,
+	                world,
+	                playerBlockPos,
+	                playerPos,
+	                extraReachBonus);
+	        if (result == null) {
+	            result = findBestStagingPlanByBuildSide(
+	                preferExterior,
+	                visibleExteriorCandidates,
+	                visibleInteriorCandidates,
+	                fallbackExteriorCandidates,
+	                fallbackInteriorCandidates,
+	                player,
+	                world,
+	                playerBlockPos,
+	                playerPos,
+	                extraReachBonus);
+	        }
+	        cachedBuildStagingPlanTick = tick;
+        /*? if >=26.1 {*//*
+        cachedBuildStagingPlanPlayerPos = playerBlockPos.immutable();
+        *//*?} else {*/
+        cachedBuildStagingPlanPlayerPos = playerBlockPos.toImmutable();
+        /*?}*/
+        cachedBuildStagingPlanExtraReachBonus = extraReachBonus;
+        cachedBuildStagingPlan = result;
+	        return result;
+	    }
+
+    /*? if >=26.1 {*//*
+    private BuildStagingPlan findBestStagingPlanByBuildSide(boolean preferExterior,
+                                                            List<StagingTargetCandidate> visibleExterior,
+                                                            List<StagingTargetCandidate> visibleInterior,
+                                                            List<StagingTargetCandidate> fallbackExterior,
+                                                            List<StagingTargetCandidate> fallbackInterior,
+                                                            LocalPlayer player, Level world,
+                                                            BlockPos playerBlockPos, Vec3 playerPos,
+                                                            int extraReachBonus) {
+    *//*?} else if >=1.21.10 {*//*
+    private BuildStagingPlan findBestStagingPlanByBuildSide(boolean preferExterior,
+                                                            List<StagingTargetCandidate> visibleExterior,
+                                                            List<StagingTargetCandidate> visibleInterior,
+                                                            List<StagingTargetCandidate> fallbackExterior,
+                                                            List<StagingTargetCandidate> fallbackInterior,
+                                                            ClientPlayerEntity player, World world,
+                                                            BlockPos playerBlockPos, Vec3d playerPos,
+                                                            int extraReachBonus) {
+    *//*?} else {*/
+    private BuildStagingPlan findBestStagingPlanByBuildSide(boolean preferExterior,
+                                                            List<StagingTargetCandidate> visibleExterior,
+                                                            List<StagingTargetCandidate> visibleInterior,
+                                                            List<StagingTargetCandidate> fallbackExterior,
+                                                            List<StagingTargetCandidate> fallbackInterior,
+                                                            ClientPlayerEntity player, World world,
+                                                            BlockPos playerBlockPos, Vec3d playerPos,
+                                                            int extraReachBonus) {
+    /*?}*/
+        BuildStagingPlan result;
+        if (preferExterior) {
+            result = evaluateStagingCandidates(visibleExterior, player, world, playerBlockPos, playerPos, extraReachBonus);
+            if (result != null) return result;
+            result = evaluateStagingCandidates(fallbackExterior, player, world, playerBlockPos, playerPos, extraReachBonus);
+            if (result != null) return result;
+            result = evaluateStagingCandidates(visibleInterior, player, world, playerBlockPos, playerPos, extraReachBonus);
+            if (result != null) return result;
+            return evaluateStagingCandidates(fallbackInterior, player, world, playerBlockPos, playerPos, extraReachBonus);
+        }
+        result = evaluateStagingCandidates(visibleInterior, player, world, playerBlockPos, playerPos, extraReachBonus);
+        if (result != null) return result;
+        result = evaluateStagingCandidates(visibleExterior, player, world, playerBlockPos, playerPos, extraReachBonus);
+        if (result != null) return result;
+        result = evaluateStagingCandidates(fallbackInterior, player, world, playerBlockPos, playerPos, extraReachBonus);
+        if (result != null) return result;
+        return evaluateStagingCandidates(fallbackExterior, player, world, playerBlockPos, playerPos, extraReachBonus);
+    }
+
+    private boolean shouldPreferExteriorBuildTargets(BlockPos playerBlockPos) {
+        if (playerBlockPos == null || schematic == null || anchor == null) {
+            return false;
+        }
+        int minX = anchor.getX();
+        int maxX = anchor.getX() + schematic.getSizeX() - 1;
+        int minZ = anchor.getZ();
+        int maxZ = anchor.getZ() + schematic.getSizeZ() - 1;
+        return playerBlockPos.getX() < minX
+                || playerBlockPos.getX() > maxX
+                || playerBlockPos.getZ() < minZ
+                || playerBlockPos.getZ() > maxZ;
+    }
+
+    private boolean isExteriorBuildTarget(BlockPos worldPos) {
+        if (worldPos == null || schematic == null || anchor == null) {
+            return false;
+        }
+        int sx = worldPos.getX() - anchor.getX();
+        int sy = worldPos.getY() - anchor.getY();
+        int sz = worldPos.getZ() - anchor.getZ();
+        if (!schematic.contains(sx, sy, sz)) {
+            return false;
+        }
+        if (hasExteriorAirRay(sx, sy, sz, 1, 0)
+                || hasExteriorAirRay(sx, sy, sz, -1, 0)
+                || hasExteriorAirRay(sx, sy, sz, 0, 1)
+                || hasExteriorAirRay(sx, sy, sz, 0, -1)) {
+            return true;
+        }
+        int edgeDistance = Math.min(
+                Math.min(sx, schematic.getSizeX() - 1 - sx),
+                Math.min(sz, schematic.getSizeZ() - 1 - sz));
+        return edgeDistance <= EXTERIOR_BUILD_SHELL_DEPTH;
+    }
+
+    private boolean hasExteriorAirRay(int sx, int sy, int sz, int dx, int dz) {
+        int x = sx + dx;
+        int z = sz + dz;
+        int maxSteps = schematic.getSizeX() + schematic.getSizeZ() + 4;
+        for (int steps = 0; steps < maxSteps; steps++) {
+            if (!schematic.contains(x, sy, z)) {
+                return true;
+            }
+            BlockState state = schematic.getBlockState(x, sy, z);
+            if (state != null && !state.isAir()) {
+                return false;
+            }
+            x += dx;
+            z += dz;
+        }
+        return false;
+    }
+
+    private void insertStagingCandidate(List<StagingTargetCandidate> candidates,
+                                        SchematicBlockRef ref,
+                                        double targetDist) {
+        if (candidates == null || ref == null) return;
+        int insertAt = 0;
+        while (insertAt < candidates.size()) {
+            StagingTargetCandidate existing = candidates.get(insertAt);
+            int comparison = compareStagingCandidates(
+                    ref.pos(), targetDist, existing.ref().pos(), existing.targetDist());
+            if (comparison < 0) {
+                break;
+            }
+            insertAt++;
+        }
+        if (insertAt >= STAGING_PLAN_MAX_CANDIDATES) {
+            return;
+        }
+        candidates.add(insertAt, new StagingTargetCandidate(ref, targetDist));
+        if (candidates.size() > STAGING_PLAN_MAX_CANDIDATES) {
+            candidates.remove(candidates.size() - 1);
+        }
+    }
+
+    private int compareStagingCandidates(BlockPos candidatePos, double candidateDist,
+                                         BlockPos existingPos, double existingDist) {
+        if (candidatePos != null && existingPos != null && candidatePos.getY() != existingPos.getY()) {
+            if (isBetterBuildLayer(candidatePos.getY(), existingPos.getY())) {
+                return -1;
+            }
+            if (isBetterBuildLayer(existingPos.getY(), candidatePos.getY())) {
+                return 1;
+            }
+        }
+        return Double.compare(candidateDist, existingDist);
+    }
+
+    /*? if >=26.1 {*//*
+    private BuildStagingPlan evaluateStagingCandidates(List<StagingTargetCandidate> candidates,
+                                                       LocalPlayer player, Level world,
+                                                       BlockPos playerBlockPos, Vec3 playerPos,
+                                                       int extraReachBonus) {
+    *//*?} else if >=1.21.10 {*//*
+    private BuildStagingPlan evaluateStagingCandidates(List<StagingTargetCandidate> candidates,
+                                                       ClientPlayerEntity player, World world,
+                                                       BlockPos playerBlockPos, Vec3d playerPos,
+                                                       int extraReachBonus) {
+    *//*?} else {*/
+    private BuildStagingPlan evaluateStagingCandidates(List<StagingTargetCandidate> candidates,
+                                                       ClientPlayerEntity player, World world,
+                                                       BlockPos playerBlockPos, Vec3d playerPos,
+                                                       int extraReachBonus) {
+    /*?}*/
+        if (candidates == null || candidates.isEmpty() || player == null || world == null) {
+            return null;
+        }
+
+        BuildStagingPlan bestPlan = null;
+        int bestY = prefersHigherBuildLayers() ? Integer.MIN_VALUE : Integer.MAX_VALUE;
+        double bestScore = Double.MAX_VALUE;
+
+        for (StagingTargetCandidate candidate : candidates) {
+            if (candidate == null || candidate.ref() == null) continue;
+            BlockPos worldPos = candidate.ref().pos();
+            BlockPos standPos = findStandingPosition(worldPos, world, player);
+            boolean approachOnly = false;
+            if (standPos == null) {
+                standPos = findApproachStandingPosition(worldPos, world, player, extraReachBonus);
+                approachOnly = true;
+            }
+            standPos = sanitizeBuildStandingPosition(worldPos, standPos, playerBlockPos);
+            if (standPos == null) continue;
+            if (approachOnly && !canProbeBuildTargetFromStagingPosition(standPos, worldPos, world)) {
+                continue;
+            }
+            if (isNearFailedZone(standPos)) continue;
+            if (isNearBuildStagingPosition(playerPos, standPos)
+                    && !canBuildSpecificTargetFromCurrentStance(player, world, worldPos)) {
+                continue;
+            }
+
+            /*? if >=26.1 {*//*
+            double standDist = playerPos.distanceToSqr(Vec3.atCenterOf(standPos));
+            *//*?} else {*/
+            double standDist = playerPos.squaredDistanceTo(Vec3d.ofCenter(standPos));
+            /*?}*/
+            double score = standDist
+                    + candidate.targetDist() * 0.15
+                    + Math.abs(worldPos.getY() - standPos.getY()) * 12.0
+                    + (approachOnly ? 96.0 : 0.0);
+            if (bestPlan == null
+                    || isBetterBuildLayer(worldPos.getY(), bestY)
+                    || (worldPos.getY() == bestY && score < bestScore)) {
+                bestPlan = new BuildStagingPlan(worldPos, standPos, approachOnly);
+                bestY = worldPos.getY();
+                bestScore = score;
+            }
+        }
+        return bestPlan;
+    }
+
+    /*? if >=26.1 {*//*
+    private boolean canProbeBuildTargetFromStagingPosition(BlockPos standPos,
+                                                           BlockPos targetPos,
+                                                           Level world) {
+    *//*?} else {*/
+    private boolean canProbeBuildTargetFromStagingPosition(BlockPos standPos,
+                                                           BlockPos targetPos,
+                                                           World world) {
+    /*?}*/
+        if (standPos == null || targetPos == null || world == null) {
+            return false;
+        }
+        BlockState target = getDesiredBuildStateAt(targetPos);
+        if (target == null
+                || (!isPlaceable(target) && !isLiquidSource(target))
+                || !matchesCurrentBuildPass(target)
+                || isPlacementTargetCoolingDown(targetPos)
+                || isEffectivelyPlaced(world.getBlockState(targetPos), target)) {
+            return false;
+        }
+        if (!printInAir && !PlacementEngine.hasAdjacentSolid(world, targetPos)) {
+            return false;
+        }
+        if (!BlockDependency.isReadyToPlace(world, targetPos, target)) {
+            return false;
+        }
+        double rangeSq = range * range;
+        /*? if >=26.1 {*//*
+        Vec3 eyePos = Vec3.atCenterOf(standPos).add(0.0, 1.62, 0.0);
+        return eyePos.distanceToSqr(Vec3.atCenterOf(targetPos)) <= rangeSq;
+        *//*?} else {*/
+        Vec3d eyePos = Vec3d.ofCenter(standPos).add(0.0, 1.62, 0.0);
+        return eyePos.squaredDistanceTo(Vec3d.ofCenter(targetPos)) <= rangeSq;
+        /*?}*/
+    }
+
+    /*? if >=26.1 {*//*
+    private boolean startAccessMiningToBuildPocket(Minecraft mc, BlockPos targetPos) {
+    *//*?} else {*/
+    private boolean startAccessMiningToBuildPocket(MinecraftClient mc, BlockPos targetPos) {
+    /*?}*/
+        if (mc == null || targetPos == null) return false;
+        /*? if >=26.1 {*//*
+        if (mc.player == null || mc.level == null) return false;
+        BuildAccessTarget access = findBuildAccessTarget(targetPos, mc.level, mc.player);
+        *//*?} else {*/
+        if (mc.player == null || mc.world == null) return false;
+        BuildAccessTarget access = findBuildAccessTarget(targetPos, mc.world, mc.player);
+        /*?}*/
+        if (access == null || access.feetPos() == null) {
+            return false;
+        }
+        /*? if >=26.1 {*//*
+        seedAccessRepairTargets(mc.player.blockPosition(), access, targetPos, mc.level);
+        *//*?} else {*/
+        seedAccessRepairTargets(mc.player.getBlockPos(), access, targetPos, mc.world);
+        /*?}*/
+
+        invalidateBuildStagingPlanCache();
+        noProgressTicks = 0;
+        walkAttemptCooldown = NO_PROGRESS_WALK_RECHECK_TICKS;
+        triedPlacementWalk = false;
+        /*? if >=26.1 {*//*
+        lastWalkTargetZone = targetPos.immutable();
+        lastWalkStandPos = access.feetPos().immutable();
+        lastWalkApproachPos = access.feetPos().immutable();
+        *//*?} else {*/
+        lastWalkTargetZone = targetPos.toImmutable();
+        lastWalkStandPos = access.feetPos().toImmutable();
+        lastWalkApproachPos = access.feetPos().toImmutable();
+        /*?}*/
+
+        if (access.clearPos() != null) {
+            PacketTelemetry.mark("build access clear target=" + posLabel(access.clearPos())
+                    + " feet=" + posLabel(access.feetPos())
+                    + " zone=" + posLabel(targetPos));
+            accessClearInProgress = true;
+            boolean started;
+            /*? if >=26.1 {*//*
+            started = startClearWalk(mc.player, mc.level, access.clearPos());
+            *//*?} else {*/
+            started = startClearWalk(mc.player, mc.world, access.clearPos());
+            /*?}*/
+            if (started) {
+                autoState = AutoState.WALKING_TO_CLEAR;
+            } else {
+                autoState = AutoState.CLEARING_AREA;
+            }
+            return true;
+        }
+
+        PacketTelemetry.mark("build access mine feet=" + posLabel(access.feetPos())
+                + " zone=" + posLabel(targetPos));
+        PathWalker.setBreakingAllowed(true);
+        PathWalker.walkTo(access.feetPos());
+        autoState = AutoState.WALKING_TO_BUILD;
+        return true;
+    }
+
+    /*? if >=26.1 {*//*
+    private BuildAccessTarget findBuildAccessTarget(BlockPos targetPos, Level world, LocalPlayer player) {
+    *//*?} else {*/
+    private BuildAccessTarget findBuildAccessTarget(BlockPos targetPos, World world, ClientPlayerEntity player) {
+    /*?}*/
+        if (targetPos == null || world == null || player == null
+                || schematic == null || anchor == null) {
+            return null;
+        }
+        /*? if >=26.1 {*//*
+        Vec3 playerPos = player.position();
+        BlockPos playerBlockPos = player.blockPosition();
+        *//*?} else if >=1.21.10 {*//*
+        Vec3d playerPos = player.getSyncedPos();
+        BlockPos playerBlockPos = player.getBlockPos();
+        *//*?} else {*/
+        Vec3d playerPos = player.getPos();
+        BlockPos playerBlockPos = player.getBlockPos();
+        /*?}*/
+
+        BuildAccessTarget best = null;
+        double bestScore = Double.MAX_VALUE;
+        BuildAccessTarget bestReachable = null;
+        double bestReachableScore = Double.MAX_VALUE;
+        int rejectedFeet = 0;
+        int rejectedHead = 0;
+        int rejectedGround = 0;
+        int rejectedClear = 0;
+        int rejectedPath = 0;
+        int rejectedRange = 0;
+        int considered = 0;
+        int radius = ACCESS_MINING_SEARCH_RADIUS;
+        int minAccessY = Math.min(targetPos.getY(), playerBlockPos.getY());
+        for (int dy = -2; dy <= 3; dy++) {
+            for (int dx = -radius; dx <= radius; dx++) {
+                for (int dz = -radius; dz <= radius; dz++) {
+                    BlockPos feetPos = new BlockPos(
+                            targetPos.getX() + dx,
+                            targetPos.getY() + dy,
+                            targetPos.getZ() + dz);
+                    if (feetPos.getY() < minAccessY) continue;
+                    if (!isBuildAccessCell(feetPos, world)) {
+                        rejectedFeet++;
+                        continue;
+                    }
+                    /*? if >=26.1 {*//*
+                    BlockPos headPos = feetPos.above();
+                    BlockPos groundPos = feetPos.below();
+                    *//*?} else {*/
+                    BlockPos headPos = feetPos.up();
+                    BlockPos groundPos = feetPos.down();
+                    /*?}*/
+                    if (!isBuildAccessCell(headPos, world)) {
+                        rejectedHead++;
+                        continue;
+                    }
+                    if (!hasAccessMiningGround(groundPos, world)) {
+                        rejectedGround++;
+                        continue;
+                    }
+                    considered++;
+                    boolean directProbe = canProbeBuildTargetFromStagingPosition(feetPos, targetPos, world);
+
+                    BlockPos clearPos = null;
+                    BlockState feetState = world.getBlockState(feetPos);
+                    BlockState headState = world.getBlockState(headPos);
+                    if (isMovementBlocking(feetState)) {
+                        clearPos = feetPos;
+                    } else if (isMovementBlocking(headState)) {
+                        clearPos = headPos;
+                    }
+                    if (clearPos != null
+                            && (failedClearTargets.contains(clearPos)
+                            || clearPos.getY() < minAccessY
+                            || isStorageBlacklistedForClearing(
+                                    world.getBlockState(clearPos), clearPos,
+                                    getProtectedStoragePositions()))) {
+                        rejectedClear++;
+                        continue;
+                    }
+                    AccessPathProbe pathProbe = findAccessPathProbe(playerBlockPos, feetPos, world);
+                    if (pathProbe.blocked()) {
+                        rejectedPath++;
+                        continue;
+                    }
+                    if (clearPos == null) {
+                        clearPos = pathProbe.clearPos();
+                    }
+                    if (clearPos != null && clearPos.getY() < minAccessY) {
+                        rejectedClear++;
+                        continue;
+                    }
+
+                    /*? if >=26.1 {*//*
+                    Vec3 eyePos = Vec3.atCenterOf(feetPos).add(0.0, 1.62, 0.0);
+                    double targetDist = eyePos.distanceToSqr(Vec3.atCenterOf(targetPos));
+                    double playerDist = playerPos.distanceToSqr(Vec3.atCenterOf(feetPos));
+                    *//*?} else {*/
+                    Vec3d eyePos = Vec3d.ofCenter(feetPos).add(0.0, 1.62, 0.0);
+                    double targetDist = eyePos.squaredDistanceTo(Vec3d.ofCenter(targetPos));
+                    double playerDist = playerPos.squaredDistanceTo(Vec3d.ofCenter(feetPos));
+                    /*?}*/
+                    double score = targetDist * 2.0
+                            + playerDist * 0.35
+                            + Math.abs(feetPos.getY() - targetPos.getY()) * 18.0
+                            + (clearPos != null ? 8.0 : 0.0);
+                    if (directProbe) {
+                        if (targetDist > range * range) {
+                            rejectedRange++;
+                            continue;
+                        }
+                        if (score < bestScore) {
+                            bestScore = score;
+                            best = new BuildAccessTarget(feetPos, clearPos);
+                        }
+                    } else {
+                        // Reachable build pockets are still valuable even when
+                        // they cannot place this exact target yet.
+                        double relaxedScore = playerDist * 0.55
+                                + targetDist * 0.35
+                                + Math.abs(feetPos.getY() - targetPos.getY()) * 14.0
+                                + (clearPos != null ? 8.0 : 0.0)
+                                + 24.0;
+                        if (relaxedScore < bestReachableScore) {
+                            bestReachableScore = relaxedScore;
+                            bestReachable = new BuildAccessTarget(feetPos, clearPos);
+                        }
+                    }
+                }
+            }
+        }
+        if (best == null && bestReachable == null) {
+            PacketTelemetry.mark("build access reject zone=" + posLabel(targetPos)
+                    + " considered=" + considered
+                    + " feet=" + rejectedFeet
+                    + " head=" + rejectedHead
+                    + " ground=" + rejectedGround
+                    + " clear=" + rejectedClear
+                    + " path=" + rejectedPath
+                    + " range=" + rejectedRange
+                    + " player=" + posLabel(playerBlockPos));
+        }
+        return best != null ? best : bestReachable;
+    }
+
+    /*? if >=26.1 {*//*
+    private boolean isBuildAccessCell(BlockPos pos, Level world) {
+    *//*?} else {*/
+    private boolean isBuildAccessCell(BlockPos pos, World world) {
+    /*?}*/
+        if (pos == null || world == null || schematic == null || anchor == null) return false;
+        int sx = pos.getX() - anchor.getX();
+        int sy = pos.getY() - anchor.getY();
+        int sz = pos.getZ() - anchor.getZ();
+        if (schematic.contains(sx, sy, sz)) {
+            BlockState expected = schematic.getBlockState(sx, sy, sz);
+            if (expected == null || !expected.isAir()) return false;
+        }
+        BlockState current = world.getBlockState(pos);
+        if (!current.getFluidState().isEmpty()) return false;
+        return !isStorageBlacklistedForClearing(current, pos, getProtectedStoragePositions());
+    }
+
+    /*? if >=26.1 {*//*
+    private AccessPathProbe findAccessPathProbe(BlockPos fromFeet, BlockPos toFeet, Level world) {
+    *//*?} else {*/
+    private AccessPathProbe findAccessPathProbe(BlockPos fromFeet, BlockPos toFeet, World world) {
+    /*?}*/
+        if (fromFeet == null || toFeet == null || world == null) {
+            return new AccessPathProbe(null, true);
+        }
+        int dx = toFeet.getX() - fromFeet.getX();
+        int dy = toFeet.getY() - fromFeet.getY();
+        int dz = toFeet.getZ() - fromFeet.getZ();
+        int steps = Math.max(1, Math.max(Math.abs(dx), Math.max(Math.abs(dy), Math.abs(dz))));
+        for (int i = 1; i <= steps; i++) {
+            double t = (double) i / (double) steps;
+            BlockPos feetPos = new BlockPos(
+                    fromFeet.getX() + (int) Math.round(dx * t),
+                    fromFeet.getY() + (int) Math.round(dy * t),
+                    fromFeet.getZ() + (int) Math.round(dz * t));
+            BlockPos clearPos = firstAccessBlocker(feetPos, world);
+            if (clearPos == null) {
+                continue;
+            }
+            if (failedClearTargets.contains(clearPos)) {
+                return new AccessPathProbe(null, true);
+            }
+            if (!isAccessMiningCarvableCell(clearPos, world)
+                    && !isTemporarilyCarvableAccessCell(clearPos, world)) {
+                return new AccessPathProbe(null, true);
+            }
+            return new AccessPathProbe(clearPos, false);
+        }
+        return new AccessPathProbe(null, false);
+    }
+
+    /*? if >=26.1 {*//*
+    private BlockPos firstAccessBlocker(BlockPos feetPos, Level world) {
+    *//*?} else {*/
+    private BlockPos firstAccessBlocker(BlockPos feetPos, World world) {
+    /*?}*/
+        if (feetPos == null || world == null) return null;
+        if (isMovementBlocking(world.getBlockState(feetPos))) {
+            return feetPos;
+        }
+        /*? if >=26.1 {*//*
+        BlockPos headPos = feetPos.above();
+        *//*?} else {*/
+        BlockPos headPos = feetPos.up();
+        /*?}*/
+        if (isMovementBlocking(world.getBlockState(headPos))) {
+            return headPos;
+        }
+        return null;
+    }
+
+    /*? if >=26.1 {*//*
+    private boolean isAccessMiningCarvableCell(BlockPos pos, Level world) {
+    *//*?} else {*/
+    private boolean isAccessMiningCarvableCell(BlockPos pos, World world) {
+    /*?}*/
+        if (pos == null || world == null || schematic == null || anchor == null) return false;
+        int sx = pos.getX() - anchor.getX();
+        int sy = pos.getY() - anchor.getY();
+        int sz = pos.getZ() - anchor.getZ();
+        if (schematic.contains(sx, sy, sz)) {
+            BlockState expected = schematic.getBlockState(sx, sy, sz);
+            if (expected == null || !expected.isAir()) return false;
+        }
+        BlockState current = world.getBlockState(pos);
+        if (!current.getFluidState().isEmpty()) return false;
+        return !isStorageBlacklistedForClearing(current, pos, getProtectedStoragePositions());
+    }
+
+    /*? if >=26.1 {*//*
+    private boolean isTemporarilyCarvableAccessCell(BlockPos pos, Level world) {
+    *//*?} else {*/
+    private boolean isTemporarilyCarvableAccessCell(BlockPos pos, World world) {
+    /*?}*/
+        if (pos == null || world == null || schematic == null || anchor == null) return false;
+        int sx = pos.getX() - anchor.getX();
+        int sy = pos.getY() - anchor.getY();
+        int sz = pos.getZ() - anchor.getZ();
+        if (!schematic.contains(sx, sy, sz)) return false;
+        BlockState expected = schematic.getBlockState(sx, sy, sz);
+        if (expected == null || expected.isAir()) return false;
+        BlockState current = world.getBlockState(pos);
+        if (!current.getFluidState().isEmpty()) return false;
+        if (current.isAir()) return false;
+        if (isStorageBlacklistedForClearing(current, pos, getProtectedStoragePositions())) return false;
+        return isMovementBlocking(current);
+    }
+
+    /*? if >=26.1 {*//*
+    private boolean hasAccessMiningGround(BlockPos groundPos, Level world) {
+    *//*?} else {*/
+    private boolean hasAccessMiningGround(BlockPos groundPos, World world) {
+    /*?}*/
+        if (groundPos == null || world == null) return false;
+        BlockState state = world.getBlockState(groundPos);
+        if (!state.getCollisionShape(world, groundPos).isEmpty()) {
+            return true;
+        }
+        return isCorrectSchematicBlock(groundPos, world);
+    }
+
     // NAVIGATION HELPERS
 
     /*? if >=26.1 {*//*
@@ -5781,82 +9354,131 @@ public class SchematicPrinter {
         *//*?} else {*/
         Vec3d playerPos = player.getPos();
         /*?}*/
-        BlockPos best = null;
-        double bestDist = Double.MAX_VALUE;
-        /*? if >=26.1 {*//*
-        BlockPos.MutableBlockPos mutablePos = new BlockPos.MutableBlockPos();
-        *//*?} else {*/
-        BlockPos.Mutable mutablePos = new BlockPos.Mutable();
-        /*?}*/
+	        RenderWindow renderWindow =
+	                getRenderWindow(/*? if >=26.1 {*//* player.blockPosition() *//*?} else {*/player.getBlockPos()/*?}*/);
+	        boolean preferExterior =
+	                shouldPreferExteriorBuildTargets(/*? if >=26.1 {*//* player.blockPosition() *//*?} else {*/player.getBlockPos()/*?}*/);
+	        BlockPos bestRepairVisibleExterior = null;
+	        double bestRepairVisibleExteriorDist = Double.MAX_VALUE;
+	        BlockPos bestRepairVisibleInterior = null;
+	        double bestRepairVisibleInteriorDist = Double.MAX_VALUE;
+	        BlockPos bestRepairFallbackExterior = null;
+	        double bestRepairFallbackExteriorDist = Double.MAX_VALUE;
+	        BlockPos bestRepairFallbackInterior = null;
+	        double bestRepairFallbackInteriorDist = Double.MAX_VALUE;
+	        BlockPos bestVisibleExterior = null;
+	        double bestVisibleExteriorDist = Double.MAX_VALUE;
+	        BlockPos bestVisibleInterior = null;
+	        double bestVisibleInteriorDist = Double.MAX_VALUE;
+	        BlockPos bestFallbackExterior = null;
+	        double bestFallbackExteriorDist = Double.MAX_VALUE;
+	        BlockPos bestFallbackInterior = null;
+	        double bestFallbackInteriorDist = Double.MAX_VALUE;
+	        int activeBandTopY = getBottomUpActiveBandTopY(world, renderWindow);
 
-        // Scan Y-levels bottom-up, skipping failedZones.
-        for (LitematicaSchematic.Region region : schematic.getRegions()) {
-            for (int y = 0; y < region.absY; y++) {
-                for (int z = 0; z < region.absZ; z++) {
-                    for (int x = 0; x < region.absX; x++) {
-                        BlockState target = region.getBlockState(x, y, z);
-                        if (target.isAir()) continue;
-                        if (!isPlaceable(target) && !isLiquidSource(target)) continue;
-                        if (isAutoCreatedPart(target)) continue;
+        long tick = getWorldTick();
+        for (long key : schematicBlocksByChunk.keySet()) {
+            int chunkX = chunkXFromKey(key);
+            int chunkZ = chunkZFromKey(key);
+            /*? if >=26.1 {*//*
+            if (!world.hasChunk(chunkX, chunkZ)) continue;
+            *//*?} else {*/
+            if (!world.isChunkLoaded(chunkX, chunkZ)) continue;
+            /*?}*/
 
-                        // Three-pass deferral — structural → redstone → liquid
-                        boolean isLiquid = isLiquidSource(target);
-                        boolean isRedstone = !isLiquid && BlockDependency.isRedstoneComponent(target);
-                        if (liquidPass) {
-                            if (!isLiquid) continue;
-                        } else if (redstonePass) {
-                            if (!isRedstone) continue;
-                        } else {
-                            if (isLiquid || isRedstone) continue;
-                        }
+            for (SchematicBlockRef ref : getUnresolvedChunkEntries(world, tick, key)) {
+                if (!matchesCurrentBuildPass(ref)) continue;
+                if (!isCurrentlyUnresolved(ref, world)) continue;
 
-                        int wx = anchor.getX() + region.originX + x;
-                        int wy = anchor.getY() + region.originY + y;
-                        int wz = anchor.getZ() + region.originZ + z;
+                BlockPos worldPos = ref.pos();
+                if (worldPos.getY() > activeBandTopY) continue;
 
-                        // Skip positions in unloaded chunks — getBlockState
-                        // returns air for unloaded chunks, which would cause
-                        // the builder to think every block needs placing.
-                        /*? if >=26.1 {*//*
-                        if (!world.hasChunk(wx >> 4, wz >> 4)) continue;
-                        *//*?} else {*/
-                        if (!world.isChunkLoaded(wx >> 4, wz >> 4)) continue;
-                        /*?}*/
-
-                        mutablePos.set(wx, wy, wz);
-
-                        if (isEffectivelyPlaced(world.getBlockState(mutablePos), target)) continue;
-
-                        // Prefer blocks at the lowest or highest unbuilt Y-level
-                        if (sortMode == SortMode.TOP_DOWN) {
-                            if (best != null && wy < best.getY()) continue;
-                        } else {
-                            if (best != null && wy > best.getY()) continue;
-                        }
-
-                        if (!printInAir && !PlacementEngine.hasAdjacentSolid(world, mutablePos)) continue;
-                        if (!BlockDependency.isReadyToPlace(world, mutablePos, target)) continue;
-                        if (isNearFailedZone(mutablePos)) continue;
-
-                        /*? if >=26.1 {*//*
-                        double dist = playerPos.distanceToSqr(wx + 0.5, wy + 0.5, wz + 0.5);
-                        *//*?} else {*/
-                        double dist = playerPos.squaredDistanceTo(wx + 0.5, wy + 0.5, wz + 0.5);
-                        /*?}*/
-                        if (dist < bestDist) {
-                            bestDist = dist;
-                            /*? if >=26.1 {*//*
-                            best = mutablePos.immutable();
-                            *//*?} else {*/
-                            best = mutablePos.toImmutable();
-                            /*?}*/
-                        }
-                    }
+                // Prefer blocks at the lowest or highest unbuilt Y-level
+	                boolean visible = isWithinRenderWindow(renderWindow, worldPos.getX(), worldPos.getZ());
+	                boolean exterior = isExteriorBuildTarget(worldPos);
+	                boolean repair = repairPriorityTargets.contains(worldPos);
+	                BlockPos currentBest = visible
+	                        ? (repair
+	                        ? (exterior ? bestRepairVisibleExterior : bestRepairVisibleInterior)
+	                        : (exterior ? bestVisibleExterior : bestVisibleInterior))
+	                        : (repair
+	                        ? (exterior ? bestRepairFallbackExterior : bestRepairFallbackInterior)
+	                        : (exterior ? bestFallbackExterior : bestFallbackInterior));
+	                if (sortMode == SortMode.TOP_DOWN) {
+	                    if (currentBest != null && worldPos.getY() < currentBest.getY()) continue;
+	                } else {
+                    if (currentBest != null && worldPos.getY() > currentBest.getY()) continue;
                 }
-            }
-        }
-        return best;
-    }
+
+                if (!printInAir && !PlacementEngine.hasAdjacentSolid(world, worldPos)) continue;
+                if (!BlockDependency.isReadyToPlace(world, worldPos, ref.target())) continue;
+                if (isNearFailedZone(worldPos)) continue;
+
+                /*? if >=26.1 {*//*
+                double dist = playerPos.distanceToSqr(worldPos.getX() + 0.5, worldPos.getY() + 0.5, worldPos.getZ() + 0.5);
+                *//*?} else {*/
+	                double dist = playerPos.squaredDistanceTo(worldPos.getX() + 0.5, worldPos.getY() + 0.5, worldPos.getZ() + 0.5);
+	                /*?}*/
+	                if (repair && visible && exterior) {
+	                    if (dist < bestRepairVisibleExteriorDist) {
+	                        bestRepairVisibleExteriorDist = dist;
+	                        bestRepairVisibleExterior = worldPos;
+	                    }
+	                } else if (repair && visible) {
+	                    if (dist < bestRepairVisibleInteriorDist) {
+	                        bestRepairVisibleInteriorDist = dist;
+	                        bestRepairVisibleInterior = worldPos;
+	                    }
+	                } else if (repair && exterior) {
+	                    if (dist < bestRepairFallbackExteriorDist) {
+	                        bestRepairFallbackExteriorDist = dist;
+	                        bestRepairFallbackExterior = worldPos;
+	                    }
+	                } else if (repair) {
+	                    if (dist < bestRepairFallbackInteriorDist) {
+	                        bestRepairFallbackInteriorDist = dist;
+	                        bestRepairFallbackInterior = worldPos;
+	                    }
+	                } else if (visible && exterior) {
+	                    if (dist < bestVisibleExteriorDist) {
+	                        bestVisibleExteriorDist = dist;
+	                        bestVisibleExterior = worldPos;
+	                    }
+	                } else if (visible) {
+	                    if (dist < bestVisibleInteriorDist) {
+	                        bestVisibleInteriorDist = dist;
+	                        bestVisibleInterior = worldPos;
+	                    }
+	                } else if (exterior) {
+	                    if (dist < bestFallbackExteriorDist) {
+	                        bestFallbackExteriorDist = dist;
+	                        bestFallbackExterior = worldPos;
+	                    }
+	                } else if (dist < bestFallbackInteriorDist) {
+	                    bestFallbackInteriorDist = dist;
+	                    bestFallbackInterior = worldPos;
+	                }
+	            }
+	        }
+	        if (preferExterior) {
+	            if (bestRepairVisibleExterior != null) return bestRepairVisibleExterior;
+	            if (bestRepairFallbackExterior != null) return bestRepairFallbackExterior;
+	            if (bestRepairVisibleInterior != null) return bestRepairVisibleInterior;
+	            if (bestRepairFallbackInterior != null) return bestRepairFallbackInterior;
+	            if (bestVisibleExterior != null) return bestVisibleExterior;
+	            if (bestFallbackExterior != null) return bestFallbackExterior;
+	            if (bestVisibleInterior != null) return bestVisibleInterior;
+	            return bestFallbackInterior;
+	        }
+	        if (bestRepairVisibleInterior != null) return bestRepairVisibleInterior;
+	        if (bestRepairVisibleExterior != null) return bestRepairVisibleExterior;
+	        if (bestRepairFallbackInterior != null) return bestRepairFallbackInterior;
+	        if (bestRepairFallbackExterior != null) return bestRepairFallbackExterior;
+	        if (bestVisibleInterior != null) return bestVisibleInterior;
+	        if (bestVisibleExterior != null) return bestVisibleExterior;
+	        if (bestFallbackInterior != null) return bestFallbackInterior;
+	        return bestFallbackExterior;
+	    }
 
     // Finds the nearest non-air schematic block in unloaded chunks.
     // Walking toward the result loads the chunk for placement.
@@ -6464,13 +10086,16 @@ public class SchematicPrinter {
         // Use the build reach distance as the exclusion radius.
         // If we can't path to one point, all blocks within our reach
         // distance of that point are likely unreachable too.
-        double exclusionDist = Math.ceil(range);
+        double exclusionDist = Math.max(1.5, Math.min(2.5, Math.ceil(range) - 1.5));
+        double exclusionDistSq = exclusionDist * exclusionDist;
         for (BlockPos fz : failedZones) {
-            /*? if >=26.1 {*//*
-            if (pos.closerThan(fz, exclusionDist)) return true;
-            *//*?} else {*/
-            if (pos.isWithinDistance(fz, exclusionDist)) return true;
-            /*?}*/
+            int dy = Math.abs(pos.getY() - fz.getY());
+            if (dy > 1) continue;
+            int dx = pos.getX() - fz.getX();
+            int dz = pos.getZ() - fz.getZ();
+            if ((double) dx * dx + (double) dz * dz <= exclusionDistSq) {
+                return true;
+            }
         }
         return false;
     }
@@ -6512,20 +10137,38 @@ public class SchematicPrinter {
     *//*?} else {*/
     private BlockPos findStandingPosition(BlockPos target, World world, ClientPlayerEntity player) {
     /*?}*/
-        int maxReach = (int) Math.ceil(range);
+        return findStandingPosition(target, world, player, range);
+    }
+
+    /*? if >=26.1 {*//*
+    private BlockPos findStandingPosition(BlockPos target, Level world, LocalPlayer player,
+                                          double reachDistance) {
+    *//*?} else {*/
+    private BlockPos findStandingPosition(BlockPos target, World world, ClientPlayerEntity player,
+                                          double reachDistance) {
+    /*?}*/
+        int maxReach = (int) Math.ceil(reachDistance);
         // Use a reduced range to account for the player not standing
         // exactly at block center (can be ±0.5 off).  This ensures that
         // returned positions are comfortably within reach, not marginal.
-        double bufferedRange = range - 0.3;
+        double bufferedRange = Math.max(1.5, reachDistance - 0.3);
         double rangeSq = bufferedRange * bufferedRange;
         /*? if >=26.1 {*//*
         Vec3 targetCenter = Vec3.atCenterOf(target);
         *//*?} else {*/
         Vec3d targetCenter = Vec3d.ofCenter(target);
         /*?}*/
+        BlockState desiredTarget = getDesiredBuildStateAt(target);
 
-        BlockPos best = null;
-        double bestDist = Double.MAX_VALUE;
+        BlockPos bestVisible = null;
+        double bestVisibleDist = Double.MAX_VALUE;
+        BlockPos bestFallback = null;
+        double bestFallbackDist = Double.MAX_VALUE;
+        /*? if >=26.1 {*//*
+        int playerY = player.blockPosition().getY();
+        *//*?} else {*/
+        int playerY = player.getBlockPos().getY();
+        /*?}*/
 
         // Search at y-offsets from -8 to +8 relative to the target
         // so the player can stand above, below, or at the same level.
@@ -6544,6 +10187,15 @@ public class SchematicPrinter {
                     int wx = target.getX() + dx;
                     int wz = target.getZ() + dz;
                     BlockPos feetPos = new BlockPos(wx, feetY, wz);
+
+                    // For same-level or higher targets, don't route the player
+                    // down into pits or undercrofts just because they are
+                    // technically within reach. Those stances correlate with
+                    // perimeter loops and "walked under the build" failures.
+                    if (target.getY() >= playerY - 1) {
+                        if (feetPos.getY() < playerY - 1) continue;
+                        if (feetPos.getY() < target.getY() - 2) continue;
+                    }
 
                     // Must be within placement reach of the target
                     /*? if >=26.1 {*//*
@@ -6626,6 +10278,23 @@ public class SchematicPrinter {
                     // dry-land positions.
                     double penalty = inWater ? 500.0 : 0.0;
 
+                    // Strongly prefer standing positions near the target's
+                    // Y-level. Working from well below the build often leads
+                    // Baritone into caves/concaves where lower layers are
+                    // reachable but upper layers repeatedly fail.
+                    int blocksBelowTarget = Math.max(0, target.getY() - feetPos.getY());
+                    penalty += blocksBelowTarget * STANDING_BELOW_TARGET_PENALTY;
+
+                    // Prefer open, breathable platforms over cramped pockets.
+                    // Low ceilings and boxed-in exits correlate strongly with
+                    // slow/rejected placement when Baritone paths underneath
+                    // the schematic footprint.
+                    int overheadClearance = countStandingHeadroom(feetPos, world, STANDING_CLEARANCE_GOAL);
+                    penalty += Math.max(0, STANDING_CLEARANCE_GOAL - overheadClearance)
+                            * STANDING_LOW_HEADROOM_PENALTY;
+                    int openSides = countStandingOpenSides(feetPos, world);
+                    penalty += Math.max(0, 3 - openSides) * STANDING_ENCLOSURE_PENALTY;
+
                     // Penalise positions separated from the player by
                     // an air gap (no continuous ground between them).
                     // This deprioritises spots across chasms, but uses a
@@ -6649,14 +10318,79 @@ public class SchematicPrinter {
                         penalty += (Math.abs(yDiff) > 2) ? 200.0 : 10000.0;
                     }
 
-                    if (playerDist + penalty < bestDist) {
-                        bestDist = playerDist + penalty;
-                        best = feetPos;
+                    double score = playerDist + penalty;
+                    boolean visiblePlacement = desiredTarget != null
+                            && isCandidateStableForPlacement(feetPos, target)
+                            && PlacementEngine.canPlaceFromStandingPosition(
+                                    target, desiredTarget, feetPos, player, world);
+
+                    if (visiblePlacement) {
+                        if (score < bestVisibleDist) {
+                            bestVisibleDist = score;
+                            bestVisible = feetPos;
+                        }
+                    } else if (score < bestFallbackDist) {
+                        bestFallbackDist = score;
+                        bestFallback = feetPos;
                     }
                 }
             }
         }
-        return best;
+        return bestVisible != null ? bestVisible : bestFallback;
+    }
+
+    /*? if >=26.1 {*//*
+    private BlockPos findApproachStandingPosition(BlockPos target, Level world, LocalPlayer player,
+                                                  int extraReachBonus) {
+    *//*?} else {*/
+    private BlockPos findApproachStandingPosition(BlockPos target, World world, ClientPlayerEntity player,
+                                                  int extraReachBonus) {
+    /*?}*/
+        double approachReach = Math.min(APPROACH_STAGING_MAX_REACH,
+                range + APPROACH_STAGING_EXTRA_REACH + Math.max(0, extraReachBonus));
+        return findStandingPosition(target, world, player, approachReach);
+    }
+
+    /*? if >=26.1 {*//*
+    private static int countStandingHeadroom(BlockPos feetPos, Level world, int maxBlocks) {
+    *//*?} else {*/
+    private static int countStandingHeadroom(BlockPos feetPos, World world, int maxBlocks) {
+    /*?}*/
+        int clear = 0;
+        for (int i = 2; i < 2 + maxBlocks; i++) {
+            /*? if >=26.1 {*//*
+            BlockPos checkPos = feetPos.above(i);
+            *//*?} else {*/
+            BlockPos checkPos = feetPos.up(i);
+            /*?}*/
+            if (isMovementBlocking(world.getBlockState(checkPos))) {
+                break;
+            }
+            clear++;
+        }
+        return clear;
+    }
+
+    /*? if >=26.1 {*//*
+    private static int countStandingOpenSides(BlockPos feetPos, Level world) {
+    *//*?} else {*/
+    private static int countStandingOpenSides(BlockPos feetPos, World world) {
+    /*?}*/
+        int openSides = 0;
+        for (Direction dir : HORIZONTALS) {
+            /*? if >=26.1 {*//*
+            BlockPos feetN = feetPos.relative(dir);
+            BlockPos headN = feetN.above();
+            *//*?} else {*/
+            BlockPos feetN = feetPos.offset(dir);
+            BlockPos headN = feetN.up();
+            /*?}*/
+            if (!isMovementBlocking(world.getBlockState(feetN))
+                    && !isMovementBlocking(world.getBlockState(headN))) {
+                openSides++;
+            }
+        }
+        return openSides;
     }
 
     // Simple ground check: walks a straight line from start to end
@@ -7033,11 +10767,13 @@ public class SchematicPrinter {
         int maxReach = (int) Math.ceil(range);
 
         List<BlockPos> candidates = new ArrayList<>();
+        List<BlockPos> fallbackCandidates = new ArrayList<>();
         /*? if >=26.1 {*//*
         BlockPos playerPos = player.blockPosition();
         *//*?} else {*/
         BlockPos playerPos = player.getBlockPos();
         /*?}*/
+        int activeBandTopY = getBottomUpActiveBandTopY(world, getRenderWindow(playerPos));
         /*? if >=26.1 {*//*
         Vec3 eyePos = player.getEyePosition();
         *//*?} else {*/
@@ -7047,7 +10783,7 @@ public class SchematicPrinter {
         // Debug counters: track why blocks are filtered
         int dbgTotal = 0, dbgRange = 0, dbgOverlap = 0, dbgBounds = 0;
         int dbgAir = 0, dbgPlaceable = 0, dbgAutoCreated = 0, dbgLiquid = 0;
-        int dbgPlaced = 0, dbgNoAdj = 0, dbgTrap = 0;
+        int dbgPlaced = 0, dbgNoAdj = 0, dbgTrap = 0, dbgCoolingDown = 0, dbgUnstable = 0, dbgOccluded = 0;
         BlockPos dbgFirstFiltered = null;
         String dbgFirstReason = null;
 
@@ -7074,22 +10810,17 @@ public class SchematicPrinter {
                     int sy = worldPos.getY() - anchor.getY();
                     int sz = worldPos.getZ() - anchor.getZ();
                     if (!schematic.contains(sx, sy, sz)) continue;
+                    if (isPlacementTargetCoolingDown(worldPos)) {
+                        dbgCoolingDown++;
+                        continue;
+                    }
 
                     BlockState target = schematic.getBlockState(sx, sy, sz);
                     if (target.isAir()) continue;
                     if (!isPlaceable(target) && !isLiquidSource(target)) continue;
                     if (isAutoCreatedPart(target)) continue;
-
-                    // Three-pass deferral: structural → redstone → liquid.
-                    boolean isLiquid = isLiquidSource(target);
-                    boolean isRedstone = !isLiquid && BlockDependency.isRedstoneComponent(target);
-                    if (liquidPass) {
-                        if (!isLiquid) continue;
-                    } else if (redstonePass) {
-                        if (!isRedstone) continue;
-                    } else {
-                        if (isLiquid || isRedstone) continue;
-                    }
+                    if (!matchesCurrentBuildPass(target)) continue;
+                    if (worldPos.getY() > activeBandTopY) continue;
 
                     // This block needs placing — count it for debug
                     dbgTotal++;
@@ -7125,12 +10856,79 @@ public class SchematicPrinter {
                         continue;
                     }
 
-                    candidates.add(worldPos);
+                    boolean stableForPlacement = isCandidateStableForPlacement(playerPos, worldPos);
+                    if (!stableForPlacement) {
+                        dbgUnstable++;
+                        /*? if >=26.1 {*//*
+                        if (dbgFirstFiltered == null) { dbgFirstFiltered = worldPos.immutable(); dbgFirstReason = "target too high for current stance"; }
+                        *//*?} else {*/
+                        if (dbgFirstFiltered == null) { dbgFirstFiltered = worldPos.toImmutable(); dbgFirstReason = "target too high for current stance"; }
+                        /*?}*/
+                    }
+
+                    boolean canPlaceFromCurrentPosition =
+                            PlacementEngine.canPlaceFromCurrentPosition(worldPos, target, player, world);
+                    if (!canPlaceFromCurrentPosition) {
+                        dbgOccluded++;
+                        /*? if >=26.1 {*//*
+                        if (dbgFirstFiltered == null) { dbgFirstFiltered = worldPos.immutable(); dbgFirstReason = "occluded placement path"; }
+                        *//*?} else {*/
+                        if (dbgFirstFiltered == null) { dbgFirstFiltered = worldPos.toImmutable(); dbgFirstReason = "occluded placement path"; }
+                        /*?}*/
+                    }
+                    if (stableForPlacement && canPlaceFromCurrentPosition) {
+                        candidates.add(worldPos);
+                    } else {
+                        fallbackCandidates.add(worldPos);
+                    }
                 }
             }
         }
 
+        if (candidates.isEmpty() && !fallbackCandidates.isEmpty()) {
+            PacketTelemetry.mark("place blocked relaxed=" + fallbackCandidates.size()
+                    + " unstable=" + dbgUnstable
+                    + " occluded=" + dbgOccluded);
+            markCurrentBuildApproachFailed("all nearby candidates occluded from current stance");
+            if (!deferredPlacementReposition && deferredPlacementRepositionPos == null) {
+                BlockPos blockedTarget = fallbackCandidates.get(0);
+                /*? if >=26.1 {*//*
+                deferredPlacementRepositionPos = blockedTarget.immutable();
+                *//*?} else {*/
+                deferredPlacementRepositionPos = blockedTarget.toImmutable();
+                /*?}*/
+                deferredPlacementReposition = true;
+                placementFailurePauseTicks = Math.max(
+                        placementFailurePauseTicks, PLACEMENT_START_FAILURE_PAUSE_TICKS);
+                walkAttemptCooldown = Math.max(
+                        walkAttemptCooldown, PLACEMENT_START_FAILURE_PAUSE_TICKS);
+                PacketTelemetry.mark("place blocked reposition target=" + posLabel(blockedTarget));
+            }
+            // Nearby work exists, but not from this stance. Push the build
+            // loop toward a faster walk/re-approach instead of hammering the
+            // same impossible local target every few ticks.
+            noProgressTicks = Math.max(noProgressTicks, NO_PROGRESS_WALK_RECHECK_TICKS - 1);
+            LOGGER.debug("No strict placement candidates from current stance; {} relaxed candidates need reposition",
+                    fallbackCandidates.size());
+        }
+
         if (candidates.isEmpty()) {
+            if (placeDebugCooldown <= 0) {
+                PacketTelemetry.mark("place scan none"
+                        + " total=" + dbgTotal
+                        + " placed=" + dbgPlaced
+                        + " noAdj=" + dbgNoAdj
+                        + " trap=" + dbgTrap
+                        + " cooldown=" + dbgCoolingDown
+                        + " unstable=" + dbgUnstable
+                        + " occluded=" + dbgOccluded
+                        + " player=" + posLabel(playerPos)
+                        + " lastZone=" + posLabel(lastWalkTargetZone)
+                        + " activeTop=" + activeBandTopY
+                        + (dbgFirstFiltered != null
+                        ? " first=" + posLabel(dbgFirstFiltered) + ":" + dbgFirstReason
+                        : ""));
+            }
             // Debug output (rate-limited to once per 5 s / 100 ticks)
             if (LOGGER.isDebugEnabled() && statusMessages && placeDebugCooldown <= 0) {
                 placeDebugCooldown = 100;
@@ -7141,6 +10939,9 @@ public class SchematicPrinter {
                     if (dbgPlaced > 0) sb.append("placed=").append(dbgPlaced).append(" ");
                     if (dbgNoAdj > 0) sb.append("noAdj=").append(dbgNoAdj).append(" ");
                     if (dbgTrap > 0) sb.append("trap=").append(dbgTrap).append(" ");
+                    if (dbgCoolingDown > 0) sb.append("cooldown=").append(dbgCoolingDown).append(" ");
+                    if (dbgUnstable > 0) sb.append("unstable=").append(dbgUnstable).append(" ");
+                    if (dbgOccluded > 0) sb.append("occluded=").append(dbgOccluded).append(" ");
                     if (dbgFirstFiltered != null) {
                         sb.append(" First: ").append(dbgFirstFiltered.getX())
                           .append(" ").append(dbgFirstFiltered.getY())
@@ -7159,6 +10960,21 @@ public class SchematicPrinter {
             return false;
         }
 
+        Map<Item, Integer> hotbarInventory = PlacementEngine.getHotbarContents();
+        Map<Item, Integer> fullInventory = PlacementEngine.getInventoryContentsCached();
+        boolean liveInventorySwapAllowed = allowLiveInventorySwapsDuringBuild();
+        /*? if >=26.1 {*//*
+        Inventory playerInv = player.getInventory();
+        Item heldBuildItem = playerInv.getItem(playerInv.getSelectedSlot()).getItem();
+        *//*?} else {*/
+        PlayerInventory playerInv = player.getInventory();
+        /*? if >=1.21.5 {*//*
+        Item heldBuildItem = playerInv.getStack(playerInv.getSelectedSlot()).getItem();
+        *//*?} else {*/
+        Item heldBuildItem = playerInv.getStack(playerInv.selectedSlot).getItem();
+        /*?}*/
+        /*?}*/
+
         // Dependency-aware sorting
         // Freestanding blocks (tier 0) are tried before blocks that need
         // adjacent support (tier 1: torches, flowers, rails, etc.).  This
@@ -7172,6 +10988,7 @@ public class SchematicPrinter {
                         int sz2 = p.getZ() - anchor.getZ();
                         return BlockDependency.getTier(schematic.getBlockState(sx2, sy2, sz2));
                     })
+                .thenComparingInt(p -> getBuildItemPriority(p, heldBuildItem, hotbarInventory))
                 .thenComparingInt(BlockPos::getY)
                 /*? if >=26.1 {*//*
                 .thenComparingDouble(p -> eyePos.distanceToSqr(Vec3.atCenterOf(p)));
@@ -7185,6 +11002,7 @@ public class SchematicPrinter {
                         int sz2 = p.getZ() - anchor.getZ();
                         return BlockDependency.getTier(schematic.getBlockState(sx2, sy2, sz2));
                     })
+                .thenComparingInt(p -> getBuildItemPriority(p, heldBuildItem, hotbarInventory))
                 .thenComparingInt(p -> -p.getY())
                 /*? if >=26.1 {*//*
                 .thenComparingDouble(p -> eyePos.distanceToSqr(Vec3.atCenterOf(p)));
@@ -7198,6 +11016,7 @@ public class SchematicPrinter {
                         int sz2 = p.getZ() - anchor.getZ();
                         return BlockDependency.getTier(schematic.getBlockState(sx2, sy2, sz2));
                     })
+                .thenComparingInt(p -> getBuildItemPriority(p, heldBuildItem, hotbarInventory))
                 /*? if >=26.1 {*//*
                 .thenComparingDouble(p -> eyePos.distanceToSqr(Vec3.atCenterOf(p)));
                 *//*?} else {*/
@@ -7208,6 +11027,7 @@ public class SchematicPrinter {
 
         Set<Item> missing = new HashSet<>();
         int dbgDepSkip = 0, dbgPlaceFail = 0, dbgScaffold = 0;
+        int deferredInventorySwapCandidates = 0;
         BlockPos dbgFirstPlaceFail = null;
         BlockState dbgFirstPlaceFailTarget = null;
         BlockState dbgFirstPlaceFailExisting = null;
@@ -7216,129 +11036,146 @@ public class SchematicPrinter {
         List<BlockState> batchStates  = null;
         Item             batchItem    = null;
 
-        for (BlockPos worldPos : candidates) {
-            int sx = worldPos.getX() - anchor.getX();
-            int sy = worldPos.getY() - anchor.getY();
-            int sz = worldPos.getZ() - anchor.getZ();
-            BlockState target = schematic.getBlockState(sx, sy, sz);
+        boolean sawFastLaneCandidate = false;
+        for (int lane = 0; lane < 2; lane++) {
+            boolean fastLaneOnly = lane == 0;
+            for (BlockPos worldPos : candidates) {
+                int sx = worldPos.getX() - anchor.getX();
+                int sy = worldPos.getY() - anchor.getY();
+                int sz = worldPos.getZ() - anchor.getZ();
+                BlockState target = schematic.getBlockState(sx, sy, sz);
 
-            // Dependency check: skip blocks whose support is missing
-            // Torches without a wall, flowers without a floor, rails
-            // without ground, etc. are silently skipped.  They will be
-            // retried once their support blocks have been placed.
-            if (!BlockDependency.isReadyToPlace(world, worldPos, target)) {
-                dbgDepSkip++;
-                continue;
-            }
-
-            // Skip blocks whose materials we already gave up on
-            // If restock failed and this item was marked skipped, don't
-            // waste time trying — move on to blocks we CAN place.
-            if (!skippedItems.isEmpty()) {
-                Item reqItem = isLiquidSource(target)
-                        ? getLiquidBucketItem(target)
-                        : target.getBlock().asItem();
-                if (reqItem != null && skippedItems.contains(reqItem)) continue;
-            }
-
-            // liquid source block → bucket placement
-            if (isLiquidSource(target)) {
-                Item bucketItem = getLiquidBucketItem(target);
-                if (bucketItem == null) continue;
-
-                // Check if we actually have this bucket in inventory.
-                // Unlike solid blocks, don't add to 'missing' on placement
-                // failure — placeLiquid can fail due to angle/position issues
-                // even when we have buckets, and we want to try other positions.
-                Map<Item, Integer> inv = PlacementEngine.getInventoryContentsCached();
-                if (inv.getOrDefault(bucketItem, 0) <= 0) {
-                    missing.add(bucketItem);
+                // Dependency check: skip blocks whose support is missing
+                // Torches without a wall, flowers without a floor, rails
+                // without ground, etc. are silently skipped.  They will be
+                // retried once their support blocks have been placed.
+                if (!BlockDependency.isReadyToPlace(world, worldPos, target)) {
+                    dbgDepSkip++;
                     continue;
                 }
-                if (missing.contains(bucketItem)) continue;
 
-                if (PlacementEngine.placeLiquid(worldPos, target, swapItems)) {
-                    lastMissingItems.clear();
-                    return true;
+                // Skip blocks whose materials we already gave up on
+                // If restock failed and this item was marked skipped, don't
+                // waste time trying — move on to blocks we CAN place.
+                if (!skippedItems.isEmpty()) {
+                    Item reqItem = isLiquidSource(target)
+                            ? getLiquidBucketItem(target)
+                            : target.getBlock().asItem();
+                    if (reqItem != null && skippedItems.contains(reqItem)) continue;
                 }
-                // Don't add to missing — placement failed for positional
-                // reasons, not because we lack the item.
-                continue;
-            }
 
-            // normal block placement
-            Item requiredItem = target.getBlock().asItem();
-            // Skip items we already know are missing (avoid redundant hotbar scans)
-            if (missing.contains(requiredItem)) continue;
+                // liquid source block → bucket placement
+                if (isLiquidSource(target)) {
+                    Item bucketItem = getLiquidBucketItem(target);
+                    if (bucketItem == null) continue;
+                    boolean fastLaneEligible = isBuildItemFastLaneEligible(bucketItem, heldBuildItem, hotbarInventory);
+                    if (fastLaneOnly != fastLaneEligible) continue;
+                    if (fastLaneEligible) {
+                        sawFastLaneCandidate = true;
+                    }
 
-            // If a scaffold block (placed by Baritone) occupies this
-            // position, break it first so the correct block can be placed.
-            // PlacementEngine's correction mechanism will break the scaffold,
-            // and on the next cycle the position will be air → normal placement.
-            BlockState existing = world.getBlockState(worldPos);
-            /*? if >=26.1 {*//*
-            if (!existing.isAir() && !existing.canBeReplaced()
-            *//*?} else {*/
-            if (!existing.isAir() && !existing.isReplaceable()
-            /*?}*/
-                    && existing.getBlock() != target.getBlock()) {
-                dbgScaffold++;
-                if (PlacementEngine.placeBlock(worldPos, target, swapItems)) {
-                    lastMissingItems.clear();
-                    return true;
+                    // Check if we actually have this bucket in inventory.
+                    // Unlike solid blocks, don't add to 'missing' on placement
+                    // failure — placeLiquid can fail due to angle/position issues
+                    // even when we have buckets, and we want to try other positions.
+                    if (fullInventory.getOrDefault(bucketItem, 0) <= 0) {
+                        missing.add(bucketItem);
+                        continue;
+                    }
+                    if (missing.contains(bucketItem)) continue;
+                    if (!fastLaneOnly && !liveInventorySwapAllowed) {
+                        deferredInventorySwapCandidates++;
+                        continue;
+                    }
+
+                    if (PlacementEngine.placeLiquid(worldPos, target, !fastLaneOnly && liveInventorySwapAllowed)) {
+                        lastMissingItems.clear();
+                        return true;
+                    }
+                    // Don't add to missing — placement failed for positional
+                    // reasons, not because we lack the item.
+                    continue;
                 }
-                // PlacementEngine busy or can't start — skip for now
-                continue;
-            }
 
-            if (batchTargets == null && PlacementEngine.canBatchPlace()) {
-                batchTargets = new ArrayList<>(9);
-                batchStates  = new ArrayList<>(9);
-                batchItem    = requiredItem;
-            }
-            if (batchTargets != null
-                    && batchTargets.size() < 9
-                    && requiredItem == batchItem) {
-                /*? if >=26.1 {*//*
-                batchTargets.add(worldPos.immutable());
-                *//*?} else {*/
-                batchTargets.add(worldPos.toImmutable());
-                /*?}*/
-                batchStates.add(target);
-                continue;
-            }
-
-            if (PlacementEngine.placeBlock(worldPos, target, swapItems)) {
-                lastMissingItems.clear();
-                placeDebugCooldown = 0;
-                return true;
-            }
-
-            // Track first placeBlock failure for debug
-            dbgPlaceFail++;
-            if (dbgFirstPlaceFail == null) {
-                /*? if >=26.1 {*//*
-                dbgFirstPlaceFail = worldPos.immutable();
-                *//*?} else {*/
-                dbgFirstPlaceFail = worldPos.toImmutable();
-                /*?}*/
-                dbgFirstPlaceFailTarget = target;
-                dbgFirstPlaceFailExisting = existing;
-            }
-
-            // placeBlock can fail for many reasons (angle, reach, no
-            // adjacent face, etc.) — only mark as missing if the item
-            // genuinely isn't in the player's inventory.
-            if (requiredItem != Items.AIR) {
-                Map<Item, Integer> currentInv = PlacementEngine.getInventoryContentsCached();
-                if (currentInv.getOrDefault(requiredItem, 0) <= 0) {
+                // normal block placement
+                Item requiredItem = target.getBlock().asItem();
+                boolean fastLaneEligible = isBuildItemFastLaneEligible(requiredItem, heldBuildItem, hotbarInventory);
+                if (fastLaneOnly != fastLaneEligible) continue;
+                if (fastLaneEligible) {
+                    sawFastLaneCandidate = true;
+                }
+                // Skip items we already know are missing (avoid redundant hotbar scans)
+                if (missing.contains(requiredItem)) continue;
+                int inventoryCount = fullInventory.getOrDefault(requiredItem, 0);
+                if (inventoryCount <= 0) {
                     missing.add(requiredItem);
+                    continue;
+                }
+                if (!fastLaneOnly && !liveInventorySwapAllowed) {
+                    deferredInventorySwapCandidates++;
+                    continue;
+                }
+
+                // If a scaffold block (placed by Baritone) occupies this
+                // position, break it first so the correct block can be placed.
+                // PlacementEngine's correction mechanism will break the scaffold,
+                // and on the next cycle the position will be air → normal placement.
+                BlockState existing = world.getBlockState(worldPos);
+                /*? if >=26.1 {*//*
+                if (!existing.isAir() && !existing.canBeReplaced()
+                *//*?} else {*/
+                if (!existing.isAir() && !existing.isReplaceable()
+                /*?}*/
+                        && existing.getBlock() != target.getBlock()) {
+                    dbgScaffold++;
+                    if (PlacementEngine.placeBlock(worldPos, target, !fastLaneOnly && liveInventorySwapAllowed)) {
+                        lastMissingItems.clear();
+                        return true;
+                    }
+                    // PlacementEngine busy or can't start — skip for now
+                    continue;
+                }
+
+                if (batchTargets == null && PlacementEngine.canBatchPlace()) {
+                    batchTargets = new ArrayList<>(9);
+                    batchStates  = new ArrayList<>(9);
+                    batchItem    = requiredItem;
+                }
+                if (batchTargets != null
+                        && batchTargets.size() < 9
+                        && requiredItem == batchItem) {
+                    /*? if >=26.1 {*//*
+                    batchTargets.add(worldPos.immutable());
+                    *//*?} else {*/
+                    batchTargets.add(worldPos.toImmutable());
+                    /*?}*/
+                    batchStates.add(target);
+                    continue;
+                }
+
+                if (PlacementEngine.placeBlock(worldPos, target, !fastLaneOnly && liveInventorySwapAllowed)) {
+                    lastMissingItems.clear();
+                    placeDebugCooldown = 0;
+                    return true;
+                }
+
+                // Track first placeBlock failure for debug
+                dbgPlaceFail++;
+                if (dbgFirstPlaceFail == null) {
+                    /*? if >=26.1 {*//*
+                    dbgFirstPlaceFail = worldPos.immutable();
+                    *//*?} else {*/
+                    dbgFirstPlaceFail = worldPos.toImmutable();
+                    /*?}*/
+                    dbgFirstPlaceFailTarget = target;
+                    dbgFirstPlaceFailExisting = existing;
                 }
             }
         }
 
         if (batchTargets != null && !batchTargets.isEmpty()) {
-            int placed = PlacementEngine.placeBatch(batchTargets, batchStates, swapItems);
+            int placed = PlacementEngine.placeBatch(batchTargets, batchStates,
+                    allowLiveInventorySwapsDuringBuild());
             if (placed > 0) {
                 lastMissingItems.clear();
                 placeDebugCooldown = 0;
@@ -7367,8 +11204,261 @@ public class SchematicPrinter {
         }
         if (placeDebugCooldown > 0) placeDebugCooldown--;
 
+        if (deferredInventorySwapCandidates > 0) {
+            PacketTelemetry.mark("build wait inventory-swap candidates=" + deferredInventorySwapCandidates
+                    + " fastLaneSeen=" + sawFastLaneCandidate
+                    + " calm=" + SetbackMonitor.get().isCalm()
+                    + " failures=" + PlacementEngine.getConsecutiveFailures()
+                    + " rejections=" + PlacementEngine.getConsecutiveRejections());
+            placementFailurePauseTicks = Math.max(
+                    placementFailurePauseTicks, PLACEMENT_START_FAILURE_PAUSE_TICKS);
+            walkAttemptCooldown = Math.max(
+                    walkAttemptCooldown, PLACEMENT_START_FAILURE_PAUSE_TICKS);
+            noProgressTicks = 0;
+            lastMissingItems.clear();
+            return false;
+        }
+
+        if (dbgPlaceFail > 0 && dbgFirstPlaceFail != null) {
+            beginPlacementStartFailurePause(dbgFirstPlaceFail);
+        }
+
         lastMissingItems = missing;
         return false;
+    }
+
+    private int getBuildItemPriority(BlockPos worldPos, Item heldBuildItem, Map<Item, Integer> hotbarInventory) {
+        int sx = worldPos.getX() - anchor.getX();
+        int sy = worldPos.getY() - anchor.getY();
+        int sz = worldPos.getZ() - anchor.getZ();
+        BlockState target = schematic.getBlockState(sx, sy, sz);
+        Item requiredItem = isLiquidSource(target)
+                ? getLiquidBucketItem(target)
+                : target.getBlock().asItem();
+        if (requiredItem == null || requiredItem == Items.AIR) {
+            return 3;
+        }
+        if (requiredItem == heldBuildItem) {
+            return 0;
+        }
+        if (hotbarInventory.getOrDefault(requiredItem, 0) > 0) {
+            return 1;
+        }
+        return 2;
+    }
+
+    private boolean isBuildItemFastLaneEligible(Item requiredItem, Item heldBuildItem,
+                                                Map<Item, Integer> hotbarInventory) {
+        if (requiredItem == null || requiredItem == Items.AIR) {
+            return false;
+        }
+        return requiredItem == heldBuildItem
+                || hotbarInventory.getOrDefault(requiredItem, 0) > 0;
+    }
+
+    private boolean isCandidateStableForPlacement(BlockPos playerPos, BlockPos targetPos) {
+        int dy = targetPos.getY() - playerPos.getY();
+        if (dy <= 3) {
+            return true;
+        }
+        int dx = targetPos.getX() - playerPos.getX();
+        int dz = targetPos.getZ() - playerPos.getZ();
+        int horizontalSq = dx * dx + dz * dz;
+        // Building often needs to place one layer above head height
+        // from ground level. Keep the guard for extreme below-angle
+        // attempts, but allow close vertical wall placements.
+        return dy <= 4 && horizontalSq <= 4;
+    }
+
+    /*? if >=26.1 {*//*
+    private boolean hasBuildOpportunityFromHere(LocalPlayer player, Level world, boolean allowRelaxed) {
+    *//*?} else {*/
+    private boolean hasBuildOpportunityFromHere(ClientPlayerEntity player, World world, boolean allowRelaxed) {
+    /*?}*/
+        if (player == null || world == null || schematic == null || anchor == null) {
+            return false;
+        }
+
+        int maxReach = (int) Math.ceil(range);
+        double rangeSq = range * range;
+        /*? if >=26.1 {*//*
+        BlockPos playerPos = player.blockPosition();
+        Vec3 eyePos = player.getEyePosition();
+        *//*?} else {*/
+        BlockPos playerPos = player.getBlockPos();
+        Vec3d eyePos = player.getEyePos();
+        /*?}*/
+        int activeBandTopY = getBottomUpActiveBandTopY(world, getRenderWindow(playerPos));
+        boolean relaxedOpportunity = false;
+
+        for (int dy = -maxReach; dy <= maxReach; dy++) {
+            for (int dx = -maxReach; dx <= maxReach; dx++) {
+                for (int dz = -maxReach; dz <= maxReach; dz++) {
+                    /*? if >=26.1 {*//*
+                    BlockPos worldPos = playerPos.offset(dx, dy, dz);
+                    if (eyePos.distanceToSqr(Vec3.atCenterOf(worldPos)) > rangeSq) continue;
+                    *//*?} else {*/
+                    BlockPos worldPos = playerPos.add(dx, dy, dz);
+                    if (eyePos.squaredDistanceTo(Vec3d.ofCenter(worldPos)) > rangeSq) continue;
+                    /*?}*/
+                    if (playerOverlapsBlock(player, worldPos)) continue;
+
+                    int sx = worldPos.getX() - anchor.getX();
+                    int sy = worldPos.getY() - anchor.getY();
+                    int sz = worldPos.getZ() - anchor.getZ();
+                    if (!schematic.contains(sx, sy, sz)) continue;
+
+                    BlockState target = schematic.getBlockState(sx, sy, sz);
+                    if (target.isAir()) continue;
+                    if (!isPlaceable(target) && !isLiquidSource(target)) continue;
+                    if (isAutoCreatedPart(target)) continue;
+                    if (!matchesCurrentBuildPass(target)) continue;
+                    if (worldPos.getY() > activeBandTopY) continue;
+                    if (isEffectivelyPlaced(world.getBlockState(worldPos), target)) continue;
+
+                    if (isPlacementTargetCoolingDown(worldPos)) continue;
+                    if (!printInAir && !PlacementEngine.hasAdjacentSolid(world, worldPos)) continue;
+                    if (!BlockDependency.isReadyToPlace(world, worldPos, target)) continue;
+                    if (wouldTrapPlayer(player, worldPos, world)) continue;
+                    boolean stableForPlacement = isCandidateStableForPlacement(playerPos, worldPos);
+                    boolean canPlaceFromCurrentPosition =
+                            PlacementEngine.canPlaceFromCurrentPosition(worldPos, target, player, world);
+                    if (stableForPlacement && canPlaceFromCurrentPosition) {
+                        return true;
+                    }
+                    // "Relaxed" build opportunities are only useful for
+                    // builder handoff if there is at least some placement
+                    // path from the current stance. Purely occluded targets
+                    // just bounce BUILDING back into WALKING_TO_BUILD.
+                    if (canPlaceFromCurrentPosition) {
+                        relaxedOpportunity = true;
+                    }
+                }
+            }
+        }
+        return allowRelaxed && relaxedOpportunity;
+    }
+
+    /*? if >=26.1 {*//*
+    private boolean hasBuildHandoffOpportunityFromHere(LocalPlayer player, Level world) {
+    *//*?} else {*/
+    private boolean hasBuildHandoffOpportunityFromHere(ClientPlayerEntity player, World world) {
+    /*?}*/
+        return hasBuildOpportunityFromHere(player, world, true);
+    }
+
+    /*? if >=26.1 {*//*
+    private boolean hasStableBuildTargetFromHere(LocalPlayer player, Level world) {
+    *//*?} else {*/
+    private boolean hasStableBuildTargetFromHere(ClientPlayerEntity player, World world) {
+    /*?}*/
+        if (player == null || world == null || schematic == null || anchor == null) {
+            return false;
+        }
+
+        int maxReach = (int) Math.ceil(range);
+        double rangeSq = range * range;
+        /*? if >=26.1 {*//*
+        BlockPos playerPos = player.blockPosition();
+        Vec3 eyePos = player.getEyePosition();
+        *//*?} else {*/
+        BlockPos playerPos = player.getBlockPos();
+        Vec3d eyePos = player.getEyePos();
+        /*?}*/
+        int activeBandTopY = getBottomUpActiveBandTopY(world, getRenderWindow(playerPos));
+
+        for (int dy = -maxReach; dy <= maxReach; dy++) {
+            for (int dx = -maxReach; dx <= maxReach; dx++) {
+                for (int dz = -maxReach; dz <= maxReach; dz++) {
+                    /*? if >=26.1 {*//*
+                    BlockPos worldPos = playerPos.offset(dx, dy, dz);
+                    if (eyePos.distanceToSqr(Vec3.atCenterOf(worldPos)) > rangeSq) continue;
+                    *//*?} else {*/
+                    BlockPos worldPos = playerPos.add(dx, dy, dz);
+                    if (eyePos.squaredDistanceTo(Vec3d.ofCenter(worldPos)) > rangeSq) continue;
+                    /*?}*/
+                    if (playerOverlapsBlock(player, worldPos)) continue;
+
+                    int sx = worldPos.getX() - anchor.getX();
+                    int sy = worldPos.getY() - anchor.getY();
+                    int sz = worldPos.getZ() - anchor.getZ();
+                    if (!schematic.contains(sx, sy, sz)) continue;
+
+                    BlockState target = schematic.getBlockState(sx, sy, sz);
+                    if (target.isAir()) continue;
+                    if (!isPlaceable(target) && !isLiquidSource(target)) continue;
+                    if (isAutoCreatedPart(target)) continue;
+                    if (!matchesCurrentBuildPass(target)) continue;
+                    if (worldPos.getY() > activeBandTopY) continue;
+                    if (isEffectivelyPlaced(world.getBlockState(worldPos), target)) continue;
+                    if (isPlacementTargetCoolingDown(worldPos)) continue;
+                    if (!printInAir && !PlacementEngine.hasAdjacentSolid(world, worldPos)) continue;
+                    if (!BlockDependency.isReadyToPlace(world, worldPos, target)) continue;
+                    if (wouldTrapPlayer(player, worldPos, world)) continue;
+                    if (isCandidateStableForPlacement(playerPos, worldPos)) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    private BlockState getDesiredBuildStateAt(BlockPos worldPos) {
+        if (worldPos == null || schematic == null || anchor == null) {
+            return null;
+        }
+        int sx = worldPos.getX() - anchor.getX();
+        int sy = worldPos.getY() - anchor.getY();
+        int sz = worldPos.getZ() - anchor.getZ();
+        if (!schematic.contains(sx, sy, sz)) {
+            return null;
+        }
+        BlockState desired = schematic.getBlockState(sx, sy, sz);
+        if (desired == null || desired.isAir() || isAutoCreatedPart(desired)) {
+            return null;
+        }
+        return desired;
+    }
+
+    private BlockPos sanitizeBuildStandingPosition(BlockPos targetPos, BlockPos standPos,
+                                                   BlockPos playerPos) {
+        if (targetPos == null || standPos == null || playerPos == null) {
+            return standPos;
+        }
+        if (standPos.getY() < targetPos.getY() - 2
+                && targetPos.getY() >= playerPos.getY() - 3) {
+            return null;
+        }
+        if (targetPos.getY() >= playerPos.getY() - 1) {
+            if (standPos.getY() < playerPos.getY() - 1) {
+                return null;
+            }
+            if (standPos.getY() < targetPos.getY() - 2) {
+                return null;
+            }
+        }
+        // Don't walk underneath a target that is at or above the player.
+        // Those concave stances correlate with "visible hologram but no
+        // placement attempts" because the build scan ends up looking up
+        // through the structure instead of working from the exposed face.
+        if (targetPos.getY() >= playerPos.getY()) {
+            int maxVerticalGap = Math.max(2, (int) Math.ceil(range));
+            if (standPos.getY() < targetPos.getY() - maxVerticalGap) {
+                return null;
+            }
+            if (standPos.getY() < playerPos.getY() - 2) {
+                return null;
+            }
+        }
+        return standPos;
+    }
+
+    private String posLabel(BlockPos pos) {
+        if (pos == null) {
+            return "null";
+        }
+        return pos.getX() + "," + pos.getY() + "," + pos.getZ();
     }
 
     // UTILITY / STATUS
@@ -7402,31 +11492,15 @@ public class SchematicPrinter {
         World world = mc.world;
         /*?}*/
         int remaining = 0;
-
-        for (LitematicaSchematic.Region region : schematic.getRegions()) {
-            for (int y = 0; y < region.absY; y++) {
-                for (int z = 0; z < region.absZ; z++) {
-                    for (int x = 0; x < region.absX; x++) {
-                        BlockState target = region.getBlockState(x, y, z);
-                        if (target.isAir()) continue;
-                        if (!isPlaceable(target) && !isLiquidSource(target)) continue;
-                        if (isAutoCreatedPart(target)) continue;
-
-                        int wx = anchor.getX() + region.originX + x;
-                        int wy = anchor.getY() + region.originY + y;
-                        int wz = anchor.getZ() + region.originZ + z;
-
-                        /*? if >=26.1 {*//*
-                        if (!world.hasChunk(wx >> 4, wz >> 4)) continue;
-                        *//*?} else {*/
-                        if (!world.isChunkLoaded(wx >> 4, wz >> 4)) continue;
-                        /*?}*/
-                        if (!isEffectivelyPlaced(world.getBlockState(new BlockPos(wx, wy, wz)), target)) {
-                            remaining++;
-                        }
-                    }
-                }
-            }
+        for (long key : schematicBlocksByChunk.keySet()) {
+            int chunkX = chunkXFromKey(key);
+            int chunkZ = chunkZFromKey(key);
+            /*? if >=26.1 {*//*
+            if (!world.hasChunk(chunkX, chunkZ)) continue;
+            *//*?} else {*/
+            if (!world.isChunkLoaded(chunkX, chunkZ)) continue;
+            /*?}*/
+            remaining += getUnresolvedChunkEntries(world, tick, key).size();
         }
         remainingCacheTick = tick;
         cachedCountRemaining = remaining;
@@ -7473,6 +11547,7 @@ public class SchematicPrinter {
         Path normalizedPath = schematicPath.normalize();
         this.schematic = LitematicaSchematic.load(normalizedPath);
         this.anchor = data.anchorPos();
+        rebuildSchematicChunkIndex();
         this.blocksPlaced = data.blocksPlaced;
         this.schematicPath = normalizedPath;
         this.schematicFile = normalizedPath.getFileName().toString();

@@ -16,7 +16,7 @@ public final class HighwayRoute {
     // Immutable route legs.
     public sealed interface Leg permits ApproachLeg, BounceLeg, TurnLeg, OffRampLeg, MineLeg, FlightLeg {}
 
-    // Reach the chosen on-ramp.
+    // Walk to the next on-ramp.
     public record ApproachLeg(BlockPos onRamp) implements Leg {}
 
     // Bounce along the highway.
@@ -32,7 +32,7 @@ public final class HighwayRoute {
     // Walk or mine toward the takeoff point.
     public record MineLeg(BlockPos freeNetherTarget) implements Leg {}
 
-    // Fly to the final destination.
+    // Fly to the next waypoint.
     public record FlightLeg(BlockPos destination) implements Leg {}
 
     public final HighwayCandidate primary;

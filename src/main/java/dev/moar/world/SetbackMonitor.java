@@ -1,5 +1,6 @@
 package dev.moar.world;
 
+import dev.moar.util.PacketTelemetry;
 /*? if >=26.1 {*//*
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.player.LocalPlayer;
@@ -97,6 +98,7 @@ public final class SetbackMonitor {
             totalSetbacks++;
             setbackTicks[historyHead] = currentTick;
             historyHead = (historyHead + 1) % HISTORY_SIZE;
+            PacketTelemetry.markSetback(totalSetbacks, ticksSinceSetback);
         } else if (ticksSinceSetback < CALM_WINDOW_TICKS) {
             ticksSinceSetback++;
         }

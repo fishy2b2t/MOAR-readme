@@ -164,11 +164,16 @@ public final class PathWalker {
     /** True when Baritone's allowPlace/allowParkour were enabled for
      *  the current walk.  Restored to previous values on stop/arrival. */
     private static boolean placementEnabled;
+    /** True when vanilla fallback should use the calmer printer-style
+     *  movement policy instead of sprinting and proactive hop logic. */
+    private static boolean conservativeVanillaMovement;
 
     /** GoalNear radius for the current walk — used for the arrival
      *  check so we accept arrival within the same range that Baritone
      *  targets.  Zero means use the tight ARRIVAL_DIST_SQ. */
     private static int goalRadius = 0;
+    /** Optional tighter arrival distance override for exact approaches. */
+    private static double arrivalDistSqOverride = Double.NaN;
 
     /** When >= -64, we're navigating to a Y-level rather than
      *  an XZ position.  Arrival is based on Y only. */
@@ -221,6 +226,7 @@ public final class PathWalker {
      * Uses Baritone pathfinding if available, vanilla key simulation otherwise.
      */
     public static void walkTo(BlockPos pos) {
+        conservativeVanillaMovement = false;
         if (BARITONE_AVAILABLE) {
             /*? if >=26.1 {*//*
             target = pos.immutable();
@@ -232,6 +238,7 @@ public final class PathWalker {
             stuck = false;
             ticksWalking = 0;
             goalRadius = 0;
+            arrivalDistSqOverride = Double.NaN;
             yLevelTarget = Integer.MIN_VALUE;
             lastProgressPos = null;
             lastProgressTick = 0;
@@ -250,6 +257,15 @@ public final class PathWalker {
      * Falls back to walkTo(BlockPos) when Baritone is not available.
      */
     public static void walkToAdjacent(BlockPos pos) {
+        walkToAdjacentWithArrival(pos, Double.NaN);
+    }
+
+    public static void walkToAdjacentExact(BlockPos pos, double arrivalDist) {
+        walkToAdjacentWithArrival(pos, arrivalDist * arrivalDist);
+    }
+
+    private static void walkToAdjacentWithArrival(BlockPos pos, double arrivalDistSq) {
+        conservativeVanillaMovement = false;
         if (BARITONE_AVAILABLE) {
             /*? if >=26.1 {*//*
             target = pos.immutable();
@@ -260,10 +276,17 @@ public final class PathWalker {
             arrived = false;
             stuck = false;
             ticksWalking = 0;
+            goalRadius = 0;
+            arrivalDistSqOverride = arrivalDistSq;
+            yLevelTarget = Integer.MIN_VALUE;
+            lastProgressPos = null;
+            lastProgressTick = 0;
+            stuckCycles = 0;
+            recordInitialDistance(pos);
             LOGGER.debug("PathWalker: walking adjacent to ({}, {}, {})", pos.getX(), pos.getY(), pos.getZ());
             BaritoneDelegate.walkToAdjacent(pos);
         } else {
-            walkTo(pos);
+            startVanillaWalk(pos, 0, arrivalDistSq);
         }
     }
 
@@ -273,6 +296,7 @@ public final class PathWalker {
      * trying to path directly to or onto the target block.
      */
     public static void walkToNearby(BlockPos pos, int radius) {
+        conservativeVanillaMovement = false;
         if (BARITONE_AVAILABLE) {
             /*? if >=26.1 {*//*
             target = pos.immutable();
@@ -284,6 +308,7 @@ public final class PathWalker {
             stuck = false;
             ticksWalking = 0;
             goalRadius = radius;
+            arrivalDistSqOverride = Double.NaN;
             yLevelTarget = Integer.MIN_VALUE;
             recordInitialDistance(pos);
             LOGGER.debug("PathWalker: walking near ({}, {}, {}) r={}", pos.getX(), pos.getY(), pos.getZ(), radius);
@@ -301,13 +326,22 @@ public final class PathWalker {
      * blocks on flat terrain).
      */
     public static void walkToVanilla(BlockPos pos) {
+        walkToVanillaExact(pos, Double.NaN);
+    }
+
+    public static void walkToVanillaExact(BlockPos pos, double arrivalDistSq) {
+        conservativeVanillaMovement = false;
         if (BARITONE_AVAILABLE) {
             BaritoneDelegate.stop();
         }
-        startVanillaWalk(pos, 0);
+        startVanillaWalk(pos, 0, arrivalDistSq);
     }
 
     private static void startVanillaWalk(BlockPos pos, int radius) {
+        startVanillaWalk(pos, radius, Double.NaN);
+    }
+
+    private static void startVanillaWalk(BlockPos pos, int radius, double arrivalDistSq) {
         BlockPos vanillaTarget = normalizeVanillaTarget(pos);
         /*? if >=26.1 {*//*
         target = vanillaTarget.immutable();
@@ -319,6 +353,7 @@ public final class PathWalker {
         stuck = false;
         ticksWalking = 0;
         goalRadius = radius;
+        arrivalDistSqOverride = arrivalDistSq;
         yLevelTarget = Integer.MIN_VALUE;
         lastProgressPos = null;
         lastProgressTick = 0;
@@ -369,6 +404,7 @@ public final class PathWalker {
                                            *//*?} else {*/
                                            ClientPlayerEntity player) {
                                            /*?}*/
+        conservativeVanillaMovement = true;
         if (BARITONE_AVAILABLE) {
             BaritoneDelegate.enablePlacement();
             if (player != null) {
@@ -387,6 +423,7 @@ public final class PathWalker {
      * Navigate to a specific Y level using Baritone's GoalYLevel.
      */
     public static void walkToYLevel(int y) {
+        conservativeVanillaMovement = false;
         if (BARITONE_AVAILABLE) {
             target = new BlockPos(0, y, 0);
             active = true;
@@ -413,6 +450,7 @@ public final class PathWalker {
                                                   *//*?} else {*/
                                                   ClientPlayerEntity player) {
                                                   /*?}*/
+        conservativeVanillaMovement = true;
         if (BARITONE_AVAILABLE) {
             BaritoneDelegate.enablePlacement();
             if (player != null) {
@@ -455,6 +493,7 @@ public final class PathWalker {
         stuck = false;
         ticksWalking = 0;
         goalRadius = 0;
+        arrivalDistSqOverride = Double.NaN;
         yLevelTarget = Integer.MIN_VALUE;
         lastProgressPos = null;
         lastProgressTick = 0;
@@ -462,6 +501,7 @@ public final class PathWalker {
         initialDistance = 0;
         waypointQueue.clear();
         waypointRadiusQueue.clear();
+        conservativeVanillaMovement = true;
 
         LOGGER.debug("PathWalker: starting mining descent from Y={} to Y={}",
                 /*? if >=26.1 {*//*
@@ -478,6 +518,7 @@ public final class PathWalker {
     public static void walkToViaWaypoints(List<BlockPos> waypoints, int radius) {
         if (waypoints == null || waypoints.isEmpty()) return;
 
+        conservativeVanillaMovement = false;
         waypointQueue.clear();
         waypointRadiusQueue.clear();
         for (BlockPos wp : waypoints) {
@@ -623,6 +664,7 @@ public final class PathWalker {
         initialDistance = 0;
         noPathTicks = 0;
         vanillaFallback = false;
+        conservativeVanillaMovement = false;
         waypointQueue.clear();
         waypointRadiusQueue.clear();
         reservedItems = Collections.emptyMap();
@@ -702,6 +744,11 @@ public final class PathWalker {
      */
     public static void tick() {
         if (!active || target == null) return;
+
+        if (PlacementEngine.shouldFreezeMovementInputs()) {
+            releaseKeys();
+            return;
+        }
 
         ticksWalking++;
 
@@ -982,6 +1029,7 @@ public final class PathWalker {
                 if (distSq <= VANILLA_FALLBACK_DIST_SQ && vertDy <= 3.0) {
                     LOGGER.info("PathWalker[Baritone]: can't path to nearby target (dist²={}) — falling back to vanilla walking",
                             String.format("%.1f", distSq));
+                    boolean calmFallback = placementEnabled || conservativeVanillaMovement;
                     // Stop Baritone but keep our state active
                     if (placementEnabled) {
                         BaritoneDelegate.restorePlacement();
@@ -991,6 +1039,7 @@ public final class PathWalker {
                     noPathTicks = 0;
                     ticksWalking = 0; // reset so vanilla timeout starts fresh
                     vanillaFallback = true;
+                    conservativeVanillaMovement = calmFallback;
                     return;
                 }
             }
@@ -1046,9 +1095,11 @@ public final class PathWalker {
                 // When using GoalNear(radius), accept arrival within that
                 // radius (+1 block tolerance for sub-block positioning).
                 // Without a GoalNear radius, use the tight default.
-                double arrDistSq = goalRadius > 0
-                        ? (goalRadius + 1.0) * (goalRadius + 1.0)
-                        : ARRIVAL_DIST_SQ;
+                double arrDistSq = !Double.isNaN(arrivalDistSqOverride)
+                        ? arrivalDistSqOverride
+                        : goalRadius > 0
+                            ? (goalRadius + 1.0) * (goalRadius + 1.0)
+                            : ARRIVAL_DIST_SQ;
                 arrivedAtGoal = dxz2 <= arrDistSq && dy <= ARRIVAL_Y_TOLERANCE;
             }
             if (arrivedAtGoal) {
@@ -1100,6 +1151,7 @@ public final class PathWalker {
                 if (totalDistSq <= VANILLA_FALLBACK_DIST_SQ && dy <= 3.0) {
                     LOGGER.info("PathWalker[Baritone]: target nearby (dist²={}) — falling back to vanilla walking",
                             String.format("%.1f", totalDistSq));
+                    boolean calmFallback = placementEnabled || conservativeVanillaMovement;
                     if (placementEnabled) {
                         BaritoneDelegate.restorePlacement();
                         placementEnabled = false;
@@ -1107,6 +1159,7 @@ public final class PathWalker {
                     noPathTicks = 0;
                     ticksWalking = 0;
                     vanillaFallback = true;
+                    conservativeVanillaMovement = calmFallback;
                     return;
                 }
                 // Baritone gave up on a distant target without arriving — this
@@ -1367,6 +1420,24 @@ public final class PathWalker {
                 addIfPresent(list, "minecraft:damaged_anvil");
                 addIfPresent(list, "minecraft:crafter");
                 addIfPresent(list, "minecraft:decorated_pot");
+                // Keep the work area lit while path mining.
+                addIfPresent(list, "minecraft:torch");
+                addIfPresent(list, "minecraft:wall_torch");
+                addIfPresent(list, "minecraft:soul_torch");
+                addIfPresent(list, "minecraft:soul_wall_torch");
+                addIfPresent(list, "minecraft:redstone_torch");
+                addIfPresent(list, "minecraft:redstone_wall_torch");
+                addIfPresent(list, "minecraft:lantern");
+                addIfPresent(list, "minecraft:soul_lantern");
+                addIfPresent(list, "minecraft:glowstone");
+                addIfPresent(list, "minecraft:sea_lantern");
+                addIfPresent(list, "minecraft:shroomlight");
+                addIfPresent(list, "minecraft:jack_o_lantern");
+                addIfPresent(list, "minecraft:redstone_lamp");
+                addIfPresent(list, "minecraft:ochre_froglight");
+                addIfPresent(list, "minecraft:verdant_froglight");
+                addIfPresent(list, "minecraft:pearlescent_froglight");
+                addIfPresent(list, "minecraft:end_rod");
 
                 settingValueField.set(disallowSetting, list);
                 LOGGER.info("PathWalker: Baritone blocksToDisallowBreaking now contains {} entries "
@@ -1747,9 +1818,11 @@ public final class PathWalker {
         /*?}*/
         double dxz2 = horizontalDistSq(playerPos, targetCenter);
         double dy = Math.abs(playerPos.y - targetCenter.y);
-        double arrivalDistSq = goalRadius > 0
-            ? Math.max(ARRIVAL_DIST_SQ, goalRadius * goalRadius)
-            : ARRIVAL_DIST_SQ;
+        double arrivalDistSq = !Double.isNaN(arrivalDistSqOverride)
+            ? arrivalDistSqOverride
+            : goalRadius > 0
+                ? Math.max(ARRIVAL_DIST_SQ, goalRadius * goalRadius)
+                : ARRIVAL_DIST_SQ;
 
         // fall detection
         // If the player is now significantly below the target (fell off
@@ -1868,13 +1941,17 @@ public final class PathWalker {
         /*?}*/
 
         boolean facingTarget = Math.abs(yawDiff) < 30.0f;
+        double sprintThreshold = conservativeVanillaMovement ? 36.0 : 9.0;
+        boolean allowSprint = facingTarget && dxz2 > sprintThreshold;
         /*? if >=26.1 {*//*
-        options.keySprint.setDown(facingTarget && dxz2 > 9.0);
+        options.keySprint.setDown(allowSprint);
         *//*?} else {*/
-        options.sprintKey.setPressed(facingTarget && dxz2 > 9.0);
+        options.sprintKey.setPressed(allowSprint);
         /*?}*/
 
-        // proactive obstacle jumping
+        // Keep printer-controlled fallback calmer near the build, but
+        // still let it climb basic terrain so it can actually reach a
+        // placeable stance instead of freezing below the structure.
         /*? if >=26.1 {*//*
         if (player.onGround()) {
         *//*?} else {*/
@@ -1886,6 +1963,20 @@ public final class PathWalker {
                 *//*?} else {*/
                 player.jump();
                 /*?}*/
+            } else if (!conservativeVanillaMovement
+                    /*? if >=26.1 {*//*
+                    && shouldJumpAhead(player, mc.level, targetYaw)) {
+                    *//*?} else {*/
+                    && shouldJumpAhead(player, mc.world, targetYaw)) {
+                    /*?}*/
+                /*? if >=26.1 {*//*
+                player.jumpFromGround();
+                *//*?} else {*/
+                player.jump();
+                /*?}*/
+            } else if (conservativeVanillaMovement && facingTarget && dxz2 <= 9.0) {
+                // Near the build, stay grounded unless a real collision forces a hop.
+                return;
             /*? if >=26.1 {*//*
             } else if (shouldJumpAhead(player, mc.level, targetYaw)) {
             *//*?} else {*/

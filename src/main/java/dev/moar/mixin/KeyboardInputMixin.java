@@ -1,5 +1,6 @@
 package dev.moar.mixin;
 
+import dev.moar.util.PlacementEngine;
 import dev.moar.util.SneakOverride;
 /*? if >=26.1 {*//*
 import net.minecraft.client.player.ClientInput;
@@ -32,6 +33,13 @@ public abstract class KeyboardInputMixin extends Input {
     /*? if >=26.1 {*//*
     @Inject(method = "tick()V", at = @At("TAIL"))
     private void moar$overrideSneak(CallbackInfo ci) {
+        if (PlacementEngine.shouldFreezeMovementInputs()) {
+            Input old = this.keyPresses;
+            this.keyPresses = new Input(
+                    false, false, false, false,
+                    false, SneakOverride.shouldSneak(), false);
+            return;
+        }
         if (SneakOverride.shouldSneak()) {
             Input old = this.keyPresses;
             this.keyPresses = new Input(
@@ -42,6 +50,12 @@ public abstract class KeyboardInputMixin extends Input {
     *//*?} else {*/
     @Inject(method = "tick()V", at = @At("TAIL"))
     private void moar$overrideSneak(CallbackInfo ci) {
+        if (PlacementEngine.shouldFreezeMovementInputs()) {
+            this.playerInput = new PlayerInput(
+                    false, false, false, false,
+                    false, SneakOverride.shouldSneak(), false);
+            return;
+        }
         if (SneakOverride.shouldSneak()) {
             PlayerInput old = this.playerInput;
             this.playerInput = new PlayerInput(

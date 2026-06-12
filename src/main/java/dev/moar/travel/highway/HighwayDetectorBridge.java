@@ -70,7 +70,7 @@ public final class HighwayDetectorBridge {
 
     // Try to confirm a highway near the player's current Y.
     public Optional<ScanResult> scanAt(BlockPos playerPos, HighwayCandidate.Axis axis) {
-        for (int yOff = -1; yOff <= 1; yOff++) {
+        for (int yOff = -4; yOff <= 4; yOff++) {
             ScanResult r = scanAlongAxis(
                     playerPos.getX(), playerPos.getY() + yOff, playerPos.getZ(), axis);
             if (r != null) return Optional.of(r);

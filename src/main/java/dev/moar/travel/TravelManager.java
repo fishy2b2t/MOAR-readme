@@ -321,20 +321,6 @@ public final class TravelManager {
         BlockPos origin = currentPlayerPos();
         if (origin == null) { abort("no player on PLANNING"); return; }
 
-        if (canDirectFlightFromCurrentPosition(origin)) {
-            double dist = horizontalDistance(origin, state.mission.destination);
-            state.route = new HighwayRoute(
-                    null,
-                    List.of(new HighwayRoute.FlightLeg(state.mission.destination)),
-                    dist,
-                    0,
-                    0);
-            currentLegIndex = -1;
-            LOGGER.info("[Travel] planned direct open-nether flight route to {}", state.mission.destination.toShortString());
-            advanceLeg("planning complete");
-            return;
-        }
-
         HighwayPlanner.Options opts = new HighwayPlanner.Options()
                 .freeNetherFlightThreshold(state.mission.freeNetherFlightThreshold)
                 .allowFlight(state.mission.useElytra);
@@ -342,7 +328,24 @@ public final class TravelManager {
             opts.expectedFloorY(state.mission.expectedHighwayFloorY);
 
         Optional<HighwayRoute> planned = planner.plan(origin, state.mission.destination, opts);
-        if (planned.isEmpty()) { abort("planner returned no route"); return; }
+        if (planned.isEmpty()) {
+            if (canDirectFlightFromCurrentPosition(origin)) {
+                double dist = horizontalDistance(origin, state.mission.destination);
+                state.route = new HighwayRoute(
+                        null,
+                        List.of(new HighwayRoute.FlightLeg(state.mission.destination)),
+                        dist,
+                        0,
+                        0);
+                currentLegIndex = -1;
+                LOGGER.info("[Travel] planner returned no highway route; falling back to direct open-nether flight to {}",
+                        state.mission.destination.toShortString());
+                advanceLeg("planning complete");
+                return;
+            }
+            abort("planner returned no route");
+            return;
+        }
 
         state.route = planned.get();
         currentLegIndex = -1;
@@ -797,6 +800,10 @@ public final class TravelManager {
             startBaritoneWalk(approach.onRamp(), 2, TravelPhase.APPROACH_ONRAMP, reason);
         } else if (leg instanceof HighwayRoute.BounceLeg bounceLeg) {
             if (!isReadyToBounce(bounceLeg)) {
+                if (tryStartHighwayIngressAscent(bounceLeg, reason)) {
+                    currentLegIndex--;
+                    return;
+                }
                 startBaritoneWalk(bounceLeg.highway().entry, BOUNCE_ENTRY_ALIGN_RADIUS,
                         TravelPhase.APPROACH_ONRAMP, reason + " -> align for bounce");
                 currentLegIndex--;
@@ -865,6 +872,20 @@ public final class TravelManager {
         transition(TravelPhase.MINING_TO_FREENETHER, reason + " -> descend to Y " + targetY);
     }
 
+    private boolean tryStartHighwayIngressAscent(HighwayRoute.BounceLeg bounceLeg, String reason) {
+        BlockPos pos = currentPlayerPos();
+        if (pos == null) return false;
+        HighwayCandidate highway = bounceLeg.highway();
+        if (highway == null) return false;
+        if (highway.floorY <= Integer.MIN_VALUE || pos.getY() >= highway.floorY - 2) return false;
+
+        acquireOwner(MovementOwner.BARITONE);
+        bridge.walkToYLevelWithPlacement(highway.floorY);
+        transition(TravelPhase.APPROACH_ONRAMP,
+                reason + " -> climb to highway Y " + highway.floorY);
+        return true;
+    }
+
     private boolean tryManualMiningDescent(String reason) {
         if (activeMineTarget == null) return false;
         BlockPos pos = currentPlayerPos();
@@ -899,6 +920,7 @@ public final class TravelManager {
 
     private static final int WALL_BYPASS_DISTANCE      = 12; // blocks to walk past a wall
     private static final int KNOCKBACK_PERP_THRESHOLD  =  5; // off-axis blocks before recovery
+    private static final int KNOCKBACK_RECOVERY_LEAD   =  8; // stay moving toward the exit after re-entry
 
     private void triggerWallBypass() {
         BlockPos pos = currentPlayerPos();
@@ -942,13 +964,30 @@ public final class TravelManager {
         if (pos == null || bounceLeg == null) { abort("no player pos for knockback recovery"); return; }
         HighwayCandidate hw = bounceLeg.highway();
         rememberCurrentBounceExit();
+        IntegrityReport rep = verifier.lastReport();
+        if (rep.status() == IntegrityReport.Status.GRIEFED
+                && rep.confidence() >= DetourPlanner.MIN_CONFIDENCE) {
+            List<BlockPos> waypoints = DetourPlanner.plan(hw, rep, pos,
+                    bounceLeg.travelDx(), bounceLeg.travelDz());
+            if (!waypoints.isEmpty()) {
+                LOGGER.warn("[Travel] knocked off highway near grief — recovering via {} detour waypoints", waypoints.size());
+                releaseOwner(state.owner);
+                acquireOwner(MovementOwner.BARITONE);
+                bridge.walkToWaypoints(waypoints, 3);
+                transition(TravelPhase.DETOURING,
+                        "knockback recovery detour: griefRange=["
+                                + rep.griefStartOffset() + "," + rep.griefEndOffset() + "]");
+                return;
+            }
+        }
         // Project player onto travel axis from the highway entry point.
         int ex = hw.entry.getX(), ez = hw.entry.getZ();
         int dx = bounceLeg.travelDx(), dz = bounceLeg.travelDz();
         int dSq = dx * dx + dz * dz;
         int t   = ((pos.getX() - ex) * dx + (pos.getZ() - ez) * dz) / dSq;
-        BlockPos onHighway = new BlockPos(ex + dx * t, hw.floorY + 1, ez + dz * t);
-        LOGGER.warn("[Travel] knocked off highway — walking back to axis at {}", onHighway.toShortString());
+        int recoveryT = Math.max(0, t) + KNOCKBACK_RECOVERY_LEAD;
+        BlockPos onHighway = new BlockPos(ex + dx * recoveryT, hw.floorY + 1, ez + dz * recoveryT);
+        LOGGER.warn("[Travel] knocked off highway — recovering forward to {}", onHighway.toShortString());
         releaseOwner(state.owner);
         acquireOwner(MovementOwner.BARITONE);
         bridge.walkNear(onHighway, 2);
