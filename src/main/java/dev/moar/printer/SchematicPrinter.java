@@ -396,6 +396,11 @@ public class SchematicPrinter {
     private int trappedEscapeAttempts;
     private BlockPos trappedEscapeLastPos;
     private static final int TRAPPED_ESCAPE_GIVEUP_ATTEMPTS = 15;
+    // Set when the trapped-escape giveup above fires. tickIdle() keeps the
+    // build paused until the player is actually confirmed no longer trapped —
+    // the plain idleScanCooldown timer alone would silently resume walking
+    // back into the same hazard once it lapsed, even if nothing changed.
+    private boolean pausedWhileTrapped;
     private int walkingSetbackPauseTicks;
     private int observedWalkingSetbacks;
     private int observedPlacementSetbacks;
@@ -1489,6 +1494,9 @@ public class SchematicPrinter {
     // more confirmations rather than looping immediately.
     public int retryAbandonedBuildTargets() {
         int count = abandonedBuildTargets.size();
+        for (BlockPos pos : abandonedBuildTargets) {
+            cooledDownPlacementTargets.remove(pos);
+        }
         abandonedBuildTargets.clear();
         entombedFailureStreak.clear();
         entombedStreakLastTick.clear();
@@ -1552,12 +1560,15 @@ public class SchematicPrinter {
         noProgressTicks = 0;
         walkAttemptCooldown = 0;
         stuckCycles = 0;
+        consecutiveStuckPauses = 0;
+        blocksPlacedAtLastStuckPause = -1;
         walkingSetbackPauseTicks = 0;
         buildHandoffSettleTicks = 0;
         buildGateStallTicks = 0;
         remainingCacheTick = Long.MIN_VALUE;
         trappedEscapeAttempts = 0;
         trappedEscapeLastPos = null;
+        pausedWhileTrapped = false;
     }
 
     private void refreshPlacementPlannerState() {
@@ -3190,7 +3201,8 @@ public class SchematicPrinter {
                 if (statusMessages) {
                     ChatHelper.info("§c⚠ Still blocked in after §f" + trappedEscapeAttempts
                             + "§c escape attempts — pausing build."
-                            + " §7Break a nearby block to free yourself, then run §f/printer auto§7 to resume.");
+                            + " §7Break a nearby block to free yourself — the build will resume"
+                            + " automatically once you're clear.");
                 }
                 // Fix #54 follow-up: a live log showed the planner walking the
                 // player right back into the SAME chokepoint ~4 minutes after
@@ -3206,6 +3218,7 @@ public class SchematicPrinter {
                 PathWalker.stop();
                 autoState = AutoState.IDLE;
                 idleScanCooldown = MAX_STUCK_PAUSE_BACKOFF_TICKS;
+                pausedWhileTrapped = true;
                 return;
             }
             if (statusMessages && trappedEscapeAttempts == 1) {
@@ -7906,6 +7919,17 @@ public class SchematicPrinter {
     *//*?} else {*/
     private void tickIdle(MinecraftClient mc) {
     /*?}*/
+        if (pausedWhileTrapped) {
+            /*? if >=26.1 {*//*
+            if (mc.player == null || isPlayerTrapped(mc.player, mc.level)) return;
+            *//*?} else {*/
+            if (mc.player == null || isPlayerTrapped(mc.player, mc.world)) return;
+            /*?}*/
+            pausedWhileTrapped = false;
+            if (statusMessages) {
+                ChatHelper.info("§aNo longer blocked in — resuming build.");
+            }
+        }
         SetbackMonitor setbackMonitor = SetbackMonitor.get();
         int totalSetbacks = setbackMonitor.totalSetbacks();
         if (totalSetbacks != observedPlacementSetbacks) {
@@ -10740,6 +10764,10 @@ public class SchematicPrinter {
                 long key = next.asLong();
                 if (reachableDepthByPos.containsKey(key)) continue;
                 if (!isReachabilityPassable(next, world)) continue;
+                // Stepping up requires a surface to land on — otherwise this
+                // cheap BFS would treat an open vertical air shaft as freely
+                // "climbable", wrongly marking sealed pockets as reachable.
+                if (step[1] > 0 && !hasSolidFloorBelow(next, world)) continue;
                 reachableDepthByPos.put(key, depth + 1);
                 queue.add(next);
             }
@@ -10763,6 +10791,15 @@ public class SchematicPrinter {
         if (isMovementBlocking(world.getBlockState(feetPos))) return false;
         BlockPos headPos = new BlockPos(feetPos.getX(), feetPos.getY() + 1, feetPos.getZ());
         return !isMovementBlocking(world.getBlockState(headPos));
+    }
+
+    /*? if >=26.1 {*//*
+    private boolean hasSolidFloorBelow(BlockPos feetPos, Level world) {
+    *//*?} else {*/
+    private boolean hasSolidFloorBelow(BlockPos feetPos, World world) {
+    /*?}*/
+        BlockPos below = new BlockPos(feetPos.getX(), feetPos.getY() - 1, feetPos.getZ());
+        return isMovementBlocking(world.getBlockState(below));
     }
 
     // Real BFS depth (in single-block steps) from origin to pos, or null if
@@ -13763,7 +13800,17 @@ public class SchematicPrinter {
             *//*?} else {*/
             if (!world.isChunkLoaded(chunkX, chunkZ)) continue;
             /*?}*/
-            remaining += getUnresolvedChunkEntries(world, tick, key).size();
+            List<SchematicBlockRef> unresolved = getUnresolvedChunkEntries(world, tick, key);
+            int chunkRemaining = unresolved.size();
+            // Permanently sealed positions (see /printer holes) are still
+            // physically unbuilt, but we've given up trying to build them —
+            // don't let them block completion detection forever.
+            if (!abandonedBuildTargets.isEmpty()) {
+                for (SchematicBlockRef ref : unresolved) {
+                    if (abandonedBuildTargets.contains(ref.pos())) chunkRemaining--;
+                }
+            }
+            remaining += chunkRemaining;
         }
         remainingCacheTick = tick;
         cachedCountRemaining = remaining;

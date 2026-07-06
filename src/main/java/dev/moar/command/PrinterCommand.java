@@ -294,9 +294,15 @@ public final class PrinterCommand {
                         MinecraftClient holesMc = MinecraftClient.getInstance();
                         /*?}*/
                         if (holesMc.player != null) {
+                            /*? if >=26.1 {*//*
+                            BlockPos playerPos = holesMc.player.blockPosition();
+                            holes.sort((a, b) -> Double.compare(
+                                    a.distSqr(playerPos), b.distSqr(playerPos)));
+                            *//*?} else {*/
                             BlockPos playerPos = holesMc.player.getBlockPos();
                             holes.sort((a, b) -> Double.compare(
                                     a.getSquaredDistance(playerPos), b.getSquaredDistance(playerPos)));
+                            /*?}*/
                         }
                         // Fix #62: once dozens of positions are abandoned they're
                         // almost always one contiguous sealed pocket, not 35
