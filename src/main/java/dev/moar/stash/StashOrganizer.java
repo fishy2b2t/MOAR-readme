@@ -195,24 +195,22 @@ public final class StashOrganizer {
     private final Deque<MoveTask> taskQueue = new ArrayDeque<>();
     private MoveTask currentTask;
 
-    /**
-     * Connected containers forming a vertical column. Sorted top-down
-     * so depositing fills from top (bottom stays accessible to user).
-     */
+    // Connected containers forming a vertical column. Sorted top-down
+    // so depositing fills from top (bottom stays accessible to user).
     record Column(int id, List<BlockPos> chests) {
         BlockPos bottom() { return chests.get(chests.size() - 1); }
         BlockPos top()    { return chests.get(0); }
     }
 
-    /** Column assignment: item type → column (list of chests top-to-bottom). */
+    // Column assignment: item type → column (list of chests top-to-bottom).
     private Map<String, Column> columnAssignment = new LinkedHashMap<>();
 
-    /** Index for depositing: which column-chest index we're currently filling. */
+    // Index for depositing: which column-chest index we're currently filling.
     private int depositColumnIndex;
 
     // Configuration
 
-    /** Destination chest(s) for empty shulker boxes after organization. */
+    // Destination chest(s) for empty shulker boxes after organization.
     private BlockPos emptyShulkerDest;
 
     // Timing constants
@@ -222,9 +220,9 @@ public final class StashOrganizer {
     private static final int PLACE_DELAY_TICKS = 4;
     private static final int PICKUP_DELAY_TICKS = 20;
     private static final int BREAK_TIMEOUT_TICKS = 100;
-    /** Minimum loose item count to justify packing into a shulker box. */
+    // Minimum loose item count to justify packing into a shulker box.
     private static final int CONDENSE_MIN_ITEMS = 1;
-    /** Number of hotbar slots to exclude from scanning/depositing. */
+    // Number of hotbar slots to exclude from scanning/depositing.
     private static final int HOTBAR_SIZE = 9;
 
     // Runtime state
@@ -239,50 +237,50 @@ public final class StashOrganizer {
 
     // Shulker packing state
 
-    /** Items in player inventory that need to be packed into a shulker. */
+    // Items in player inventory that need to be packed into a shulker.
     private String packItemId;
-    /** Where to deposit the filled shulker after packing. */
+    // Where to deposit the filled shulker after packing.
     private BlockPos packDestination;
-    /** Block position where the shulker is placed in the world. */
+    // Block position where the shulker is placed in the world.
     private BlockPos shulkerPlacePos;
-    /** Saved player look direction before shulker interactions. */
+    // Saved player look direction before shulker interactions.
     private float savedYaw, savedPitch;
-    /** Tick counter for shulker phases. */
+    // Tick counter for shulker phases.
     private int shulkerTicks;
-    /** Retry counter for shulker placement attempts. */
+    // Retry counter for shulker placement attempts.
     private int shulkerPlaceRetries;
 
     // Crafting state
 
-    /** Position of the crafting table to use. */
+    // Position of the crafting table to use.
     private BlockPos craftingTablePos;
-    /** How many shulker boxes we want to craft. */
+    // How many shulker boxes we want to craft.
     private int shulkersToCraft;
-    /** Tick counter for crafting phases. */
+    // Tick counter for crafting phases.
     private int craftTicks;
-    /** Serialized crafting-grid clicks for the active recipe. */
+    // Serialized crafting-grid clicks for the active recipe.
     private final Deque<CraftClick> craftClickPlan = new ArrayDeque<>();
-    /** Queue of containers to visit for crafting material collection. */
+    // Queue of containers to visit for crafting material collection.
     private final Deque<BlockPos> materialSources = new ArrayDeque<>();
-    /** Shells still needed from region containers. */
+    // Shells still needed from region containers.
     private int shellsNeeded;
-    /** Chests still needed from region containers. */
+    // Chests still needed from region containers.
     private int chestsNeeded;
 
     private record CraftClick(int slot, int button) {}
 
     // Consolidation state
 
-    /** Queue of take-only tasks for packing misc items into mixed shulkers. */
+    // Queue of take-only tasks for packing misc items into mixed shulkers.
     private final Deque<MoveTask> consolidationQueue = new ArrayDeque<>();
-    /** True when processing consolidation tasks (mixed-item shulker packing). */
+    // True when processing consolidation tasks (mixed-item shulker packing).
     private boolean consolidationMode = false;
 
     // Overflow state
 
-    /** Position of the overflow chest. */
+    // Position of the overflow chest.
     private BlockPos overflowChestPos;
-    /** Items that couldn't be organized (itemId → quantity). */
+    // Items that couldn't be organized (itemId → quantity).
     private final Map<String, Integer> overflowItems = new LinkedHashMap<>();
 
     // Public API
@@ -662,9 +660,7 @@ public final class StashOrganizer {
         advanceToNextTask();
     }
 
-    /**
-     * Detect columns via connected-component flood-fill. Sorted top-down.
-     */
+    // Detect columns via connected-component flood-fill. Sorted top-down.
     private static List<Column> detectColumns(Set<BlockPos> positions) {
         Set<BlockPos> remaining = new HashSet<>(positions);
         List<Column> columns = new ArrayList<>();
@@ -756,7 +752,7 @@ public final class StashOrganizer {
         PathWalker.tick();
     }
 
-    /** Called when the walk target is reached — transitions to the appropriate next state. */
+    // Called when the walk target is reached — transitions to the appropriate next state.
     private void onArrived() {
         openWaitTicks = 0;
         switch (state) {
@@ -1064,10 +1060,8 @@ public final class StashOrganizer {
         advanceToNextTask();
     }
 
-    /**
-     * When a destination chest is full, try the next chest down in the same
-     * column. Returns true if a cascade target was found (will walk there).
-     */
+    // When a destination chest is full, try the next chest down in the same
+    // column. Returns true if a cascade target was found (will walk there).
     private boolean cascadeToNextInColumn() {
         Column col = columnAssignment.get(currentTask.itemId());
         if (col == null) return false;
@@ -1158,11 +1152,11 @@ public final class StashOrganizer {
         }
         if (slot < 9) {
             // Already in hotbar — just select it
-            /*? if >=1.21.5 {*//*
+            /*? if >=1.21.5 {*/
             player.getInventory().setSelectedSlot(slot);
-            *//*?} else {*/
-            player.getInventory().selectedSlot = slot;
-            /*?}*/
+            /*?} else {*/
+            /*player.getInventory().selectedSlot = slot;
+            *//*?}*/
         } else {
             // Swap from main inventory to current hotbar slot
             /*? if >=1.21.5 {*//*
@@ -1633,7 +1627,7 @@ public final class StashOrganizer {
         }
     }
 
-    /** True if the player has a non-empty shulker box in inventory. */
+    // True if the player has a non-empty shulker box in inventory.
     /*? if >=26.1 {*//*
     private boolean hasFilledShulkerInInventory(LocalPlayer player) {
     *//*?} else {*/
@@ -2296,7 +2290,7 @@ public final class StashOrganizer {
         }
     }
 
-    /** Advance to the next material source or proceed to crafting if possible. */
+    // Advance to the next material source or proceed to crafting if possible.
     private void advanceCraftMaterial() {
         if (!materialSources.isEmpty()) {
             walkTarget = materialSources.poll();
@@ -2820,7 +2814,7 @@ public final class StashOrganizer {
 
     // Consolidation helpers
 
-    /** Advance the consolidation phase: prepare shulker → collect → pack → store. */
+    // Advance the consolidation phase: prepare shulker → collect → pack → store.
     private void advanceConsolidation() {
         /*? if >=26.1 {*//*
         Minecraft mc = Minecraft.getInstance();
@@ -2886,7 +2880,7 @@ public final class StashOrganizer {
         state = State.WALKING;
     }
 
-    /** Begin packing all misc items in inventory into a mixed shulker box. */
+    // Begin packing all misc items in inventory into a mixed shulker box.
     private void startConsolidationPacking() {
         // Use the destination from the first consolidation task's column
         packDestination = (currentTask != null && currentTask.destination() != null)
@@ -2903,7 +2897,7 @@ public final class StashOrganizer {
         startShulkerPacking(itemToPack, packDestination);
     }
 
-    /** True if the player has consolidation-relevant items in inventory. */
+    // True if the player has consolidation-relevant items in inventory.
     /*? if >=26.1 {*//*
     private boolean hasOrganizableItemsInInventory(LocalPlayer player) {
     *//*?} else {*/
@@ -3097,7 +3091,7 @@ public final class StashOrganizer {
         return false;
     }
 
-    /** Find an empty shulker box in the player's inventory. Returns slot index or -1. */
+    // Find an empty shulker box in the player's inventory. Returns slot index or -1.
     /*? if >=26.1 {*//*
     private int findEmptyShulkerInInventory(LocalPlayer player) {
     *//*?} else {*/
@@ -3130,7 +3124,7 @@ public final class StashOrganizer {
         return -1;
     }
 
-    /** Find a container in the region that has empty shulker boxes. */
+    // Find a container in the region that has empty shulker boxes.
     private BlockPos findEmptyShulkerInRegion() {
         Map<BlockPos, ContainerEntry> region = getRegionContainers();
         for (var entry : region.entrySet()) {
@@ -3171,7 +3165,7 @@ public final class StashOrganizer {
         return total;
     }
 
-    /** Find a specific item in the player's inventory, optionally skipping a slot. */
+    // Find a specific item in the player's inventory, optionally skipping a slot.
     /*? if >=26.1 {*//*
     private int findItemSlotInInventory(LocalPlayer player, Item item, int skipSlot) {
     *//*?} else {*/
@@ -3230,7 +3224,7 @@ public final class StashOrganizer {
         /*?}*/
     }
 
-    /** Map a player inventory slot (0-35) to a crafting handler slot. */
+    // Map a player inventory slot (0-35) to a crafting handler slot.
     private int playerSlotToHandlerSlot(int invSlot, int handlerInvStart) {
         // handler: invStart..(invStart+26) = main inv (slots 9-35),
         //          (invStart+27)..(invStart+35) = hotbar (slots 0-8)
@@ -3317,7 +3311,7 @@ public final class StashOrganizer {
         return best;
     }
 
-    /** Find a crafting table within 32 blocks of the player or in the stash region. */
+    // Find a crafting table within 32 blocks of the player or in the stash region.
     /*? if >=26.1 {*//*
     private BlockPos findCraftingTable(LocalPlayer player, Level world) {
     *//*?} else {*/
@@ -3361,7 +3355,7 @@ public final class StashOrganizer {
         return best;
     }
 
-    /** Find a chest in the region (or emptyShulkerDest) that has room for overflow. */
+    // Find a chest in the region (or emptyShulkerDest) that has room for overflow.
     private BlockPos findOverflowChest() {
         if (emptyShulkerDest != null) return emptyShulkerDest;
 

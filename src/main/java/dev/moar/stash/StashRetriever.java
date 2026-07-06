@@ -104,10 +104,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
-/**
- * Lightweight state machine that walks to containers and retrieves items
- * into the player's inventory.  Driven by /stash get.
- */
+// Lightweight state machine that walks to containers and retrieves items
+// into the player's inventory.  Driven by /stash get.
 public final class StashRetriever {
 
     private static final Logger LOGGER = LoggerFactory.getLogger("MOAR/Retriever");
@@ -130,7 +128,7 @@ public final class StashRetriever {
     private int targetCount;
     private int takenCount;
 
-    /** Kit-mode: item_id -> quantity still needed. null for single-item mode. */
+    // Kit-mode: item_id -> quantity still needed. null for single-item mode.
     private Map<String, Integer> kitRemaining;
 
     // Walking / opening
@@ -172,24 +170,22 @@ public final class StashRetriever {
     private int shulkerOpenRetries;
     private Runnable shulkerSneakRestore;
 
-    /** Positions that have failed this run; skipped when re-encountered. */
+    // Positions that have failed this run; skipped when re-encountered.
     private final Set<BlockPos> failedContainers = new LinkedHashSet<>();
-    /** Player inventory slots currently holding shulkers fetched by this run. */
+    // Player inventory slots currently holding shulkers fetched by this run.
     private final Set<Integer> ownedShulkerSlots = new LinkedHashSet<>();
-    /** Fingerprint of a shulker we just quick-moved out of a container. */
+    // Fingerprint of a shulker we just quick-moved out of a container.
     private String pendingOwnedShulkerFingerprint;
-    /** Empty player slots that could receive the pending quick-moved shulker. */
+    // Empty player slots that could receive the pending quick-moved shulker.
     private final Set<Integer> pendingOwnedShulkerCandidateSlots = new LinkedHashSet<>();
-    /** Consecutive container failures (open timeout, unreachable, shulker fail). */
+    // Consecutive container failures (open timeout, unreachable, shulker fail).
     private int consecutiveFailures;
-    /** True once we've seen a live world+player; used to detect disconnect. */
+    // True once we've seen a live world+player; used to detect disconnect.
     private boolean wasInWorld;
 
-    /**
-     * Containers managed by ChestManager (supply/dump/storage) must NEVER be
-     * touched by /stash get — those are reserved for the printer/sorter and
-     * the user has explicitly told us to leave them alone.
-     */
+    // Containers managed by ChestManager (supply/dump/storage) must NEVER be
+    // touched by /stash get — those are reserved for the printer/sorter and
+    // the user has explicitly told us to leave them alone.
     private static Set<BlockPos> getBlacklistedContainerPositions() {
         Set<BlockPos> out = new java.util.HashSet<>();
         ChestManager cm = MoarMod.getChestManager();
@@ -216,10 +212,8 @@ public final class StashRetriever {
     public State getState() { return state; }
     public boolean isActive() { return state != State.IDLE; }
 
-    /**
-     * Start retrieval: find containers holding the item, queue them
-     * closest-first, and begin walking.
-     */
+    // Start retrieval: find containers holding the item, queue them
+    // closest-first, and begin walking.
     public boolean start(String itemIdFragment, int count) {
         StashDatabase db = MoarMod.getDatabase();
         if (db == null) {
@@ -317,7 +311,7 @@ public final class StashRetriever {
         return true;
     }
 
-    /** Start kit-mode retrieval: find kit items in stash DB, walk to containers, collect. */
+    // Start kit-mode retrieval: find kit items in stash DB, walk to containers, collect.
     public boolean startKit(String kitName, Map<String, Integer> kitItems) {
         StashDatabase db = MoarMod.getDatabase();
         if (db == null) {
@@ -824,7 +818,7 @@ public final class StashRetriever {
         finish();
     }
 
-    /** Mark a container as failed for this run and bump the global failure counter. */
+    // Mark a container as failed for this run and bump the global failure counter.
     private void recordContainerFailure(BlockPos pos) {
         if (pos != null) failedContainers.add(pos);
         consecutiveFailures++;
@@ -859,7 +853,7 @@ public final class StashRetriever {
         }
     }
 
-    /** True if itemId is still needed in current retrieval. */
+    // True if itemId is still needed in current retrieval.
     private boolean isWanted(String itemId) {
         if (kitRemaining != null) {
             return kitRemaining.containsKey(itemId) && kitRemaining.get(itemId) > 0;
@@ -867,7 +861,7 @@ public final class StashRetriever {
         return itemId.equals(targetItemId) && takenCount < targetCount;
     }
 
-    /** Record that we took some items. */
+    // Record that we took some items.
     private void recordTaken(String itemId, int count) {
         consecutiveFailures = 0;
         if (kitRemaining != null) {
@@ -882,7 +876,7 @@ public final class StashRetriever {
         }
     }
 
-    /** True when all target items have been collected. */
+    // True when all target items have been collected.
     private boolean isDone() {
         if (kitRemaining != null) {
             return kitRemaining.isEmpty();
@@ -890,7 +884,7 @@ public final class StashRetriever {
         return takenCount >= targetCount;
     }
 
-    /** Placement-safe means long enough calm plus no recent correction burst. */
+    // Placement-safe means long enough calm plus no recent correction burst.
     private boolean isPlacementWindowSafe() {
         SetbackMonitor monitor = SetbackMonitor.get();
         if (monitor.recentSetbackCount(SHULKER_PLACE_RECENT_WINDOW) > 0) return false;
@@ -914,11 +908,9 @@ public final class StashRetriever {
 
     // Shulker unloading state machine
 
-    /**
-     * Drives one tick of an in-progress partial-take split. Returns true if a
-     * click was issued (caller should set its cooldown and stop). Returns
-     * false when the split is complete (state cleared, recordTaken called).
-     */
+    // Drives one tick of an in-progress partial-take split. Returns true if a
+    // click was issued (caller should set its cooldown and stop). Returns
+    // false when the split is complete (state cleared, recordTaken called).
     /*? if >=26.1 {*//*
     private boolean tickSplitTake(Minecraft mc, AbstractContainerMenu handler) {
     *//*?} else {*/
@@ -990,7 +982,7 @@ public final class StashRetriever {
         return true;
     }
 
-    /** Begin a partial-take split for a slot whose stack exceeds what we need. */
+    // Begin a partial-take split for a slot whose stack exceeds what we need.
     private void beginSplitTake(int srcSlot, String itemId, int stackCount, int needed) {
         splitInProgress = true;
         splitSrcSlot = srcSlot;
@@ -1009,7 +1001,7 @@ public final class StashRetriever {
         splitItemId = null;
     }
 
-    /** How many more of itemId the current run wants. */
+    // How many more of itemId the current run wants.
     private int neededOf(String itemId) {
         if (kitRemaining != null) {
             Integer v = kitRemaining.get(itemId);
@@ -1159,11 +1151,11 @@ public final class StashRetriever {
                     swapOwnedShulkerSlots(shulkerSlot, inv.selectedSlot);
                     /*?}*/
                 } else {
-                    /*? if >=1.21.5 {*//*
+                    /*? if >=1.21.5 {*/
                     inv.setSelectedSlot(shulkerSlot);
-                    *//*?} else {*/
-                    inv.selectedSlot = shulkerSlot;
-                    /*?}*/
+                    /*?} else {*/
+                    /*inv.selectedSlot = shulkerSlot;
+                    *//*?}*/
                 }
                 shulkerPhase = 2;
                 shulkerTicks = 0;
@@ -1525,7 +1517,7 @@ public final class StashRetriever {
         }
     }
 
-    /** Find an inventory slot containing a shulker with items we still need. */
+    // Find an inventory slot containing a shulker with items we still need.
     /*? if >=26.1 {*//*
     private int findShulkerWithNeededItems(LocalPlayer player) {
     *//*?} else {*/
@@ -1648,7 +1640,7 @@ public final class StashRetriever {
         return sb.toString();
     }
 
-    /** Find a nearby air block with solid support and space above for shulker placement. */
+    // Find a nearby air block with solid support and space above for shulker placement.
     /*? if >=26.1 {*//*
     private BlockPos findShulkerPlaceSpot(LocalPlayer player, Level world) {
     *//*?} else {*/

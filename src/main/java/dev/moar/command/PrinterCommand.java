@@ -265,6 +265,94 @@ public final class PrinterCommand {
                     })
             );
 
+            // /printer holes — list positions fix53 has permanently given up on
+            // (sealed by already-built structure) and /printer holes retry to
+            // give them a fresh attempt after manually reopening access.
+            /*? if >=26.1 {*//*
+            root.then(ClientCommands.literal("holes")
+            *//*?} else {*/
+            root.then(ClientCommandManager.literal("holes")
+            /*?}*/
+                    .executes(ctx -> {
+                        SchematicPrinter printer = getPrinter();
+                        if (!printer.isLoaded()) {
+                            ChatHelper.info("§cNo schematic loaded.");
+                            return 0;
+                        }
+                        List<BlockPos> holes = printer.getAbandonedBuildTargets();
+                        if (holes.isEmpty()) {
+                            ChatHelper.info("§aNo abandoned build targets — nothing given up on.");
+                            return 1;
+                        }
+                        // Fix #63: when the user is manually filling gaps by hand,
+                        // working through them in on-foot travel order beats the
+                        // default Y/X/Z sort — re-sort nearest-to-player first so
+                        // each subsequent hole is a short hop from the last.
+                        /*? if >=26.1 {*//*
+                        Minecraft holesMc = Minecraft.getInstance();
+                        *//*?} else {*/
+                        MinecraftClient holesMc = MinecraftClient.getInstance();
+                        /*?}*/
+                        if (holesMc.player != null) {
+                            BlockPos playerPos = holesMc.player.getBlockPos();
+                            holes.sort((a, b) -> Double.compare(
+                                    a.getSquaredDistance(playerPos), b.getSquaredDistance(playerPos)));
+                        }
+                        // Fix #62: once dozens of positions are abandoned they're
+                        // almost always one contiguous sealed pocket, not 35
+                        // scattered holes — a bounding box tells the user where
+                        // to breach a wall/ceiling in one spot instead of forcing
+                        // them to visit every individual coordinate in the list.
+                        int minX = Integer.MAX_VALUE, minY = Integer.MAX_VALUE, minZ = Integer.MAX_VALUE;
+                        int maxX = Integer.MIN_VALUE, maxY = Integer.MIN_VALUE, maxZ = Integer.MIN_VALUE;
+                        for (BlockPos pos : holes) {
+                            minX = Math.min(minX, pos.getX());
+                            minY = Math.min(minY, pos.getY());
+                            minZ = Math.min(minZ, pos.getZ());
+                            maxX = Math.max(maxX, pos.getX());
+                            maxY = Math.max(maxY, pos.getY());
+                            maxZ = Math.max(maxZ, pos.getZ());
+                        }
+                        ChatHelper.info("§lAbandoned build targets (" + holes.size() + "):");
+                        ChatHelper.info(" §7Bounding box: §eX " + minX + ".." + maxX
+                                + " §7Y " + minY + ".." + maxY + " §7Z " + minZ + ".." + maxZ
+                                + " §7(center ~§e" + ((minX + maxX) / 2) + " " + ((minY + maxY) / 2)
+                                + " " + ((minZ + maxZ) / 2) + "§7)");
+                        int shown = 0;
+                        for (BlockPos pos : holes) {
+                            if (shown >= 25) {
+                                ChatHelper.info(" §7... and " + (holes.size() - shown) + " more.");
+                                break;
+                            }
+                            ChatHelper.info(" §7- §e" + pos.getX() + " " + pos.getY() + " " + pos.getZ());
+                            shown++;
+                        }
+                        ChatHelper.info("§7Break into that area from outside to reopen access, then run §f/printer holes retry");
+                        return 1;
+                    })
+                    /*? if >=26.1 {*//*
+                    .then(ClientCommands.literal("retry")
+                    *//*?} else {*/
+                    .then(ClientCommandManager.literal("retry")
+                    /*?}*/
+                            .executes(ctx -> {
+                                SchematicPrinter printer = getPrinter();
+                                if (!printer.isLoaded()) {
+                                    ChatHelper.info("§cNo schematic loaded.");
+                                    return 0;
+                                }
+                                int count = printer.retryAbandonedBuildTargets();
+                                if (count == 0) {
+                                    ChatHelper.info("§7No abandoned build targets to retry.");
+                                } else {
+                                    ChatHelper.info("§aCleared §f" + count
+                                            + "§a abandoned build target(s) — they'll be re-attempted on the next scan.");
+                                }
+                                return 1;
+                            })
+                    )
+            );
+
             // /printer list
             /*? if >=26.1 {*//*
             root.then(ClientCommands.literal("list")

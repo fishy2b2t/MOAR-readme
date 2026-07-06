@@ -26,6 +26,11 @@ import net.minecraft.world.item.ItemStack;
 import net.minecraft.item.ItemStack;
 /*?}*/
 /*? if >=26.1 {*//*
+import net.minecraft.world.item.Item;
+*//*?} else {*/
+import net.minecraft.item.Item;
+/*?}*/
+/*? if >=26.1 {*//*
 import net.minecraft.core.registries.BuiltInRegistries;
 *//*?} else {*/
 import net.minecraft.registry.Registries;
@@ -38,7 +43,9 @@ import net.minecraft.registry.entry.RegistryEntry;
 
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 // Enriched item IDs — pickaxes get enchant suffixes, others use registry ID.
 public final class ItemIdentifier {
@@ -54,13 +61,31 @@ public final class ItemIdentifier {
             "minecraft:netherite_pickaxe"
     );
 
+    // Items are registry singletons, so base registry-ID strings never change.
+    // Caching them eliminates Identifier.toString() allocation on every call.
+    private static final Map<Item, String> BASE_ID_CACHE = new ConcurrentHashMap<>();
+
+    private static String baseId(Item item) {
+        return BASE_ID_CACHE.computeIfAbsent(item, i ->
+                /*? if >=26.1 {*//*
+                BuiltInRegistries.ITEM.getKey(i).toString()
+                *//*?} else {*/
+                Registries.ITEM.getId(i).toString()
+                /*?}*/
+        );
+    }
+
+    // Allocation-free equivalence check — same result as
+    // getItemId(a).equals(getItemId(b)) without building strings.
+    public static boolean matches(ItemStack a, ItemStack b) {
+        if (a.getItem() != b.getItem()) return false;
+        if (!PICKAXE_IDS.contains(baseId(a.getItem()))) return true;
+        return Objects.equals(getPickaxeEnchantSuffix(a), getPickaxeEnchantSuffix(b));
+    }
+
     // Item ID with pickaxe enchant suffix (e.g. [silk_touch]).
     public static String getItemId(ItemStack stack) {
-        /*? if >=26.1 {*//*
-        String baseId = BuiltInRegistries.ITEM.getKey(stack.getItem()).toString();
-        *//*?} else {*/
-        String baseId = Registries.ITEM.getId(stack.getItem()).toString();
-        /*?}*/
+        String baseId = baseId(stack.getItem());
 
         if (PICKAXE_IDS.contains(baseId)) {
             String suffix = getPickaxeEnchantSuffix(stack);

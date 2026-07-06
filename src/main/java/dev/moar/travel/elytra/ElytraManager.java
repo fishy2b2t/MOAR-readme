@@ -849,13 +849,13 @@ public final class ElytraManager {
                     /*?}*/
                 } else {
                     if (!tryElytraInventory(SWAP_SETTLE)) return;
-                    /*? if >=1.21.5 {*//*
+                    /*? if >=1.21.5 {*/
                     inv.setSelectedSlot(ecInvSlot);
-                    *//*?} else if >=26.1 {*//*
+                    /*?} else if >=26.1 {*//*
                     inv.setSelectedSlot(ecInvSlot);
                     *//*?} else {*/
-                    inv.selectedSlot = ecInvSlot;
-                    /*?}*/
+                    /*inv.selectedSlot = ecInvSlot;
+                    *//*?}*/
                 }
                 shulkerPhase = 2;
                 shulkerTicks = 0;
@@ -1221,13 +1221,13 @@ public final class ElytraManager {
                     /*?}*/
                 } else {
                     if (!tryElytraInventory(SWAP_SETTLE)) return;
-                    /*? if >=1.21.5 {*//*
+                    /*? if >=1.21.5 {*/
                     inv.setSelectedSlot(shulkerSlot);
-                    *//*?} else if >=26.1 {*//*
+                    /*?} else if >=26.1 {*//*
                     inv.setSelectedSlot(shulkerSlot);
                     *//*?} else {*/
-                    inv.selectedSlot = shulkerSlot;
-                    /*?}*/
+                    /*inv.selectedSlot = shulkerSlot;
+                    *//*?}*/
                 }
                 shulkerPhase = 2;
                 shulkerTicks = 0;
@@ -1990,13 +1990,13 @@ public final class ElytraManager {
                     /*?}*/
                 } else {
                     if (!tryElytraInventory(SWAP_SETTLE)) return;
-                    /*? if >=1.21.5 {*//*
+                    /*? if >=1.21.5 {*/
                     inv.setSelectedSlot(stSlot);
-                    *//*?} else if >=26.1 {*//*
+                    /*?} else if >=26.1 {*//*
                     inv.setSelectedSlot(stSlot);
                     *//*?} else {*/
-                    inv.selectedSlot = stSlot;
-                    /*?}*/
+                    /*inv.selectedSlot = stSlot;
+                    *//*?}*/
                 }
 
                 /*? if >=26.1 {*//*
@@ -2697,11 +2697,11 @@ public final class ElytraManager {
                 MoarNetworkManager.OWNER_ELYTRA, 1, 2)) {
             return;
         }
-        /*? if >=1.21.5 {*//*
+        /*? if >=1.21.5 {*/
         mc.player.getInventory().setSelectedSlot(savedHotbarSlot);
-        *//*?} else {*/
-        mc.player.getInventory().selectedSlot = savedHotbarSlot;
-        /*?}*/
+        /*?} else {*/
+        /*mc.player.getInventory().selectedSlot = savedHotbarSlot;
+        *//*?}*/
         mc.player.networkHandler.sendPacket(new UpdateSelectedSlotC2SPacket(savedHotbarSlot));
         savedHotbarSlot = -1;
     }

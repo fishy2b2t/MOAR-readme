@@ -87,12 +87,12 @@ public final class ChestManager {
 
     // --- SUPPLY CHEST INDEX — positions (persisted) + snapshots (ephemeral)
 
-    /** Registered supply-chest positions. Persisted to database. */
+    // Registered supply-chest positions. Persisted to database.
     private final Set<BlockPos> supplyPositions = new LinkedHashSet<>();
 
     // Supply chest registration
 
-    /** Register a supply chest position. Returns false if already registered. */
+    // Register a supply chest position. Returns false if already registered.
     public boolean addSupplyChest(BlockPos pos) {
         /*? if >=26.1 {*//*
         BlockPos immutable = pos.immutable();
@@ -104,7 +104,7 @@ public final class ChestManager {
         return true;
     }
 
-    /** Unregister a supply chest position. */
+    // Unregister a supply chest position.
     public boolean removeSupplyChest(BlockPos pos) {
         /*? if >=26.1 {*//*
         BlockPos immutable = pos.immutable();
@@ -119,19 +119,19 @@ public final class ChestManager {
         return removed;
     }
 
-    /** Remove all supply chest registrations and their snapshots. */
+    // Remove all supply chest registrations and their snapshots.
     public void clearSupplyChests() {
         supplyPositions.clear();
         snapshots.clear();
         saveSupplyChests();
     }
 
-    /** Unmodifiable snapshot of all registered supply-chest positions. */
+    // Unmodifiable snapshot of all registered supply-chest positions.
     public List<BlockPos> getSupplyPositions() {
         return List.copyOf(supplyPositions);
     }
 
-    /** Number of registered supply chests. */
+    // Number of registered supply chests.
     public int supplyChestCount() {
         return supplyPositions.size();
     }
@@ -153,13 +153,13 @@ public final class ChestManager {
             return items.getOrDefault(itemId, 0);
         }
 
-        /** Seconds since this snapshot was taken. */
+        // Seconds since this snapshot was taken.
         public long ageSeconds() {
             return (System.currentTimeMillis() - timestamp) / 1000;
         }
     }
 
-    /** BlockPos to last-known inventory snapshot.  Capped at 256 entries. */
+    // BlockPos to last-known inventory snapshot.  Capped at 256 entries.
     private static final int MAX_SNAPSHOTS = 256;
     private final Map<BlockPos, ChestSnapshot> snapshots =
             new LinkedHashMap<>(32, 0.75f, false) {
@@ -169,7 +169,7 @@ public final class ChestManager {
                 }
             };
 
-    /** Store a snapshot for a chest position. */
+    // Store a snapshot for a chest position.
     public void putSnapshot(BlockPos pos, ChestSnapshot snapshot) {
         /*? if >=26.1 {*//*
         snapshots.put(pos.immutable(), snapshot);
@@ -178,7 +178,7 @@ public final class ChestManager {
         /*?}*/
     }
 
-    /** Get the cached snapshot for a chest, or null if not scanned. */
+    // Get the cached snapshot for a chest, or null if not scanned.
     public ChestSnapshot getSnapshot(BlockPos pos) {
         /*? if >=26.1 {*//*
         return snapshots.get(pos.immutable());
@@ -187,7 +187,7 @@ public final class ChestManager {
         /*?}*/
     }
 
-    /** Invalidate the cached snapshot for a chest (e.g. after modifying contents). */
+    // Invalidate the cached snapshot for a chest (e.g. after modifying contents).
     public void invalidateSnapshot(BlockPos pos) {
         /*? if >=26.1 {*//*
         snapshots.remove(pos.immutable());
@@ -196,7 +196,7 @@ public final class ChestManager {
         /*?}*/
     }
 
-    /** Clear all snapshots (positions are retained). */
+    // Clear all snapshots (positions are retained).
     public void clearSnapshots() {
         snapshots.clear();
     }
@@ -277,7 +277,7 @@ public final class ChestManager {
         return contents;
     }
 
-    /** Check if an ItemStack is a shulker box. */
+    // Check if an ItemStack is a shulker box.
     public static boolean isShulkerBox(ItemStack stack) {
         return stack.getItem() instanceof BlockItem bi
                 && bi.getBlock() instanceof ShulkerBoxBlock;
@@ -285,13 +285,11 @@ public final class ChestManager {
 
     // Best-chest ranking
 
-    /**
-     * Find the best supply chest for a set of needed item IDs.
-     *
-     * Ranking: indexed chests with matching items (by match count
-     * then distance) then unindexed chests (by distance) then indexed
-     * chests with no matches (by distance, snapshot may be stale).
-     */
+    // Find the best supply chest for a set of needed item IDs.
+    //
+    // Ranking: indexed chests with matching items (by match count
+    // then distance) then unindexed chests (by distance) then indexed
+    // chests with no matches (by distance, snapshot may be stale).
     public BlockPos findBestChest(BlockPos from, Set<String> neededItemIds) {
         return findBestChest(from, neededItemIds, Collections.emptySet());
     }
@@ -352,7 +350,7 @@ public final class ChestManager {
         return bestFallback;
     }
 
-    /** Find the nearest registered supply chest. */
+    // Find the nearest registered supply chest.
     public BlockPos nearestSupplyChest(BlockPos from) {
         BlockPos nearest = null;
         double nearestDist = Double.MAX_VALUE;
@@ -381,9 +379,7 @@ public final class ChestManager {
         return combined;
     }
 
-    /**
-     * Summary of the chest index state.
-     */
+    // Summary of the chest index state.
     public record ChestIndexSummary(
             int indexedChests,
             int unindexedChests,
@@ -396,7 +392,7 @@ public final class ChestManager {
         }
     }
 
-    /** Build a summary of the chest index. */
+    // Build a summary of the chest index.
     public ChestIndexSummary getIndexSummary() {
         int indexed = 0;
         int unindexed = 0;
@@ -422,19 +418,19 @@ public final class ChestManager {
 
     // --- STORAGE CHEST SORTING — deposit planning + state machine
 
-    /** Sorting state machine states. */
+    // Sorting state machine states.
     public enum SortState {
-        /** Not sorting. */
+        // Not sorting.
         IDLE,
-        /** Walking to the sorting chest area. */
+        // Walking to the sorting chest area.
         WALKING_TO_CHESTS,
-        /** Opening a chest to deposit items. */
+        // Opening a chest to deposit items.
         OPENING_CHEST,
-        /** Depositing items into the open chest. */
+        // Depositing items into the open chest.
         DEPOSITING,
-        /** Walking to the next chest for different items. */
+        // Walking to the next chest for different items.
         WALKING_TO_NEXT,
-        /** Done — all items deposited or no more chests. */
+        // Done — all items deposited or no more chests.
         DONE
     }
 
@@ -442,64 +438,60 @@ public final class ChestManager {
 
     // Storage chest configuration
 
-    /** Storage chest positions (order matters — first chest gets first item type). */
+    // Storage chest positions (order matters — first chest gets first item type).
     private final List<BlockPos> storageChests = new ArrayList<>();
 
-    /**
-     * Chest type assignments: maps chest position to the primary item type.
-     * The "type" is the item's registry ID (e.g., "minecraft:cobblestone").
-     */
+    // Chest type assignments: maps chest position to the primary item type.
+    // The "type" is the item's registry ID (e.g., "minecraft:cobblestone").
     private final Map<BlockPos, String> chestTypes = new LinkedHashMap<>();
 
-    /**
-     * Overflow chest — receives items that don't match any typed chest.
-     * If null, items without a matching chest are skipped.
-     */
+    // Overflow chest — receives items that don't match any typed chest.
+    // If null, items without a matching chest are skipped.
     private BlockPos overflowChest;
 
-    /** Items to keep in inventory (tools, food, light sources). */
+    // Items to keep in inventory (tools, food, light sources).
     private final Set<Item> keepItems = new HashSet<>();
 
     // Sorting runtime state
 
-    /** Items to deposit, grouped by target chest. */
+    // Items to deposit, grouped by target chest.
     private final Map<BlockPos, List<Integer>> depositPlan = new LinkedHashMap<>();
 
-    /** Current target chest for sorting. */
+    // Current target chest for sorting.
     private BlockPos sortTarget;
 
-    /** Slots to deposit at the current chest. */
+    // Slots to deposit at the current chest.
     private List<Integer> currentSlots;
 
-    /** Deposit progress index. */
+    // Deposit progress index.
     private int depositIndex;
 
-    /** Tick counter for sorting. */
+    // Tick counter for sorting.
     private int sortTickCounter;
 
-    /** Cooldown between slot clicks (avoid server-side rate limits). */
+    // Cooldown between slot clicks (avoid server-side rate limits).
     private static final int CLICK_COOLDOWN_TICKS = 3;
 
-    /** Ticks to wait for chest screen to open. */
+    // Ticks to wait for chest screen to open.
     private static final int OPEN_TIMEOUT_TICKS = 40;
 
-    /** Counter for open timeout. */
+    // Counter for open timeout.
     private int openWaitTicks;
 
-    /** Position to return to after sorting. */
+    // Position to return to after sorting.
     private BlockPos sortReturnPos;
 
     // Storage chest API
 
-    /** Get the current sort state. */
+    // Get the current sort state.
     public SortState getSortState() { return sortState; }
 
-    /** Whether the sorter is actively running. */
+    // Whether the sorter is actively running.
     public boolean isSorting() {
         return sortState != SortState.IDLE && sortState != SortState.DONE;
     }
 
-    /** Add a storage chest. */
+    // Add a storage chest.
     public void addStorageChest(BlockPos pos) {
         if (!storageChests.contains(pos)) {
             storageChests.add(pos);
@@ -507,19 +499,19 @@ public final class ChestManager {
         }
     }
 
-    /** Remove a storage chest. */
+    // Remove a storage chest.
     public void removeStorageChest(BlockPos pos) {
         storageChests.remove(pos);
         chestTypes.remove(pos);
         saveSortingConfig();
     }
 
-    /** Get storage chest positions. */
+    // Get storage chest positions.
     public List<BlockPos> getStorageChests() {
         return Collections.unmodifiableList(storageChests);
     }
 
-    /** Set the overflow chest. */
+    // Set the overflow chest.
     public void setOverflowChest(BlockPos pos) {
         this.overflowChest = pos;
         if (!storageChests.contains(pos)) {
@@ -528,38 +520,38 @@ public final class ChestManager {
         saveSortingConfig();
     }
 
-    /** Get the overflow chest, if set. */
+    // Get the overflow chest, if set.
     public BlockPos getOverflowChest() { return overflowChest; }
 
-    /** Get chest type assignments. */
+    // Get chest type assignments.
     public Map<BlockPos, String> getChestTypes() {
         return Collections.unmodifiableMap(chestTypes);
     }
 
-    /** Manually assign a chest type. */
+    // Manually assign a chest type.
     public void setChestType(BlockPos pos, String itemId) {
         chestTypes.put(pos, itemId);
         saveSortingConfig();
     }
 
-    /** Add an item to the keep list (won't be deposited). */
+    // Add an item to the keep list (won't be deposited).
     public void addKeepItem(Item item) {
         keepItems.add(item);
         saveKeepItems();
     }
 
-    /** Remove an item from the keep list. */
+    // Remove an item from the keep list.
     public void removeKeepItem(Item item) {
         keepItems.remove(item);
         saveKeepItems();
     }
 
-    /** Get keep item set. */
+    // Get keep item set.
     public Set<Item> getKeepItems() {
         return Collections.unmodifiableSet(keepItems);
     }
 
-    /** Clear all chest type assignments. */
+    // Clear all chest type assignments.
     public void clearTypes() {
         chestTypes.clear();
         saveSortingConfig();
@@ -567,13 +559,13 @@ public final class ChestManager {
 
     // Sorting persistence
 
-    /** Save storage chest layout (positions, types, overflow) to the database. */
+    // Save storage chest layout (positions, types, overflow) to the database.
     public void saveSortingConfig() {
         StashDatabase db = MoarMod.getDatabase();
         if (db.isOpen()) db.saveStorageChests(storageChests, chestTypes, overflowChest);
     }
 
-    /** Load storage chest layout from the database. */
+    // Load storage chest layout from the database.
     public void loadSortingConfig() {
         StashDatabase db = MoarMod.getDatabase();
         if (!db.isOpen()) return;
@@ -585,7 +577,7 @@ public final class ChestManager {
         overflowChest = cfg.overflowChest();
     }
 
-    /** Save keep-items set to the database. */
+    // Save keep-items set to the database.
     private void saveKeepItems() {
         StashDatabase db = MoarMod.getDatabase();
         if (!db.isOpen()) return;
@@ -600,7 +592,7 @@ public final class ChestManager {
         db.saveKeepItems(ids);
     }
 
-    /** Load keep-items set from the database. */
+    // Load keep-items set from the database.
     public void loadKeepItems() {
         StashDatabase db = MoarMod.getDatabase();
         if (!db.isOpen()) return;
@@ -623,10 +615,8 @@ public final class ChestManager {
 
     // Sorting lifecycle
 
-    /**
-     * Check if the player's inventory is full enough to warrant sorting.
-     * Returns true if fewer than 4 empty slots remain.
-     */
+    // Check if the player's inventory is full enough to warrant sorting.
+    // Returns true if fewer than 4 empty slots remain.
     /*? if >=26.1 {*//*
     public boolean isInventoryFull(Minecraft mc) {
     *//*?} else {*/
@@ -646,10 +636,8 @@ public final class ChestManager {
         return empty < 4;
     }
 
-    /**
-     * Start the sorting process.
-     * Analyzes inventory and builds a deposit plan.
-     */
+    // Start the sorting process.
+    // Analyzes inventory and builds a deposit plan.
     /*? if >=26.1 {*//*
     public boolean startSort(Minecraft mc) {
     *//*?} else {*/
@@ -691,7 +679,7 @@ public final class ChestManager {
         return true;
     }
 
-    /** Stop sorting. */
+    // Stop sorting.
     public void stopSort() {
         PathWalker.stop();
         sortState = SortState.IDLE;
@@ -700,14 +688,12 @@ public final class ChestManager {
         currentSlots = null;
     }
 
-    /** Get the return position after sorting. */
+    // Get the return position after sorting.
     public BlockPos getSortReturnPos() { return sortReturnPos; }
 
     // Sorting tick
 
-    /**
-     * Drive the sorting state machine. Call every client tick.
-     */
+    // Drive the sorting state machine. Call every client tick.
     public void tick() {
         if (sortState == SortState.IDLE || sortState == SortState.DONE) return;
 
@@ -1136,7 +1122,7 @@ public final class ChestManager {
         }
     }
 
-    /** Get a status string for the sorter. */
+    // Get a status string for the sorter.
     public String getSortStatus() {
         return switch (sortState) {
             case IDLE -> "Idle";
@@ -1150,7 +1136,7 @@ public final class ChestManager {
 
     // --- PERSISTENCE — supply chest positions
 
-    /** Load supply-chest positions from the database. */
+    // Load supply-chest positions from the database.
     public void loadSupplyChests() {
         StashDatabase db = MoarMod.getDatabase();
         if (!db.isOpen()) return;
@@ -1161,7 +1147,7 @@ public final class ChestManager {
         }
     }
 
-    /** Save supply-chest positions to the database. */
+    // Save supply-chest positions to the database.
     public void saveSupplyChests() {
         StashDatabase db = MoarMod.getDatabase();
         if (db.isOpen()) db.saveSupplyChests(supplyPositions);
@@ -1169,10 +1155,10 @@ public final class ChestManager {
 
     // --- DUMP CHEST INDEX — positions for depositing mined items
 
-    /** Registered dump-chest positions (for depositing items during clearing). */
+    // Registered dump-chest positions (for depositing items during clearing).
     private final Set<BlockPos> dumpPositions = new LinkedHashSet<>();
 
-    /** Register a dump chest position. Returns false if already registered. */
+    // Register a dump chest position. Returns false if already registered.
     public boolean addDumpChest(BlockPos pos) {
         /*? if >=26.1 {*//*
         BlockPos immutable = pos.immutable();
@@ -1184,7 +1170,7 @@ public final class ChestManager {
         return true;
     }
 
-    /** Unregister a dump chest position. */
+    // Unregister a dump chest position.
     public boolean removeDumpChest(BlockPos pos) {
         /*? if >=26.1 {*//*
         BlockPos immutable = pos.immutable();
@@ -1196,23 +1182,23 @@ public final class ChestManager {
         return removed;
     }
 
-    /** Remove all dump chest registrations. */
+    // Remove all dump chest registrations.
     public void clearDumpChests() {
         dumpPositions.clear();
         saveDumpChests();
     }
 
-    /** Unmodifiable snapshot of all registered dump-chest positions. */
+    // Unmodifiable snapshot of all registered dump-chest positions.
     public List<BlockPos> getDumpPositions() {
         return List.copyOf(dumpPositions);
     }
 
-    /** Number of registered dump chests. */
+    // Number of registered dump chests.
     public int dumpChestCount() {
         return dumpPositions.size();
     }
 
-    /** Find the nearest dump chest to the given position, or null. */
+    // Find the nearest dump chest to the given position, or null.
     public BlockPos findNearestDumpChest(BlockPos from) {
         if (dumpPositions.isEmpty()) return null;
         BlockPos best = null;
@@ -1231,7 +1217,7 @@ public final class ChestManager {
         return best;
     }
 
-    /** Load dump-chest positions from the database. */
+    // Load dump-chest positions from the database.
     public void loadDumpChests() {
         StashDatabase db = MoarMod.getDatabase();
         if (!db.isOpen()) return;
@@ -1242,7 +1228,7 @@ public final class ChestManager {
         }
     }
 
-    /** Save dump-chest positions to the database. */
+    // Save dump-chest positions to the database.
     public void saveDumpChests() {
         StashDatabase db = MoarMod.getDatabase();
         if (db.isOpen()) db.saveDumpChests(dumpPositions);
@@ -1250,10 +1236,8 @@ public final class ChestManager {
 
     // --- GLOBAL OPERATIONS
 
-    /**
-     * Clear all build-session chest data (snapshots only).
-     * Supply/dump chest positions are retained (persistent config).
-     */
+    // Clear all build-session chest data (snapshots only).
+    // Supply/dump chest positions are retained (persistent config).
     public void clearSessionData() {
         snapshots.clear();
     }

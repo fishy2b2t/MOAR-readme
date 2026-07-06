@@ -234,6 +234,10 @@ public class SchematicPrinter {
     private static final int BUILD_PLAN_SECTION_HEIGHT = 16;
     private static final int EXTERIOR_BUILD_SHELL_DEPTH = 4;
     private static final int EXTERIOR_FAILED_ZONE_BUDGET = 24;
+    // How far beyond the schematic's footprint edge to place the
+    // scaffold-climb column when escalating to a placement-enabled
+    // ascent (see findExteriorApproachColumn / walkToZoneWithPlacement).
+    private static final int SCAFFOLD_EXTERIOR_MARGIN = 3;
 
     private boolean tryPrinterLane(PrinterNetworkCoordinator.Lane lane, int cost, int cooldownTicks) {
         return PrinterNetworkCoordinator.tryAcquire(lane, NETWORK_OWNER, cost, cooldownTicks);
@@ -314,7 +318,9 @@ public class SchematicPrinter {
     private static final int CONTAINER_ACTION_TIMEOUT_TICKS = 8;
     // Consecutive restock failures without grabbing any items.
     private int restockFailures;
-    // Pause proactive restock after a shulker unload.
+    // Ticks after a shulker unload during which proactive restock is
+    // suppressed — forces the bot to attempt building / zone-hopping
+    // before churning another unload cycle.
     private int restockCooldown;
     private static final int SHULKER_RESTOCK_COOLDOWN = 200;
     // Consecutive shulker unloads with no build progress in between.
@@ -366,15 +372,41 @@ public class SchematicPrinter {
     private int walkAttemptCooldown;
     private int stuckCycles;
     private static final int MAX_STUCK_CYCLES = 10;
+    // Fix47: track whether the last MAX_STUCK_CYCLES pause actually made any
+    // progress. If the same pause fires again with zero blocks placed in
+    // between, the "idle bounce" recovery has just walked straight back into
+    // the exact same access/target/layer cooldowns that caused the stall in
+    // the first place — clearing failedZones alone doesn't touch those maps,
+    // so it re-freezes instantly and burns another 10 stuck cycles doing
+    // nothing. See perf-audit-2026-07-05.md "total=0 stagnation" entry.
+    private int consecutiveStuckPauses;
+    private int blocksPlacedAtLastStuckPause = -1;
+    // 200 ticks (10s) per repeat, capped at 1200 ticks (60s) — long enough to
+    // let cleared cooldowns matter without leaving the player idle forever.
+    private static final int STUCK_PAUSE_BACKOFF_TICKS = 200;
+    private static final int MAX_STUCK_PAUSE_BACKOFF_TICKS = 1200;
+    // Fix #54: isPlayerTrapped()'s escape handling had no attempt limit or
+    // message throttling — when findEscapePosition() returns a candidate that
+    // satisfies the local block checks but Baritone can't actually path to
+    // (e.g. only reachable by breaking a wall it won't mine), the walk ends
+    // instantly every tick and the trapped branch re-fires immediately,
+    // spamming "Blocked in! Finding escape route..." forever with the player
+    // frozen in place. Track consecutive attempts at the same position and
+    // give up (pause the build) instead of looping indefinitely.
+    private int trappedEscapeAttempts;
+    private BlockPos trappedEscapeLastPos;
+    private static final int TRAPPED_ESCAPE_GIVEUP_ATTEMPTS = 15;
     private int walkingSetbackPauseTicks;
     private int observedWalkingSetbacks;
     private int observedPlacementSetbacks;
     private static final int WALK_SETBACK_PAUSE_TICKS = 16;
-    // Back off when setbacks arrive in bursts.
+    // Setback-storm circuit breaker: when the server rubber-bands us repeatedly
+    // in a short window, retrying placements only escalates anti-cheat. Pause
+    // building entirely for a longer cooldown to let position settle.
     private int setbackStormPauseTicks;
     private static final int SETBACK_STORM_WINDOW_TICKS = 60;
-    private static final int SETBACK_STORM_THRESHOLD = 4;
-    private static final int SETBACK_STORM_PAUSE_TICKS = 200; // Let position settle.
+    private static final int SETBACK_STORM_THRESHOLD = 3;
+    private static final int SETBACK_STORM_PAUSE_TICKS = 200; // ~10s settle
     private int inventorySwapWaitTicks;
     private boolean forceLiveInventorySwapOnce;
     private static final int INVENTORY_SWAP_WAIT_ESCALATION_TICKS = 40;
@@ -434,6 +466,18 @@ public class SchematicPrinter {
     // change their accessibility, which won't happen if the printer keeps
     // picking them. 2400t (~2 min) effectively retires them for the session.
     private static final int ENTOMBED_ZONE_COOLDOWN_TICKS = 2400;
+    // Fix #53: the stuck-cycle amnesty (MAX_STUCK_CYCLES handler) force-clears
+    // every cooldown map to give genuinely-transient failures a fresh, unbiased
+    // retry. But a position that is truly entombed (walled in by already-built,
+    // correct blocks with no opening) will simply fail the exact same way the
+    // moment its cooldown is cleared — the amnesty was resurrecting these
+    // hopeless positions every ~60-90s forever, re-triggering the same
+    // "stuck for 10 cycles" pause in an endless loop with zero net progress.
+    // Once a position survives this many *separate* entombed/sealed cooldown
+    // expiries (i.e. it was re-confirmed entombed across multiple amnesty
+    // resets, not just retried within the same one), give up on it for the
+    // rest of the session so the build can move on to reachable work instead.
+    private static final int ENTOMBED_ABANDON_STREAK_THRESHOLD = 3;
     // Three pure-occlusion / access failures on the same Y means that layer is
     // geometrically broken from the current approach; stop hammering it.
     // The 24-tick target cooldown lets the printer cycle through 10+ adjacent
@@ -449,6 +493,76 @@ public class SchematicPrinter {
     // distinguish "considered=0 entombed" from "considered=N but all rejected"
     // and pick the appropriate cooldown. -1 = no recent reject.
     private int lastBuildAccessRejectConsidered = -1;
+    // Set alongside lastBuildAccessRejectConsidered: how many of those
+    // considered candidates failed specifically because their access path was
+    // blocked by an already-correct (placed) schematic block, as opposed to
+    // range/no-path/clear-target rejections. When this equals considered, the
+    // zone is walled in by its own completed shell and will never clear on
+    // its own — only a future adjacent placement can open it up. -1 = no
+    // recent reject.
+    private int lastBuildAccessRejectBlockedByBuilt = -1;
+    // Perf: findAccessPathProbe runs once per candidate stance, so a single
+    // findBuildAccessTarget evaluation can hit dozens of built blockers. Cap
+    // the per-evaluation detail marks and surface the total in the reject
+    // summary instead of logging every blocker (was ~40 lines/tick).
+    private static final int MAX_BLOCKED_BY_BUILT_MARKS_PER_EVAL = 3;
+    private int blockedByBuiltProbeCount = 0;
+    // Set alongside lastBuildAccessRejectBlockedByBuilt: how many of the
+    // considered candidates were confirmed unreachable from the player's
+    // current position by the bounded reachability BFS (see below) — i.e.
+    // not merely "blocked on the direct line" but genuinely disconnected
+    // through any walkable route within REACHABILITY_BFS_RADIUS. When this
+    // equals considered, the zone is real-topologically sealed right now,
+    // independent of the blockedByBuilt heuristic. -1 = no recent reject.
+    private int lastBuildAccessRejectUnreachableLocally = -1;
+
+    // ---- Ground-truth local reachability (bounded BFS over passable air) ----
+    // Row-order selection (scanBuildPlanFrontierRow), sealed-zone
+    // classification (rememberSoftNoAccessBuildTarget), and build-access
+    // candidate scoring (findBuildAccessTarget) each used to rely on their
+    // own proxy for the same real question: "is this position still
+    // connected, through walkable space, to where the player currently is?"
+    // This computes that directly via a cheap, bounded BFS seeded from the
+    // player's position, cached per world tick + origin, and shared by all
+    // three call sites instead of three independent heuristics.
+    private static final int REACHABILITY_BFS_RADIUS = 28;
+    // Bumped from 6000 after fix44's first validation: the real-world case
+    // that motivated this (a stand point ~10 blocks below the player,
+    // surrounded by placed shell) needed Baritone 1.5-15M weighted-search
+    // node expansions to resolve — evidence the true open-air graph there
+    // is far bigger than 6000 cells. 20000 plain BFS steps is still cheap
+    // (sub-millisecond; this is unit-cost 6-neighbour BFS, not A*) but
+    // resolves a much larger fraction of real cases instead of falling into
+    // the "budget exceeded" bucket below.
+    private static final int REACHABILITY_BFS_NODE_BUDGET = 20000;
+    // Large enough to dominate every other term in the build-access scoring
+    // formula (whose components top out in the low thousands for this
+    // search radius), so a confirmed-unreachable candidate is only ever
+    // picked when nothing better is available.
+    private static final double REACHABILITY_UNREACHABLE_PENALTY = 5000.0;
+    // Applied when the BFS exhausts its node budget before ever reaching OR
+    // ruling out a candidate. This used to fall through to "no penalty" —
+    // identical to having no data at all — which is exactly why the very
+    // first fix44 validation still picked the same pathologically expensive
+    // stand point as before (10 blocks below the player through a maze of
+    // built shell): the BFS almost certainly ran out of budget without
+    // reaching it, and an unexplored candidate was scored as if it were
+    // free. Budget-exhaustion is itself a real signal ("this took more than
+    // 20000 block-steps to resolve either way") and deserves a real, if
+    // smaller-than-confirmed-dead-end, penalty.
+    private static final double REACHABILITY_BUDGET_EXCEEDED_PENALTY = 2500.0;
+    private static final int[][] REACHABILITY_STEPS = {
+            {1, 0, 0}, {-1, 0, 0}, {0, 0, 1}, {0, 0, -1}, {0, 1, 0}, {0, -1, 0}
+    };
+    private long cachedReachabilityTick = Long.MIN_VALUE;
+    private BlockPos cachedReachabilityOrigin;
+    private boolean cachedReachabilityBudgetExceeded;
+    private final Map<Long, Integer> reachableDepthByPos = new HashMap<>();
+    // Set by findNextBuildZone (the primary "what to build next" entry
+    // point) each time it runs, so scanBuildPlanFrontierRow can consult
+    // real reachability without needing its own signature changed across
+    // every one of its callers.
+    private BlockPos reachabilityOriginHint;
     private BlockPos pendingBuildPlacementPos;
     private BlockState pendingBuildPlacementState;
     private BlockPos pendingBuildPlacementSupportPos;
@@ -485,6 +599,41 @@ public class SchematicPrinter {
             return size() > 32;
         }
     };
+    // Fix #53: how many separate entombed-cooldown expiries a position has
+    // survived (re-confirmed entombed each time). Deliberately NOT cleared by
+    // the stuck-cycle amnesty — see ENTOMBED_ABANDON_STREAK_THRESHOLD.
+    private final Map<BlockPos, Integer> entombedFailureStreak = new LinkedHashMap<>(32, 0.75f, false) {
+        @Override protected boolean removeEldestEntry(Map.Entry<BlockPos, Integer> eldest) {
+            return size() > 128;
+        }
+    };
+    // Fix #60: world tick of the last streak increment per position, so a
+    // single stuck-cycle amnesty burst (which force-clears cooldowns for
+    // EVERY cooling-down position at once) can't re-confirm the same
+    // position's entombment several times within seconds and blow through
+    // ENTOMBED_ABANDON_STREAK_THRESHOLD in one shot. A real log showed 24
+    // distinct positions permanently abandoned within ~4 minutes — far more
+    // than the "survived 3 separate ~2-minute-spaced cooldown expiries"
+    // intent behind fix53 — because two amnesty resets a minute apart, plus
+    // one natural cooldown expiry, all landed on the same batch of positions.
+    // Requiring real elapsed time between increments restores that intent
+    // without weakening it (a position still only needs to be confirmed
+    // entombed 3 times — just not 3 times in the same few seconds).
+    private final Map<BlockPos, Long> entombedStreakLastTick = new LinkedHashMap<>(32, 0.75f, false) {
+        @Override protected boolean removeEldestEntry(Map.Entry<BlockPos, Long> eldest) {
+            return size() > 128;
+        }
+    };
+    private static final long ENTOMBED_STREAK_MIN_INTERVAL_TICKS = ENTOMBED_ZONE_COOLDOWN_TICKS;
+    // Fix #53: positions permanently given up on this session — survives the
+    // stuck-cycle amnesty on purpose so hopeless entombed cells stop
+    // re-triggering the same pause loop. Cleared only by a full state reset.
+    private final Set<BlockPos> abandonedBuildTargets = Collections.newSetFromMap(
+            new LinkedHashMap<>(32, 0.75f, false) {
+                @Override protected boolean removeEldestEntry(Map.Entry<BlockPos, Boolean> eldest) {
+                    return size() > 256;
+                }
+            });
     private record PlacementAttemptKey(BlockPos target, BlockPos support, BlockPos stance) {}
     private record BuildPlacementContract(BlockPos target, Set<BlockPos> allowedSupports,
                                           boolean constrained) {
@@ -1321,6 +1470,31 @@ public class SchematicPrinter {
     public double getRange()           { return range; }
     public void setRange(double range) { this.range = Math.max(2.0, Math.min(4.5, range)); }
 
+    // Fix #54 follow-up: expose the positions fix53 has permanently given up
+    // on so the user can find and manually fix them (e.g. break an adjacent
+    // block to reopen access) instead of digging through chat scrollback.
+    public List<BlockPos> getAbandonedBuildTargets() {
+        List<BlockPos> sorted = new ArrayList<>(abandonedBuildTargets);
+        sorted.sort(Comparator.comparingInt(BlockPos::getY)
+                .thenComparingInt(BlockPos::getX)
+                .thenComparingInt(BlockPos::getZ));
+        return sorted;
+    }
+
+    // Clears the abandoned-target set (and their streak counters) so the
+    // next scan gives them a fresh chance — intended to be run after the
+    // user has manually broken access into a previously-sealed pocket.
+    // Positions that are still genuinely sealed will simply re-accumulate
+    // their streak and get re-abandoned after ENTOMBED_ABANDON_STREAK_THRESHOLD
+    // more confirmations rather than looping immediately.
+    public int retryAbandonedBuildTargets() {
+        int count = abandonedBuildTargets.size();
+        abandonedBuildTargets.clear();
+        entombedFailureStreak.clear();
+        entombedStreakLastTick.clear();
+        return count;
+    }
+
     private double getClearReach() {
         return Math.min(range, CLEAR_INTERACTION_RANGE);
     }
@@ -1352,6 +1526,9 @@ public class SchematicPrinter {
         buildLayerAccessFailures.clear();
         cooledDownBuildLayers.clear();
         buildLayerCooldownStage.clear();
+        entombedFailureStreak.clear();
+        entombedStreakLastTick.clear();
+        abandonedBuildTargets.clear();
     }
 
     private void prepareForBuildFromCurrentStance() {
@@ -1379,6 +1556,8 @@ public class SchematicPrinter {
         buildHandoffSettleTicks = 0;
         buildGateStallTicks = 0;
         remainingCacheTick = Long.MIN_VALUE;
+        trappedEscapeAttempts = 0;
+        trappedEscapeLastPos = null;
     }
 
     private void refreshPlacementPlannerState() {
@@ -1592,18 +1771,74 @@ public class SchematicPrinter {
         // feet/head/ground checks \u2014 the zone is geometrically entombed and
         // only an adjacent placement can change that. Otherwise it's a softer
         // "no reachable stance right now" and may clear as the player moves.
+        // Fix #consistency: also treat considered>0 as effectively entombed when
+        // EVERY considered candidate was rejected specifically because its
+        // access path is blocked by an already-correct built block \u2014 that is
+        // a shell sealed by our own construction and will not clear itself on
+        // a 600t retry. Without this, sealed pockets re-probed (and re-walked
+        // to) every ~30s indefinitely, the "cycles and looping" symptom.
         int considered = lastBuildAccessRejectConsidered;
+        int blockedByBuilt = lastBuildAccessRejectBlockedByBuilt;
+        int unreachableLocally = lastBuildAccessRejectUnreachableLocally;
         lastBuildAccessRejectConsidered = -1; // consume signal
-        int cooldown = (considered == 0)
+        lastBuildAccessRejectBlockedByBuilt = -1;
+        lastBuildAccessRejectUnreachableLocally = -1;
+        boolean sealedByBuilt = considered > 0 && blockedByBuilt >= considered;
+        // Ground-truth counterpart to sealedByBuilt: the reachability BFS
+        // confirmed every considered candidate is disconnected from the
+        // player right now. Independent signal — catches real topological
+        // seals (e.g. a pocket walled in by natural terrain, not just our
+        // own placed blocks) that the blockedByBuilt heuristic can't see.
+        boolean sealedByUnreachable = considered > 0 && !sealedByBuilt && unreachableLocally >= considered;
+        boolean entombed = considered == 0 || sealedByBuilt || sealedByUnreachable;
+        int cooldown = entombed
                 ? ENTOMBED_ZONE_COOLDOWN_TICKS
                 : NO_ACCESS_ZONE_COOLDOWN_TICKS;
         coolDownPlacementTarget(center, cooldown);
-        recordBuildLayerAccessFailure(center,
-                considered == 0 ? "entombed access" : "blocked access");
+        String sealLabel = sealedByBuilt
+                ? "sealed by built"
+                : sealedByUnreachable ? "sealed unreachable" : "entombed access";
+        recordBuildLayerAccessFailure(center, entombed ? sealLabel : "blocked access");
         PacketTelemetry.mark("build access target cooldown zone="
                 + posLabel(center)
                 + " ticks=" + cooldown
-                + (considered == 0 ? " entombed" : ""));
+                + (entombed ? (" " + sealLabel.replace(' ', '-')) : ""));
+        // Fix #53: track repeated entombed confirmations across amnesty resets.
+        // A position that keeps getting cooled down for the exact same
+        // entombed/sealed reason even after a stuck-cycle amnesty force-clear
+        // isn't going to resolve itself — give up on it so it stops choking
+        // the build layer's failure counter and re-triggering stuck pauses.
+        if (entombed) {
+            long nowTick = getWorldTick();
+            Long lastTick = entombedStreakLastTick.get(center);
+            if (lastTick != null && nowTick >= 0 && nowTick - lastTick < ENTOMBED_STREAK_MIN_INTERVAL_TICKS) {
+                // Too soon after the last confirmation (almost always an
+                // amnesty burst re-checking everything at once) — this isn't
+                // a genuinely new, separately-timed confirmation, so don't
+                // let it count toward the abandon streak.
+                return;
+            }
+            entombedStreakLastTick.put(center, nowTick);
+            int streak = entombedFailureStreak.merge(center, 1, Integer::sum);
+            if (streak >= ENTOMBED_ABANDON_STREAK_THRESHOLD) {
+                entombedFailureStreak.remove(center);
+                entombedStreakLastTick.remove(center);
+                abandonedBuildTargets.add(center);
+                PacketTelemetry.mark("build access target abandoned zone="
+                        + posLabel(center)
+                        + " reason=" + sealLabel.replace(' ', '-')
+                        + " abandonedTotal=" + abandonedBuildTargets.size());
+                if (statusMessages) {
+                    ChatHelper.info("\u00a7cGiving up on block at \u00a77" + posLabel(center)
+                            + "\u00a7c — it stayed sealed by already-built structure across multiple retries."
+                            + " (\u00a7f" + abandonedBuildTargets.size() + "\u00a7c abandoned so far;"
+                            + " break in manually to let the printer finish it.)");
+                }
+            }
+        } else {
+            entombedFailureStreak.remove(center);
+            entombedStreakLastTick.remove(center);
+        }
     }
 
     /*? if >=26.1 {*//*
@@ -1892,7 +2127,7 @@ public class SchematicPrinter {
                     >= SETBACK_STORM_THRESHOLD) {
                 setbackStormPauseTicks = SETBACK_STORM_PAUSE_TICKS;
                 PacketTelemetry.mark("build setback storm pause total=" + totalSetbacks);
-                LOGGER.debug("Setback storm; pausing build to let position settle");
+                LOGGER.debug("Setback storm — pausing build to let position settle");
                 return true;
             }
             PacketTelemetry.mark("build setback refresh total=" + totalSetbacks);
@@ -1944,7 +2179,7 @@ public class SchematicPrinter {
         if (a.isEmpty() && b.isEmpty()) return true;
         if (a.isEmpty() != b.isEmpty()) return false;
         if (a.getCount() != b.getCount()) return false;
-        return ItemIdentifier.getItemId(a).equals(ItemIdentifier.getItemId(b));
+        return ItemIdentifier.matches(a, b);
     }
 
     /*? if >=26.1 {*//*
@@ -2026,6 +2261,56 @@ public class SchematicPrinter {
                 && (isBuildLayerCoolingDown(pos.getY()) || isPlacementTargetCoolingDown(pos));
     }
 
+    // Fix #56: guards against the recurring "vertical shaft entombment"
+    // failure mode — a lower schematic cell that's only temporarily cooling
+    // down (blocked by rubber-banding/access failure, NOT yet permanently
+    // abandoned) can still resolve once its cooldown expires, but only if
+    // nothing seals its last remaining opening in the meantime. BOTTOM_UP
+    // deliberately lets the active Y-band advance past cooling-down cells
+    // (see scanBottomUpActionableY's "temporarily unavailable pockets do not
+    // pin the active layer") so a single stuck position can't stall the whole
+    // build — but that means candidates directly above it can otherwise get
+    // placed and permanently entomb it once its cooldown clears. This defers
+    // (not rejects — it's just excluded from THIS candidate list, same as any
+    // other cooldown) placing directly above a cooling-down, not-yet-
+    // abandoned target when doing so would close its only remaining
+    // horizontal opening, i.e. it's the target's last exit. Already-abandoned
+    // targets are exempt: fix53 already accepted sealing those as the
+    // deliberate trade-off once a position is given up on for good.
+    /*? if >=26.1 {*//*
+    private boolean wouldSealCoolingDownVerticalAccess(BlockPos worldPos, Level world) {
+    *//*?} else {*/
+    private boolean wouldSealCoolingDownVerticalAccess(BlockPos worldPos, World world) {
+    /*?}*/
+        if (worldPos == null || world == null || schematic == null || anchor == null) return false;
+        /*? if >=26.1 {*//*
+        BlockPos below = worldPos.below();
+        *//*?} else {*/
+        BlockPos below = worldPos.down();
+        /*?}*/
+        int sx = below.getX() - anchor.getX();
+        int sy = below.getY() - anchor.getY();
+        int sz = below.getZ() - anchor.getZ();
+        if (!schematic.contains(sx, sy, sz)) return false;
+        BlockState expected = schematic.getBlockState(sx, sy, sz);
+        if (expected == null || expected.isAir()) return false;
+        if (isEffectivelyPlaced(world.getBlockState(below), expected)) return false;
+        if (abandonedBuildTargets.contains(below)) return false;
+        if (!isBuildLayerCoolingDown(below.getY()) && !isPlacementTargetCoolingDown(below)) return false;
+        if (!world.getBlockState(worldPos).isAir()) return false;
+        for (Direction dir : HORIZONTALS) {
+            /*? if >=26.1 {*//*
+            BlockPos side = below.relative(dir);
+            *//*?} else {*/
+            BlockPos side = below.offset(dir);
+            /*?}*/
+            if (!isMovementBlocking(world.getBlockState(side))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     private void recordBuildLayerAccessFailure(BlockPos zone, String reason) {
         long now = getWorldTick();
         if (zone == null || now < 0) return;
@@ -2064,6 +2349,7 @@ public class SchematicPrinter {
 
     private boolean isPlacementTargetCoolingDown(BlockPos pos) {
         if (pos == null) return false;
+        if (abandonedBuildTargets.contains(pos)) return true;
         long now = getWorldTick();
         pruneCooledDownPlacementTargets(now);
         Long expiry = cooledDownPlacementTargets.get(pos);
@@ -2568,6 +2854,10 @@ public class SchematicPrinter {
             ChatHelper.info("§eInventory swaps suspended§f — server stopped honoring container clicks."
                     + " Continuing with hotbar items only; restock manually to resume swap-required blocks.");
         }
+        if (statusMessages && PlacementEngine.consumeSwapsResumedNotice()) {
+            ChatHelper.info("§aInventory swaps resumed§f — placements have been stable for a while,"
+                    + " so swap-required blocks will be attempted again.");
+        }
         if (PlacementEngine.consumeAutoBuildKillSwitchNotice()) {
             // Server has stopped acknowledging placements entirely (UseItemOn drops).
             // Stop the whole printer loop; falling back to manual placement would
@@ -2883,7 +3173,42 @@ public class SchematicPrinter {
         *//*?} else {*/
         if (isPlayerTrapped(mc.player, mc.world)) {
         /*?}*/
-            if (statusMessages) {
+            /*? if >=26.1 {*//*
+            BlockPos trappedFeet = mc.player.blockPosition();
+            *//*?} else {*/
+            BlockPos trappedFeet = mc.player.getBlockPos();
+            /*?}*/
+            if (trappedFeet.equals(trappedEscapeLastPos)) {
+                trappedEscapeAttempts++;
+            } else {
+                trappedEscapeLastPos = trappedFeet;
+                trappedEscapeAttempts = 1;
+            }
+            if (trappedEscapeAttempts > TRAPPED_ESCAPE_GIVEUP_ATTEMPTS) {
+                PacketTelemetry.mark("build trapped giveup attempts=" + trappedEscapeAttempts
+                        + " pos=" + posLabel(trappedFeet));
+                if (statusMessages) {
+                    ChatHelper.info("§c⚠ Still blocked in after §f" + trappedEscapeAttempts
+                            + "§c escape attempts — pausing build."
+                            + " §7Break a nearby block to free yourself, then run §f/printer auto§7 to resume.");
+                }
+                // Fix #54 follow-up: a live log showed the planner walking the
+                // player right back into the SAME chokepoint ~4 minutes after
+                // the first giveup (once idleScanCooldown lapsed) and getting
+                // trapped again. Mark a footprint around the trap so nearby
+                // zones are avoided for a while — same mechanism already used
+                // for failed walk approaches — instead of immediately routing
+                // back through the same dead end.
+                addFailedZoneFootprint(trappedFeet, 5);
+                trappedEscapeAttempts = 0;
+                trappedEscapeLastPos = null;
+                PlacementEngine.reset();
+                PathWalker.stop();
+                autoState = AutoState.IDLE;
+                idleScanCooldown = MAX_STUCK_PAUSE_BACKOFF_TICKS;
+                return;
+            }
+            if (statusMessages && trappedEscapeAttempts == 1) {
                 ChatHelper.info("§c⚠ Blocked in! Finding escape route...");
             }
             PlacementEngine.reset();
@@ -3110,14 +3435,47 @@ public class SchematicPrinter {
 
         // If we've been stuck for too many cycles, stop looping and go idle
         if (stuckCycles >= MAX_STUCK_CYCLES) {
+            // Fix47/48: the "idle bounce" recovery unconditionally walks
+            // straight back into whatever zone it last considered — if every
+            // candidate nearby is still cooling down from earlier failures,
+            // it hits the exact same dead end with zero delay. Clearing
+            // failedZones alone doesn't touch those cooldown maps, so a
+            // stuck-pause must ALWAYS grant a cooldown amnesty (fresh,
+            // unbiased retry) and force a real backoff before idle-bounce is
+            // allowed to retry — even on the very first occurrence, since
+            // logs show the underlying blocker is just as likely to still be
+            // present on try #1 as on a repeat.
+            boolean madeProgress = blocksPlaced != blocksPlacedAtLastStuckPause;
+            consecutiveStuckPauses = madeProgress ? 1 : consecutiveStuckPauses + 1;
+            blocksPlacedAtLastStuckPause = blocksPlaced;
+            cooledDownPlacementTargets.clear();
+            cooledDownBuildLayers.clear();
+            buildLayerCooldownStage.clear();
+            buildLayerAccessFailures.clear();
+            invalidateBuildStagingPlanCache();
+            int backoffTicks = Math.min(consecutiveStuckPauses * STUCK_PAUSE_BACKOFF_TICKS, MAX_STUCK_PAUSE_BACKOFF_TICKS);
+            PacketTelemetry.mark("build stuck cooldown amnesty repeat=" + consecutiveStuckPauses);
             if (statusMessages) {
+                // Fix #61: once a stuck-pause repeats WITHOUT net progress
+                // (consecutiveStuckPauses>=2), the amnesty clearing cooldowns
+                // alone clearly isn't helping — the recurring dead end is
+                // very likely a batch of permanently sealed pockets, not a
+                // transient cooldown. Surface the existing /printer holes
+                // tooling right here instead of making the user dig through
+                // logs to discover it exists.
+                String holesHint = (!madeProgress && consecutiveStuckPauses >= 2 && !abandonedBuildTargets.isEmpty())
+                        ? ("\n§7" + abandonedBuildTargets.size() + " build target(s) are permanently sealed"
+                                + " — run §f/printer holes§7 to see where to break in.")
+                        : "";
                 ChatHelper.info("§eStuck for " + stuckCycles
                         + " cycles — pausing. Remaining: §f" + countRemaining()
-                        + "§e blocks. Check for missing items or unreachable areas.");
+                        + "§e blocks. Check for missing items or unreachable areas."
+                        + " §7(cleared stale access cooldowns — auto-retrying in "
+                        + (backoffTicks / 20) + "s)" + holesHint);
             }
             stuckCycles = 0;
             failedZones.clear();
-            idleScanCooldown = 0;
+            idleScanCooldown = backoffTicks;
             autoState = AutoState.IDLE;
             return;
         }
@@ -4344,10 +4702,12 @@ public class SchematicPrinter {
             }
             noProgressTicks = 0;
 
-            // Stop clearing if repeated targets cannot be reached.
+            // Too many unreachable clear targets in a row (e.g. a tall column
+            // we keep falling off): stop demolishing and let BUILDING take
+            // over rather than descending the column block-by-block forever.
             if (consecutiveClearFailures >= MAX_CONSECUTIVE_CLEAR_FAILURES) {
                 clearingDone = true;
-                enterBuildMode("clearing aborted; too many unreachable targets");
+                enterBuildMode("clearing aborted — too many unreachable targets");
                 return;
             }
 
@@ -4764,7 +5124,9 @@ public class SchematicPrinter {
         if (target.isAir()) {
             return false;
         }
-        // Skip generated parts so clear validation matches selection.
+        // Auto-created parts (bed feet, door tops, etc.) report null from
+        // getDesiredBuildStateAt, which the break-state check uses. Skip them
+        // here so selection and validation agree (avoids cancel-unsafe loops).
         if (isAutoCreatedPart(target)) {
             return false;
         }
@@ -4960,7 +5322,10 @@ public class SchematicPrinter {
                 mc.interactionManager.cancelBlockBreaking();
                 /*?}*/
                 PacketTelemetry.mark("clear cancel unsafe target=" + posLabel(clearBreakTarget));
-                // Retire unsafe clear targets to avoid reselection loops.
+                // Blacklist + count this target so the column doesn't get
+                // re-selected forever (the broad scan disagrees with the
+                // build-state check, e.g. air/auto-created parts). Counting
+                // it lets the stall give-up eventually hand off to BUILDING.
                 failedClearTargets.add(clearBreakTarget);
                 consecutiveClearFailures++;
                 clearBreakTarget = null;
@@ -5993,11 +6358,11 @@ public class SchematicPrinter {
                         /*?}*/
                         return;
                     }
-                    /*? if >=1.21.5 {*//*
+                    /*? if >=1.21.5 {*/
                     inv.setSelectedSlot(dumpShulkerSlot);
-                    *//*?} else {*/
-                    inv.selectedSlot = dumpShulkerSlot;
-                    /*?}*/
+                    /*?} else {*/
+                    /*inv.selectedSlot = dumpShulkerSlot;
+                    *//*?}*/
                     return;
                 }
                 if (dumpWaitTicks < 3) return;
@@ -6012,7 +6377,7 @@ public class SchematicPrinter {
                         Math.sqrt(toTarget.x * toTarget.x + toTarget.z * toTarget.z)) * (180.0 / Math.PI));
                 *//*?} else {*/
                 ItemStack held = inv.getStack(
-                        /*? if >=1.21.5 {*//* inv.getSelectedSlot() *//*?} else {*/inv.selectedSlot/*?}*/);
+                        /*? if >=1.21.5 {*//*inv.getSelectedSlot()*//*?} else {*/ inv.selectedSlot /*?}*/);
                 Vec3d eyePos = player.getEyePos();
                 Vec3d target = Vec3d.ofCenter(dumpShulkerPos.down()).add(0, 0.5, 0);
                 Vec3d toTarget = target.subtract(eyePos);
@@ -6670,11 +7035,11 @@ public class SchematicPrinter {
                     /*?}*/
             return false;
         } else if (blockSlot != currentSlot) {
-            /*? if >=1.21.5 {*//*
+            /*? if >=1.21.5 {*/
             inv.setSelectedSlot(blockSlot);
-            *//*?} else {*/
-            inv.selectedSlot = blockSlot;
-            /*?}*/
+            /*?} else {*/
+            /*inv.selectedSlot = blockSlot;
+            *//*?}*/
         }
 
         // Place the block
@@ -6878,11 +7243,11 @@ public class SchematicPrinter {
                             player
                     );
                 } else {
-                    /*? if >=1.21.5 {*//*
+                    /*? if >=1.21.5 {*/
                     inv.setSelectedSlot(shulkerHotbarSlot);
-                    *//*?} else {*/
-                    inv.selectedSlot = shulkerHotbarSlot;
-                    /*?}*/
+                    /*?} else {*/
+                    /*inv.selectedSlot = shulkerHotbarSlot;
+                    *//*?}*/
                 }
                 // Wait 2 ticks for server to process the slot swap
                 shulkerUnloadPhase = 2;
@@ -7490,7 +7855,8 @@ public class SchematicPrinter {
         platformBlockPos = null;
         shulkerOpenRetries = 0;
 
-        // Give building a chance before another unload.
+        // Suppress immediate re-restock so the build loop gets a chance to
+        // actually place blocks before another unload can fire.
         restockCooldown = SHULKER_RESTOCK_COOLDOWN;
 
         if (statusMessages) {
@@ -8092,7 +8458,10 @@ public class SchematicPrinter {
         if (mc == null || mc.player == null) return false;
         if (restockFailures >= MAX_RESTOCK_FAILURES) return false;
         if (MoarMod.getChestManager().supplyChestCount() == 0) return false;
-        // Pause restock churn after unloading shulkers.
+        // Suppress repeated proactive restocks immediately after a shulker
+        // unload.  Without this, a build stance that can't place (rubber-band,
+        // occluded zone) re-triggers restock every few ticks, churning the
+        // unload cycle endlessly.  Give the bot time to build or hop zones.
         if (restockCooldown > 0) return false;
 
         /*? if >=26.1 {*//*
@@ -8247,7 +8616,9 @@ public class SchematicPrinter {
         // BUT: if we already tried and couldn't place a shulker (e.g.
         // standing on a 1-block pillar with no space), don't retry —
         // walk to a supply chest instead where there's flat ground.
-        // Fall back to supply chests when shulker unloads stall.
+        // Also bail to a supply chest after several consecutive unloads
+        // with no build progress — repeatedly unloading the same shulkers
+        // without placing anything is a churn loop, not real restocking.
         if (consecutiveShulkerUnloads >= MAX_CONSECUTIVE_SHULKER_UNLOADS) {
             shulkerNoSpaceSkipped = true;
         }
@@ -8537,10 +8908,29 @@ public class SchematicPrinter {
             // Baritone actually pillars up.  Without this, GoalNear's
             // 3D radius causes Baritone to consider the player
             // "arrived" while still at ground level.
-            if (horizDist > 4) {
+            //
+            // Pillar in a column OUTSIDE the schematic's footprint
+            // (near the target) rather than straight up through the
+            // target's own column.  Climbing the target's own column
+            // routes Baritone through interior walls/floors/narrow
+            // shafts, which is exactly the vertical-shaft chokepoint
+            // case where placement search gets stuck or explodes in
+            // cost.  Scaffolding up in the open air just outside the
+            // building is cheap and reliable; only the final short
+            // leg re-enters the structure at the target's Y level.
+            BlockPos exteriorColumn = findExteriorApproachColumn(target, from.getY(), w);
+            int columnX = exteriorColumn != null ? exteriorColumn.getX() : target.getX();
+            int columnZ = exteriorColumn != null ? exteriorColumn.getZ() : target.getZ();
+            if (exteriorColumn != null) {
+                PacketTelemetry.mark("build ascend via exterior column=" + columnX + "," + columnZ
+                        + " target=" + posLabel(target));
+            }
+            double columnHorizDist = Math.sqrt(
+                    Math.pow(columnX - from.getX(), 2) + Math.pow(columnZ - from.getZ(), 2));
+            if (columnHorizDist > 4) {
                 // Break the horizontal phase into legs if it's long
-                BlockPos base = new BlockPos(target.getX(), from.getY(), target.getZ());
-                if (horizDist > 48) {
+                BlockPos base = new BlockPos(columnX, from.getY(), columnZ);
+                if (columnHorizDist > 48) {
                     List<BlockPos> horizLegs = computeLinearWaypoints(
                             from, base, 48);
                     legs.addAll(horizLegs);
@@ -8556,7 +8946,7 @@ public class SchematicPrinter {
             int fullLegs = absY / vertLeg;
             for (int i = 0; i < fullLegs; i++) {
                 currentY += vertLeg;
-                legs.add(new BlockPos(target.getX(), currentY, target.getZ()));
+                legs.add(new BlockPos(columnX, currentY, columnZ));
             }
 
             /*? if >=26.1 {*//*
@@ -8657,6 +9047,11 @@ public class SchematicPrinter {
         int activeBandTopY = buildFrontier.activeBandTopY();
         Integer frontierY = null;
 
+        // Single pass: run the expensive shared filters once, remember the
+        // survivors, and track the frontier Y. The frontier-window check
+        // (which depends on the final frontierY) is applied afterwards as a
+        // cheap Y comparison instead of re-running all filters a second time.
+        List<SchematicBlockRef> survivors = new ArrayList<>();
         long tick = getWorldTick();
         for (long key : schematicBlocksByChunk.keySet()) {
             int chunkX = chunkXFromKey(key);
@@ -8682,6 +9077,7 @@ public class SchematicPrinter {
                 if (!printInAir && !PlacementEngine.hasAdjacentSolid(world, ref.pos())) continue;
                 if (!BlockDependency.isReadyToPlace(world, ref.pos(), ref.target())) continue;
                 if (isNearFailedZone(ref.pos())) continue;
+                survivors.add(ref);
                 if (frontierY == null || isBetterBuildLayer(ref.pos().getY(), frontierY)) {
                     frontierY = ref.pos().getY();
                 }
@@ -8692,43 +9088,19 @@ public class SchematicPrinter {
             return needed;
         }
 
-        for (long key : schematicBlocksByChunk.keySet()) {
-            int chunkX = chunkXFromKey(key);
-            int chunkZ = chunkZFromKey(key);
+        for (SchematicBlockRef ref : survivors) {
+            if (!isWithinActiveBuildFrontier(ref.pos().getY(), frontierY, activeBandTopY)) continue;
+
             /*? if >=26.1 {*//*
-            if (!world.hasChunk(chunkX, chunkZ)) continue;
+            double distSq = playerPos.distSqr(ref.pos());
             *//*?} else {*/
-            if (!world.isChunkLoaded(chunkX, chunkZ)) continue;
+            double distSq = playerPos.getSquaredDistance(ref.pos().getX(), ref.pos().getY(), ref.pos().getZ());
             /*?}*/
-
-            for (SchematicBlockRef ref : getUnresolvedChunkEntries(world, tick, key)) {
-                if (liquidPass) {
-                    if (!ref.liquid()) continue;
-                } else if (redstonePass) {
-                    if (!ref.redstone()) continue;
-                } else {
-                    if (ref.liquid() || ref.redstone()) continue;
-                }
-                if (!isCurrentlyUnresolved(ref, world)) continue;
-                if (ref.pos().getY() > activeBandTopY) continue;
-                if (!isInActiveBuildPlanRow(ref.pos(), buildFrontier)) continue;
-                if (isBuildTargetCoolingDown(ref.pos())) continue;
-                if (!isWithinActiveBuildFrontier(ref.pos().getY(), frontierY, activeBandTopY)) continue;
-                if (!printInAir && !PlacementEngine.hasAdjacentSolid(world, ref.pos())) continue;
-                if (!BlockDependency.isReadyToPlace(world, ref.pos(), ref.target())) continue;
-                if (isNearFailedZone(ref.pos())) continue;
-
-                /*? if >=26.1 {*//*
-                double distSq = playerPos.distSqr(ref.pos());
-                *//*?} else {*/
-                double distSq = playerPos.getSquaredDistance(ref.pos().getX(), ref.pos().getY(), ref.pos().getZ());
-                /*?}*/
-                Candidate candidate = new Candidate(ref, distSq);
-                if (isWithinRenderWindow(renderWindow, ref.pos().getX(), ref.pos().getZ())) {
-                    renderedCandidates.add(candidate);
-                } else {
-                    fallbackCandidates.add(candidate);
-                }
+            Candidate candidate = new Candidate(ref, distSq);
+            if (isWithinRenderWindow(renderWindow, ref.pos().getX(), ref.pos().getZ())) {
+                renderedCandidates.add(candidate);
+            } else {
+                fallbackCandidates.add(candidate);
             }
         }
 
@@ -9515,7 +9887,7 @@ public class SchematicPrinter {
     /*?}*/
         Integer lowestActionableY = null;
         long tick = getWorldTick();
-        // Select rows from all loaded schematic chunks.
+        // Build order scans the whole loaded schematic index; render range only affects placement reach.
         for (long key : schematicBlocksByChunk.keySet()) {
             int chunkX = chunkXFromKey(key);
             int chunkZ = chunkZFromKey(key);
@@ -9534,7 +9906,7 @@ public class SchematicPrinter {
                 if (isBuildLayerCoolingDown(y)) continue;
                 if (isPlacementTargetCoolingDown(worldPos)) continue;
 
-                // Skip cooled pockets for now.
+                // Temporarily unavailable pockets do not pin the active layer.
                 if (lowestActionableY == null || y < lowestActionableY) {
                     lowestActionableY = y;
                 }
@@ -9585,9 +9957,18 @@ public class SchematicPrinter {
     *//*?} else {*/
     private Integer scanBuildPlanFrontierRow(World world, int activeBandTopY) {
     /*?}*/
-        Integer activeRow = null;
         long tick = getWorldTick();
-        // Pick the first actionable row.
+        // Fix #consistency: collect every currently-actionable row for this Y
+        // band instead of just tracking the minimum. Building the lowest row
+        // index first (old behavior) tends to complete perimeter/shell rows
+        // before interior rows purely by coincidence of index order, which
+        // can seal off interior access from outside before the interior is
+        // reached (the "entombment" cycling reported by users). Rows are
+        // now chosen interior-first: the actionable row farthest from either
+        // edge of the CURRENT remaining footprint wins, deferring boundary
+        // rows (which become the min/max as the build progresses) to last.
+        TreeSet<Integer> actionableRows = new TreeSet<>();
+        Map<Integer, BlockPos> sampleCellByRow = new HashMap<>();
         for (long key : schematicBlocksByChunk.keySet()) {
             int chunkX = chunkXFromKey(key);
             int chunkZ = chunkZFromKey(key);
@@ -9607,12 +9988,45 @@ public class SchematicPrinter {
                 if (isPlacementTargetCoolingDown(worldPos)) continue;
 
                 int row = getBuildPlanRow(worldPos);
-                if (activeRow == null || row < activeRow) {
-                    activeRow = row;
+                actionableRows.add(row);
+                sampleCellByRow.putIfAbsent(row, worldPos);
+            }
+        }
+        if (actionableRows.isEmpty()) {
+            return null;
+        }
+        int minRow = actionableRows.first();
+        int maxRow = actionableRows.last();
+        Integer bestRow = null;
+        int bestDistance = -1;
+        // Ground-truth refinement: among rows still in the running by the
+        // farthest-from-edge heuristic above, prefer ones whose sample cell
+        // is confirmed reachable from the player right now (via the bounded
+        // reachability BFS) over ones that aren't. Row index alone can't
+        // tell a genuine interior row from a disconnected pocket that just
+        // happens to sit near the middle of the current index range — real
+        // connectivity can. Falls back to the plain heuristic when no
+        // origin hint is available yet, or when reachability data doesn't
+        // confirm any row (e.g. all sample cells are outside BFS radius).
+        BlockPos origin = reachabilityOriginHint;
+        Integer bestReachableRow = null;
+        int bestReachableDistance = -1;
+        for (int row : actionableRows) {
+            int distance = Math.min(row - minRow, maxRow - row);
+            if (distance > bestDistance) {
+                bestDistance = distance;
+                bestRow = row;
+            }
+            if (origin != null) {
+                BlockPos sample = sampleCellByRow.get(row);
+                if (sample != null && isPositionReachable(sample, origin, world)
+                        && distance > bestReachableDistance) {
+                    bestReachableDistance = distance;
+                    bestReachableRow = row;
                 }
             }
         }
-        return activeRow;
+        return bestReachableRow != null ? bestReachableRow : bestRow;
     }
 
     private boolean isInActiveBuildPlanRow(BlockPos worldPos, BuildPlanFrontier frontier) {
@@ -9754,6 +10168,7 @@ public class SchematicPrinter {
                 if (!BlockDependency.isReadyToPlace(world, worldPos, ref.target())) continue;
                 if (!hasBuildPlacementFrontierSupport(worldPos, ref.target(), world)) continue;
                 if (isNearFailedZone(worldPos)) continue;
+                if (wouldSealCoolingDownVerticalAccess(worldPos, world)) continue;
 
                 /*? if >=26.1 {*//*
                 double targetDist = playerPos.distanceToSqr(Vec3.atCenterOf(worldPos));
@@ -9872,6 +10287,99 @@ public class SchematicPrinter {
                 || playerBlockPos.getX() > maxX
                 || playerBlockPos.getZ() < minZ
                 || playerBlockPos.getZ() > maxZ;
+    }
+
+    // Ground-drop tolerance for exterior scaffold columns: if solid
+    // ground can't be found within this many blocks below the column's
+    // reference Y, the column is assumed to be over a void/cliff/ravine
+    // and is rejected in favor of the next candidate direction (see
+    // findExteriorApproachColumn).  Without this check, a column picked
+    // blindly at the nearest footprint edge can land over a steep
+    // drop-off, causing Baritone to fall/rubber-band repeatedly instead
+    // of climbing (observed as escalating SETBACK marks and near-zero
+    // placement throughput).
+    private static final int EXTERIOR_COLUMN_DROP_TOLERANCE = 6;
+
+    // Maximum horizontal distance (blocks) from the target to the
+    // nearest footprint edge that we'll bother detouring to for an
+    // exterior scaffold column.  On a large schematic, most interior
+    // targets can be tens of blocks from every edge — walking that far
+    // just to find open air to pillar in defeats the "cheap, nearby"
+    // premise of the detour, wastes huge amounts of time round-tripping
+    // out and back, and was observed to never actually complete the
+    // ascent (the walk just stalls near the far column and eventually
+    // gets rubber-banded back).  Beyond this distance, findExteriorApproachColumn
+    // gives up and returns null so the caller falls back to pillaring
+    // at the target's own column instead.
+    private static final int MAX_EXTERIOR_COLUMN_DIST = 15;
+
+    /*? if >=26.1 {*//*
+    private boolean isExteriorColumnGroundSafe(int x, int z, int aroundY, Level world) {
+    *//*?} else {*/
+    private boolean isExteriorColumnGroundSafe(int x, int z, int aroundY, World world) {
+    /*?}*/
+        if (world == null) return true;
+        int top = aroundY + 2;
+        int bottom = aroundY - EXTERIOR_COLUMN_DROP_TOLERANCE;
+        for (int y = top; y >= bottom; y--) {
+            BlockPos p = new BlockPos(x, y, z);
+            if (isMovementBlocking(world.getBlockState(p))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Finds an XZ column just outside the schematic's footprint, near
+    // the given target, for use as a scaffold-pillar column when
+    // escalating to a placement-enabled ascent.  Climbing outside the
+    // building instead of straight up through the target's own column
+    // avoids bridging/pillaring through interior walls, floors, or
+    // narrow shafts — where Baritone's placement search can get stuck
+    // or extremely expensive (the shaft/chokepoint entombment case).
+    // Candidates are tried nearest-edge-first, but any candidate whose
+    // ground drops away into a void/cliff (isExteriorColumnGroundSafe)
+    // is skipped in favor of the next one.  Returns null if the target
+    // is already outside the footprint, schematic bounds are
+    // unavailable, or every candidate direction is unsafe — meaning the
+    // target's own column should be used unchanged.
+    /*? if >=26.1 {*//*
+    private BlockPos findExteriorApproachColumn(BlockPos target, int refY, Level world) {
+    *//*?} else {*/
+    private BlockPos findExteriorApproachColumn(BlockPos target, int refY, World world) {
+    /*?}*/
+        if (target == null || schematic == null || anchor == null) {
+            return null;
+        }
+        int minX = anchor.getX();
+        int maxX = anchor.getX() + schematic.getSizeX() - 1;
+        int minZ = anchor.getZ();
+        int maxZ = anchor.getZ() + schematic.getSizeZ() - 1;
+        int tx = target.getX();
+        int tz = target.getZ();
+        if (tx < minX || tx > maxX || tz < minZ || tz > maxZ) {
+            return null;
+        }
+        int distWest = tx - minX;
+        int distEast = maxX - tx;
+        int distNorth = tz - minZ;
+        int distSouth = maxZ - tz;
+        record Candidate(int dist, int x, int z) {}
+        List<Candidate> candidates = new ArrayList<>();
+        candidates.add(new Candidate(distWest, minX - SCAFFOLD_EXTERIOR_MARGIN, tz));
+        candidates.add(new Candidate(distEast, maxX + SCAFFOLD_EXTERIOR_MARGIN, tz));
+        candidates.add(new Candidate(distNorth, tx, minZ - SCAFFOLD_EXTERIOR_MARGIN));
+        candidates.add(new Candidate(distSouth, tx, maxZ + SCAFFOLD_EXTERIOR_MARGIN));
+        candidates.sort(Comparator.comparingInt(Candidate::dist));
+        for (Candidate c : candidates) {
+            if (c.dist() > MAX_EXTERIOR_COLUMN_DIST) {
+                break;
+            }
+            if (isExteriorColumnGroundSafe(c.x(), c.z(), refY, world)) {
+                return new BlockPos(c.x(), refY, c.z());
+            }
+        }
+        return null;
     }
 
     private boolean isExteriorBuildTarget(BlockPos worldPos) {
@@ -10175,6 +10683,132 @@ public class SchematicPrinter {
         return true;
     }
 
+    // Rebuilds the bounded reachability BFS from `origin` if the cached one
+    // is stale (different world tick or origin). No-op otherwise. Cheap:
+    // capped at REACHABILITY_BFS_NODE_BUDGET expansions, so worst case is a
+    // small fraction of a millisecond even at REACHABILITY_BFS_RADIUS.
+    /*? if >=26.1 {*//*
+    private void ensureReachabilityMap(BlockPos origin, Level world) {
+    *//*?} else {*/
+    private void ensureReachabilityMap(BlockPos origin, World world) {
+    /*?}*/
+        if (origin == null || world == null) {
+            reachableDepthByPos.clear();
+            cachedReachabilityOrigin = null;
+            cachedReachabilityTick = Long.MIN_VALUE;
+            cachedReachabilityBudgetExceeded = false;
+            return;
+        }
+        long tick = getWorldTick();
+        if (tick == cachedReachabilityTick && origin.equals(cachedReachabilityOrigin)) {
+            return;
+        }
+        reachableDepthByPos.clear();
+        cachedReachabilityBudgetExceeded = false;
+        BlockPos start = /*? if >=26.1 {*//* origin.immutable(); *//*?} else {*/ origin.toImmutable(); /*?}*/
+        int startX = start.getX();
+        int startY = start.getY();
+        int startZ = start.getZ();
+        if (!isReachabilityPassable(start, world)) {
+            // Player isn't currently standing somewhere we'd classify as
+            // passable (e.g. mid-scaffold, in a doorway block) — still seed
+            // the map with the origin itself so exact-position lookups work.
+            reachableDepthByPos.put(start.asLong(), 0);
+            cachedReachabilityTick = tick;
+            cachedReachabilityOrigin = start;
+            return;
+        }
+        Deque<BlockPos> queue = new ArrayDeque<>();
+        reachableDepthByPos.put(start.asLong(), 0);
+        queue.add(start);
+        int radiusSq = REACHABILITY_BFS_RADIUS * REACHABILITY_BFS_RADIUS;
+        while (!queue.isEmpty() && reachableDepthByPos.size() < REACHABILITY_BFS_NODE_BUDGET) {
+            BlockPos cur = queue.poll();
+            int depth = reachableDepthByPos.get(cur.asLong());
+            int cx = cur.getX();
+            int cy = cur.getY();
+            int cz = cur.getZ();
+            for (int[] step : REACHABILITY_STEPS) {
+                int nx = cx + step[0];
+                int ny = cy + step[1];
+                int nz = cz + step[2];
+                int ddx = nx - startX;
+                int ddy = ny - startY;
+                int ddz = nz - startZ;
+                if (ddx * ddx + ddy * ddy + ddz * ddz > radiusSq) continue;
+                BlockPos next = new BlockPos(nx, ny, nz);
+                long key = next.asLong();
+                if (reachableDepthByPos.containsKey(key)) continue;
+                if (!isReachabilityPassable(next, world)) continue;
+                reachableDepthByPos.put(key, depth + 1);
+                queue.add(next);
+            }
+        }
+        if (!queue.isEmpty()) {
+            cachedReachabilityBudgetExceeded = true;
+        }
+        cachedReachabilityTick = tick;
+        cachedReachabilityOrigin = start;
+    }
+
+    // Whether the player could physically occupy this cell (feet + head
+    // clearance). Deliberately simple — no jump/fall physics — matching the
+    // cheap-proxy spirit of the rest of the access-search code; this is a
+    // connectivity probe, not a movement simulator.
+    /*? if >=26.1 {*//*
+    private boolean isReachabilityPassable(BlockPos feetPos, Level world) {
+    *//*?} else {*/
+    private boolean isReachabilityPassable(BlockPos feetPos, World world) {
+    /*?}*/
+        if (isMovementBlocking(world.getBlockState(feetPos))) return false;
+        BlockPos headPos = new BlockPos(feetPos.getX(), feetPos.getY() + 1, feetPos.getZ());
+        return !isMovementBlocking(world.getBlockState(headPos));
+    }
+
+    // Real BFS depth (in single-block steps) from origin to pos, or null if
+    // pos wasn't reached — either because it's genuinely disconnected within
+    // REACHABILITY_BFS_RADIUS, or because the node budget ran out first (see
+    // cachedReachabilityBudgetExceeded / isConfirmedUnreachableLocally to
+    // distinguish those two cases).
+    /*? if >=26.1 {*//*
+    private Integer getReachabilityDepth(BlockPos pos, BlockPos origin, Level world) {
+    *//*?} else {*/
+    private Integer getReachabilityDepth(BlockPos pos, BlockPos origin, World world) {
+    /*?}*/
+        if (pos == null) return null;
+        ensureReachabilityMap(origin, world);
+        return reachableDepthByPos.get(pos.asLong());
+    }
+
+    /*? if >=26.1 {*//*
+    private boolean isPositionReachable(BlockPos pos, BlockPos origin, Level world) {
+    *//*?} else {*/
+    private boolean isPositionReachable(BlockPos pos, BlockPos origin, World world) {
+    /*?}*/
+        return getReachabilityDepth(pos, origin, world) != null;
+    }
+
+    // True only when the BFS actually explored the full radius around pos
+    // without ever reaching it (i.e. a confirmed dead end), as opposed to
+    // simply being out of range of the origin or cut off by the node budget.
+    // This is the strong "this pocket is topologically sealed right now"
+    // signal used to strengthen sealed-by-built classification.
+    /*? if >=26.1 {*//*
+    private boolean isConfirmedUnreachableLocally(BlockPos pos, BlockPos origin, Level world) {
+    *//*?} else {*/
+    private boolean isConfirmedUnreachableLocally(BlockPos pos, BlockPos origin, World world) {
+    /*?}*/
+        if (pos == null || origin == null || world == null) return false;
+        ensureReachabilityMap(origin, world);
+        if (reachableDepthByPos.containsKey(pos.asLong())) return false;
+        if (cachedReachabilityBudgetExceeded) return false;
+        long dx = (long) pos.getX() - origin.getX();
+        long dy = (long) pos.getY() - origin.getY();
+        long dz = (long) pos.getZ() - origin.getZ();
+        long distSq = dx * dx + dy * dy + dz * dz;
+        return distSq <= (long) REACHABILITY_BFS_RADIUS * REACHABILITY_BFS_RADIUS;
+    }
+
     /*? if >=26.1 {*//*
     private BuildAccessTarget findBuildAccessTarget(BlockPos targetPos, Level world, LocalPlayer player) {
     *//*?} else {*/
@@ -10199,6 +10833,7 @@ public class SchematicPrinter {
         double bestScore = Double.MAX_VALUE;
         BuildAccessTarget bestReachable = null;
         double bestReachableScore = Double.MAX_VALUE;
+        blockedByBuiltProbeCount = 0;
         int rejectedFeet = 0;
         int rejectedHead = 0;
         int rejectedGround = 0;
@@ -10206,6 +10841,7 @@ public class SchematicPrinter {
         int rejectedPath = 0;
         int rejectedRange = 0;
         int considered = 0;
+        int unreachableLocallyCount = 0;
         int radius = ACCESS_MINING_SEARCH_RADIUS;
         int minAccessY = Math.min(targetPos.getY(), playerBlockPos.getY());
         for (int dy = -2; dy <= 3; dy++) {
@@ -10257,8 +10893,24 @@ public class SchematicPrinter {
                     }
                     AccessPathProbe pathProbe = findAccessPathProbe(playerBlockPos, feetPos, world);
                     if (pathProbe.blocked()) {
-                        rejectedPath++;
-                        continue;
+                        // Fix #51: findAccessPathProbe only checks the direct
+                        // interpolated line from the player to this stance —
+                        // once a room's walls/floor are built, that straight
+                        // line almost always crosses a correct placed block,
+                        // hard-rejecting EVERY candidate even when a real
+                        // walkable route exists through a doorway/gap. Before
+                        // giving up, consult the ground-truth BFS: if it
+                        // finds an actual path around, let the candidate
+                        // through (with a stiff reachability penalty applied
+                        // below) instead of declaring the zone "sealed by
+                        // built" and slapping it with a multi-minute cooldown.
+                        if (!isPositionReachable(feetPos, playerBlockPos, world)) {
+                            if (isConfirmedUnreachableLocally(feetPos, playerBlockPos, world)) {
+                                unreachableLocallyCount++;
+                            }
+                            rejectedPath++;
+                            continue;
+                        }
                     }
                     if (clearPos == null) {
                         clearPos = pathProbe.clearPos();
@@ -10285,8 +10937,38 @@ public class SchematicPrinter {
                     boolean wetHead = !world.getBlockState(headPos).getFluidState().isEmpty();
                     double waterPenalty = (wetFeet ? BUILD_ACCESS_WATER_PENALTY : 0.0)
                             + (wetHead ? BUILD_ACCESS_WATER_PENALTY : 0.0);
+                    // Ground-truth walking-cost signal: the straight-line probe
+                    // above only checks the direct interpolated line, so a
+                    // candidate that's euclidean-close but maze-like in
+                    // practice (surrounded by built shell) can still slip
+                    // through and get handed to Baritone, which then burns
+                    // millions of node expansions discovering the real route.
+                    // Real BFS depth replaces euclidean playerDist as the
+                    // primary walking-cost term when available; a candidate
+                    // confirmed unreachable within the bounded probe is
+                    // heavily deprioritised instead of outright rejected, so
+                    // it's only ever picked when nothing better exists.
+                    Integer reachDepth = getReachabilityDepth(feetPos, playerBlockPos, world);
+                    double reachabilityPenalty;
+                    if (reachDepth != null) {
+                        reachabilityPenalty = reachDepth * 0.5;
+                    } else if (cachedReachabilityBudgetExceeded) {
+                        // BFS exhausted its node budget before ever reaching
+                        // OR ruling out this candidate — the case that let
+                        // the original pathological stand point (10 blocks
+                        // below the player through built shell) slip through
+                        // unpenalised. Budget exhaustion is itself a real
+                        // "this is expensive to resolve" signal.
+                        reachabilityPenalty = REACHABILITY_BUDGET_EXCEEDED_PENALTY;
+                    } else if (isConfirmedUnreachableLocally(feetPos, playerBlockPos, world)) {
+                        reachabilityPenalty = REACHABILITY_UNREACHABLE_PENALTY;
+                        unreachableLocallyCount++;
+                    } else {
+                        reachabilityPenalty = 0.0;
+                    }
                     double score = targetDist * 2.0
                             + playerDist * 0.35
+                            + reachabilityPenalty
                             + Math.abs(feetPos.getY() - targetPos.getY()) * 18.0
                             + (clearPos != null ? 8.0 : 0.0)
                             + waterPenalty;
@@ -10304,6 +10986,7 @@ public class SchematicPrinter {
                         // clearing work. Feet-only fallbacks loop after arrival.
                         double relaxedScore = playerDist * 0.55
                                 + targetDist * 0.35
+                                + reachabilityPenalty
                                 + Math.abs(feetPos.getY() - targetPos.getY()) * 14.0
                                 + (clearPos != null ? 8.0 : 0.0)
                                 + waterPenalty
@@ -10320,6 +11003,15 @@ public class SchematicPrinter {
             // Fix #10: surface considered count to caller so the soft-no-access
             // cooldown can escalate for considered=0 (entombed) zones.
             lastBuildAccessRejectConsidered = considered;
+            // Perf/consistency: surface how many candidates failed specifically
+            // due to a built blocker, so the caller can also escalate when the
+            // zone is fully sealed by its own completed shell (considered>0 but
+            // every candidate's path was blocked by a correct placed block).
+            lastBuildAccessRejectBlockedByBuilt = blockedByBuiltProbeCount;
+            // Ground-truth counterpart to blockedByBuilt: how many considered
+            // candidates the reachability BFS confirmed are disconnected from
+            // the player right now (not just "blocked on the direct line").
+            lastBuildAccessRejectUnreachableLocally = unreachableLocallyCount;
             PacketTelemetry.mark("build access reject zone=" + posLabel(targetPos)
                     + " considered=" + considered
                     + " feet=" + rejectedFeet
@@ -10328,6 +11020,8 @@ public class SchematicPrinter {
                     + " clear=" + rejectedClear
                     + " path=" + rejectedPath
                     + " range=" + rejectedRange
+                    + " blockedByBuilt=" + blockedByBuiltProbeCount
+                    + " unreachableLocally=" + unreachableLocallyCount
                     + " player=" + posLabel(playerBlockPos));
         }
         return best != null ? best : bestReachable;
@@ -10385,8 +11079,15 @@ public class SchematicPrinter {
             if (!isAccessMiningCarvableCell(clearPos, world)
                     && !isTemporarilyCarvableAccessCell(clearPos, world)) {
                 if (isCorrectSchematicBlock(clearPos, world)) {
-                    PacketTelemetry.mark("build access blocked-by-built blocker=" + posLabel(clearPos)
-                            + " feet=" + posLabel(toFeet));
+                    // Perf: count every built blocker but emit at most a few
+                    // detail marks per evaluation — the reject summary carries
+                    // the total. Skip string building entirely when disabled.
+                    blockedByBuiltProbeCount++;
+                    if (PacketTelemetry.isEnabled()
+                            && blockedByBuiltProbeCount <= MAX_BLOCKED_BY_BUILT_MARKS_PER_EVAL) {
+                        PacketTelemetry.mark("build access blocked-by-built blocker=" + posLabel(clearPos)
+                                + " feet=" + posLabel(toFeet));
+                    }
                 }
                 return new AccessPathProbe(null, true);
             }
@@ -10484,10 +11185,13 @@ public class SchematicPrinter {
 
         /*? if >=26.1 {*//*
         Vec3 playerPos = player.position();
+        reachabilityOriginHint = player.blockPosition();
         *//*?} else if >=1.21.10 {*//*
         Vec3d playerPos = player.getSyncedPos();
+        reachabilityOriginHint = player.getBlockPos();
         *//*?} else {*/
         Vec3d playerPos = player.getPos();
+        reachabilityOriginHint = player.getBlockPos();
         /*?}*/
 	        RenderWindow renderWindow =
 	                getRenderWindow(/*? if >=26.1 {*//* player.blockPosition() *//*?} else {*/player.getBlockPos()/*?}*/);
@@ -10552,6 +11256,7 @@ public class SchematicPrinter {
                 if (!BlockDependency.isReadyToPlace(world, worldPos, ref.target())) continue;
                 if (!hasBuildPlacementFrontierSupport(worldPos, ref.target(), world)) continue;
                 if (isNearFailedZone(worldPos)) continue;
+                if (wouldSealCoolingDownVerticalAccess(worldPos, world)) continue;
 
                 /*? if >=26.1 {*//*
                 double dist = playerPos.distanceToSqr(worldPos.getX() + 0.5, worldPos.getY() + 0.5, worldPos.getZ() + 0.5);
@@ -10778,6 +11483,11 @@ public class SchematicPrinter {
     /*?}*/
         if (world == null || schematic == null) return 0;
         int count = 0;
+        /*? if >=26.1 {*//*
+        BlockPos.MutableBlockPos mutablePos = new BlockPos.MutableBlockPos();
+        *//*?} else {*/
+        BlockPos.Mutable mutablePos = new BlockPos.Mutable();
+        /*?}*/
         for (LitematicaSchematic.Region region : schematic.getRegions()) {
             for (int y = 0; y < region.absY; y++) {
                 for (int z = 0; z < region.absZ; z++) {
@@ -10800,7 +11510,7 @@ public class SchematicPrinter {
                         *//*?} else {*/
                         if (!world.isChunkLoaded(wx >> 4, wz >> 4)) continue;
                         /*?}*/
-                        if (!isEffectivelyPlaced(world.getBlockState(new BlockPos(wx, wy, wz)), target)) {
+                        if (!isEffectivelyPlaced(world.getBlockState(mutablePos.set(wx, wy, wz)), target)) {
                             count++;
                         }
                     }
@@ -10866,6 +11576,11 @@ public class SchematicPrinter {
     *//*?} else {*/
     private boolean hasRemainingLiquidsUncached(World world) {
     /*?}*/
+        /*? if >=26.1 {*//*
+        BlockPos.MutableBlockPos mutablePos = new BlockPos.MutableBlockPos();
+        *//*?} else {*/
+        BlockPos.Mutable mutablePos = new BlockPos.Mutable();
+        /*?}*/
         for (LitematicaSchematic.Region region : schematic.getRegions()) {
             for (int y = 0; y < region.absY; y++) {
                 for (int z = 0; z < region.absZ; z++) {
@@ -10880,7 +11595,7 @@ public class SchematicPrinter {
                         *//*?} else {*/
                         if (!world.isChunkLoaded(wx >> 4, wz >> 4)) continue;
                         /*?}*/
-                        if (!isEffectivelyPlaced(world.getBlockState(new BlockPos(wx, wy, wz)), target)) {
+                        if (!isEffectivelyPlaced(world.getBlockState(mutablePos.set(wx, wy, wz)), target)) {
                             return true;
                         }
                     }
@@ -10913,6 +11628,11 @@ public class SchematicPrinter {
     *//*?} else {*/
     private boolean hasRemainingSolidsUncached(World world) {
     /*?}*/
+        /*? if >=26.1 {*//*
+        BlockPos.MutableBlockPos mutablePos = new BlockPos.MutableBlockPos();
+        *//*?} else {*/
+        BlockPos.Mutable mutablePos = new BlockPos.Mutable();
+        /*?}*/
         for (LitematicaSchematic.Region region : schematic.getRegions()) {
             for (int y = 0; y < region.absY; y++) {
                 for (int z = 0; z < region.absZ; z++) {
@@ -10933,7 +11653,7 @@ public class SchematicPrinter {
                         *//*?} else {*/
                         if (!world.isChunkLoaded(wx >> 4, wz >> 4)) continue;
                         /*?}*/
-                        if (!isEffectivelyPlaced(world.getBlockState(new BlockPos(wx, wy, wz)), target)) {
+                        if (!isEffectivelyPlaced(world.getBlockState(mutablePos.set(wx, wy, wz)), target)) {
                             return true;
                         }
                     }
@@ -10966,6 +11686,11 @@ public class SchematicPrinter {
     *//*?} else {*/
     private boolean hasRemainingRedstoneUncached(World world) {
     /*?}*/
+        /*? if >=26.1 {*//*
+        BlockPos.MutableBlockPos mutablePos = new BlockPos.MutableBlockPos();
+        *//*?} else {*/
+        BlockPos.Mutable mutablePos = new BlockPos.Mutable();
+        /*?}*/
         for (LitematicaSchematic.Region region : schematic.getRegions()) {
             for (int y = 0; y < region.absY; y++) {
                 for (int z = 0; z < region.absZ; z++) {
@@ -10983,7 +11708,7 @@ public class SchematicPrinter {
                         *//*?} else {*/
                         if (!world.isChunkLoaded(wx >> 4, wz >> 4)) continue;
                         /*?}*/
-                        if (!isEffectivelyPlaced(world.getBlockState(new BlockPos(wx, wy, wz)), target)) {
+                        if (!isEffectivelyPlaced(world.getBlockState(mutablePos.set(wx, wy, wz)), target)) {
                             return true;
                         }
                     }
@@ -11955,6 +12680,18 @@ public class SchematicPrinter {
     private int placeDebugCooldown = 0;
     private static final int PLACE_SCAN_NONE_COOLDOWN_TICKS = 40;
 
+    // Manual (non-AutoBuild) mode is reach-only: it has none of AutoBuild's
+    // walk/cooldown-amnesty/stuck-cycle recovery, so if every nearby
+    // candidate is blocked (occlusion, missing frontier support, cooldown)
+    // the player gets zero feedback and can stand frozen for minutes with
+    // no indication anything is wrong (see fix49 stall log — placement sat
+    // stuck escalating "no visible hit" cooldowns up to 6000 ticks/5 min
+    // with the player never moving, silently, until manually stopped).
+    // Surface a one-time (then periodically repeated) chat notice instead.
+    private int manualNoCandidateTicks = 0;
+    private static final int MANUAL_STALL_NOTIFY_TICKS = 200; // 10s
+    private static final int MANUAL_STALL_RENOTIFY_TICKS = 1200; // 60s
+
     /*? if >=26.1 {*//*
     private boolean tryPlaceNextBlock(LocalPlayer player, Level world) {
     *//*?} else {*/
@@ -12113,7 +12850,9 @@ public class SchematicPrinter {
         }
 
         if (candidates.isEmpty() && !fallbackCandidates.isEmpty() && !autoBuild) {
-            // Manual mode places reachable relaxed candidates.
+            // Manual mode: reach only. The relaxed stance/occlusion gating and
+            // walk/cooldown recovery are AutoBuild-only. Place whatever the
+            // player can physically reach from where they are standing.
             candidates.addAll(fallbackCandidates);
         }
         if (candidates.isEmpty() && !fallbackCandidates.isEmpty()) {
@@ -12210,10 +12949,50 @@ public class SchematicPrinter {
                 PacketTelemetry.mark("build local pocket complete zone="
                         + posLabel(completedZone)
                         + " scanned=" + dbgTotal);
+            } else if (dbgTotal > 0 && dbgPlaced < dbgTotal && dbgNoAdj > 0
+                    && dbgOccluded == 0 && dbgTrap == 0
+                    && candidates.isEmpty() && fallbackCandidates.isEmpty()
+                    && lastWalkTargetZone != null) {
+                // All remaining unplaced blocks near the current stance are
+                // filtered out for lacking frontier support (their required
+                // neighbor hasn't been placed yet) — this pocket is
+                // temporarily blocked by build order, not finished. These
+                // candidates never reach fallbackCandidates, so they never
+                // get the walk-away treatment the "occluded local stance"
+                // path above gets; without this branch "idle bounce after
+                // unresolved work remains" just re-enters BUILDING at the
+                // same stance and rescans the identical dead end forever
+                // (observed: total=5 placed=1 noAdj=4 repeating unchanged
+                // for 10+ stuck cycles until the printer paused itself).
+                BlockPos blockedZone = lastWalkTargetZone;
+                rememberFailedBuildZone(blockedZone, 2);
+                recordBuildLayerAccessFailure(blockedZone, "local pocket blocked");
+                lastWalkTargetZone = null;
+                lastWalkStandPos = null;
+                lastWalkApproachPos = null;
+                walkAttemptCooldown = 0;
+                noProgressTicks = Math.max(noProgressTicks, NO_PROGRESS_WALK_RECHECK_TICKS - 1);
+                PacketTelemetry.mark("build local pocket blocked zone="
+                        + posLabel(blockedZone)
+                        + " scanned=" + dbgTotal
+                        + " placed=" + dbgPlaced
+                        + " noAdj=" + dbgNoAdj);
+            }
+            if (!autoBuild) {
+                manualNoCandidateTicks++;
+                if (statusMessages
+                        && (manualNoCandidateTicks == MANUAL_STALL_NOTIFY_TICKS
+                        || manualNoCandidateTicks % MANUAL_STALL_RENOTIFY_TICKS == 0)) {
+                    ChatHelper.info("§eNo placeable blocks reachable from here §7("
+                            + dbgCoolingDown + " cooling down, " + dbgNoAdj
+                            + " need support placed first, " + dbgOverlap
+                            + " blocked by your position)§e — try moving to a different spot.");
+                }
             }
             lastMissingItems.clear();
             return false;
         }
+        manualNoCandidateTicks = 0;
 
         Map<Item, Integer> hotbarInventory = PlacementEngine.getHotbarContents();
         Map<Item, Integer> fullInventory = PlacementEngine.getInventoryContentsCached();
@@ -12235,55 +13014,59 @@ public class SchematicPrinter {
         // adjacent support (tier 1: torches, flowers, rails, etc.).  This
         // ensures support structures are built before dependent blocks
         // are attempted, reducing wasted placement attempts.
-        Comparator<BlockPos> comparator;
-        if (sortMode == SortMode.BOTTOM_UP) {
-            comparator = Comparator.<BlockPos>comparingInt(BlockPos::getY)
-                .thenComparingInt(this::getBuildPlanRow)
-                .thenComparingInt(this::getBuildPlanColumnOrder)
-                .thenComparingInt((BlockPos p) -> {
-                        int sx2 = p.getX() - anchor.getX();
-                        int sy2 = p.getY() - anchor.getY();
-                        int sz2 = p.getZ() - anchor.getZ();
-                        return BlockDependency.getTier(schematic.getBlockState(sx2, sy2, sz2));
-                    })
-                .thenComparingInt(p -> -getConfirmedBuildAdjacencyScore(p, world))
-                .thenComparingInt(p -> getBuildItemPriority(p, heldBuildItem, hotbarInventory))
-                /*? if >=26.1 {*//*
-                .thenComparingDouble(p -> eyePos.distanceToSqr(Vec3.atCenterOf(p)));
-                *//*?} else {*/
-                .thenComparingDouble(p -> eyePos.squaredDistanceTo(Vec3d.ofCenter(p)));
-                /*?}*/
-        } else if (sortMode == SortMode.TOP_DOWN) {
-            comparator = Comparator.<BlockPos>comparingInt((BlockPos p) -> -p.getY())
-                .thenComparingInt((BlockPos p) -> {
-                        int sx2 = p.getX() - anchor.getX();
-                        int sy2 = p.getY() - anchor.getY();
-                        int sz2 = p.getZ() - anchor.getZ();
-                        return BlockDependency.getTier(schematic.getBlockState(sx2, sy2, sz2));
-                    })
-                .thenComparingInt(p -> -getConfirmedBuildAdjacencyScore(p, world))
-                .thenComparingInt(p -> getBuildItemPriority(p, heldBuildItem, hotbarInventory))
-                /*? if >=26.1 {*//*
-                .thenComparingDouble(p -> eyePos.distanceToSqr(Vec3.atCenterOf(p)));
-                *//*?} else {*/
-                .thenComparingDouble(p -> eyePos.squaredDistanceTo(Vec3d.ofCenter(p)));
-                /*?}*/
-        } else {
-            comparator = Comparator.<BlockPos>comparingInt((BlockPos p) -> {
-                        int sx2 = p.getX() - anchor.getX();
-                        int sy2 = p.getY() - anchor.getY();
-                        int sz2 = p.getZ() - anchor.getZ();
-                        return BlockDependency.getTier(schematic.getBlockState(sx2, sy2, sz2));
-                    })
-                .thenComparingInt(p -> -getConfirmedBuildAdjacencyScore(p, world))
-                .thenComparingInt(p -> getBuildItemPriority(p, heldBuildItem, hotbarInventory))
-                /*? if >=26.1 {*//*
-                .thenComparingDouble(p -> eyePos.distanceToSqr(Vec3.atCenterOf(p)));
-                *//*?} else {*/
-                .thenComparingDouble(p -> eyePos.squaredDistanceTo(Vec3d.ofCenter(p)));
-                /*?}*/
+        // Sort keys are precomputed once per candidate (decorate-sort-
+        // undecorate): the adjacency score alone costs up to 6 world
+        // lookups, and evaluating it inside the comparator repeated that
+        // work ~2·n·log(n) times per sort.
+        record CandidateSortKey(BlockPos pos, int row, int col, int tier,
+                                int negAdjacency, int itemPriority, double distSq) {}
+        List<CandidateSortKey> keyedCandidates = new ArrayList<>(candidates.size());
+        boolean planOrdered = sortMode == SortMode.BOTTOM_UP;
+        for (BlockPos p : candidates) {
+            int sx2 = p.getX() - anchor.getX();
+            int sy2 = p.getY() - anchor.getY();
+            int sz2 = p.getZ() - anchor.getZ();
+            keyedCandidates.add(new CandidateSortKey(
+                    p,
+                    planOrdered ? getBuildPlanRow(p) : 0,
+                    planOrdered ? getBuildPlanColumnOrder(p) : 0,
+                    BlockDependency.getTier(schematic.getBlockState(sx2, sy2, sz2)),
+                    -getConfirmedBuildAdjacencyScore(p, world),
+                    getBuildItemPriority(p, heldBuildItem, hotbarInventory),
+                    /*? if >=26.1 {*//*
+                    eyePos.distanceToSqr(Vec3.atCenterOf(p))
+                    *//*?} else {*/
+                    eyePos.squaredDistanceTo(Vec3d.ofCenter(p))
+                    /*?}*/
+            ));
         }
-        candidates.sort(comparator);
+
+        Comparator<CandidateSortKey> comparator;
+        if (sortMode == SortMode.BOTTOM_UP) {
+            comparator = Comparator.<CandidateSortKey>comparingInt(k -> k.pos().getY())
+                .thenComparingInt(CandidateSortKey::row)
+                .thenComparingInt(CandidateSortKey::col)
+                .thenComparingInt(CandidateSortKey::tier)
+                .thenComparingInt(CandidateSortKey::negAdjacency)
+                .thenComparingInt(CandidateSortKey::itemPriority)
+                .thenComparingDouble(CandidateSortKey::distSq);
+        } else if (sortMode == SortMode.TOP_DOWN) {
+            comparator = Comparator.<CandidateSortKey>comparingInt(k -> -k.pos().getY())
+                .thenComparingInt(CandidateSortKey::tier)
+                .thenComparingInt(CandidateSortKey::negAdjacency)
+                .thenComparingInt(CandidateSortKey::itemPriority)
+                .thenComparingDouble(CandidateSortKey::distSq);
+        } else {
+            comparator = Comparator.comparingInt(CandidateSortKey::tier)
+                .thenComparingInt(CandidateSortKey::negAdjacency)
+                .thenComparingInt(CandidateSortKey::itemPriority)
+                .thenComparingDouble(CandidateSortKey::distSq);
+        }
+        keyedCandidates.sort(comparator);
+        candidates.clear();
+        for (CandidateSortKey k : keyedCandidates) {
+            candidates.add(k.pos());
+        }
 
         Set<Item> missing = new HashSet<>();
         Set<Item> deferredInventorySwapItems = new HashSet<>();
@@ -12653,7 +13436,7 @@ public class SchematicPrinter {
         // of whether the schematic happens to want a different block at
         // that position. Previously this method also required the live
         // block to match the schematic's expected state when the support
-        // Keep support checks anchored to the exact target.
+        // was inside the schematic footprint — that turned the hologram
         // into a click-reference rather than a goal description, and
         // rejected nearly every candidate (including natural terrain and
         // already-placed wrong-color blocks) as occluded. Cleared blocks

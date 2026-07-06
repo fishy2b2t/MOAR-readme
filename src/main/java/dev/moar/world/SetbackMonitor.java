@@ -9,54 +9,52 @@ import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.network.ClientPlayerEntity;
 /*?}*/
 
-/**
- * Backend-only setback detector. Subsystems call isCalm() before
- * sending placement/interaction packets to avoid stacking actions on
- * top of a server-issued teleport-back.
- *
- * Detection: sample player position each client tick; any single-tick
- * delta above SETBACK_THRESHOLD_BLOCKS is treated as a server teleport.
- * Normal walk/sprint stays well under the threshold.
- */
+// Backend-only setback detector. Subsystems call isCalm() before
+// sending placement/interaction packets to avoid stacking actions on
+// top of a server-issued teleport-back.
+//
+// Detection: sample player position each client tick; any single-tick
+// delta above SETBACK_THRESHOLD_BLOCKS is treated as a server teleport.
+// Normal walk/sprint stays well under the threshold.
 public final class SetbackMonitor {
 
-    /** Single-tick movement above this distance counts as a setback. */
+    // Single-tick movement above this distance counts as a setback.
     private static final double SETBACK_THRESHOLD_BLOCKS = 0.6;
 
-    /** Stable ticks required after the last setback before isCalm() returns true. */
+    // Stable ticks required after the last setback before isCalm() returns true.
     private static final int CALM_WINDOW_TICKS = 12;
 
-    /** Ring buffer length for recentSetbackCount(). */
+    // Ring buffer length for recentSetbackCount().
     private static final int HISTORY_SIZE = 64;
 
-    /** Movement below this per-tick delta counts as stationary. */
+    // Movement below this per-tick delta counts as stationary.
     private static final double STATIONARY_DELTA_BLOCKS = 0.025;
 
     private boolean primed;
     private double lastX, lastY, lastZ;
 
-    /** Ticks elapsed since the last detected setback (capped at CALM_WINDOW_TICKS). */
+    // Ticks elapsed since the last detected setback (capped at CALM_WINDOW_TICKS).
     private int ticksSinceSetback = CALM_WINDOW_TICKS;
 
-    /** Consecutive low-movement ticks. */
+    // Consecutive low-movement ticks.
     private int stationaryTicks;
 
-    /** Total setbacks observed since join. */
+    // Total setbacks observed since join.
     private int totalSetbacks;
 
-    /** Tick timestamps of recent setbacks (newest first), capped to HISTORY_SIZE. */
+    // Tick timestamps of recent setbacks (newest first), capped to HISTORY_SIZE.
     private final long[] setbackTicks = new long[HISTORY_SIZE];
     private int historyHead;
     private long currentTick;
 
-    /** Singleton — there's only one local player. */
+    // Singleton — there's only one local player.
     private static final SetbackMonitor INSTANCE = new SetbackMonitor();
 
     public static SetbackMonitor get() { return INSTANCE; }
 
     private SetbackMonitor() {}
 
-    /** Call once per client tick (END_CLIENT_TICK). Safe when no player is loaded. */
+    // Call once per client tick (END_CLIENT_TICK). Safe when no player is loaded.
     /*? if >=26.1 {*//*
     public void tick(Minecraft mc) {
     *//*?} else {*/
@@ -104,18 +102,18 @@ public final class SetbackMonitor {
         }
     }
 
-    /** True when no setback has occurred in the last CALM_WINDOW_TICKS ticks. */
+    // True when no setback has occurred in the last CALM_WINDOW_TICKS ticks.
     public boolean isCalm() {
         return ticksSinceSetback >= CALM_WINDOW_TICKS;
     }
 
-    /** Ticks elapsed since the most recent setback (capped at CALM_WINDOW_TICKS). */
+    // Ticks elapsed since the most recent setback (capped at CALM_WINDOW_TICKS).
     public int ticksSinceSetback() { return ticksSinceSetback; }
 
-    /** Total setbacks observed this session. */
+    // Total setbacks observed this session.
     public int totalSetbacks() { return totalSetbacks; }
 
-    /** Setbacks within the last windowTicks client ticks. */
+    // Setbacks within the last windowTicks client ticks.
     public int recentSetbackCount(int windowTicks) {
         if (windowTicks <= 0) return 0;
         long cutoff = currentTick - windowTicks;
@@ -126,13 +124,13 @@ public final class SetbackMonitor {
         return count;
     }
 
-    /** True when movement has stayed below STATIONARY_DELTA_BLOCKS for minTicks. */
+    // True when movement has stayed below STATIONARY_DELTA_BLOCKS for minTicks.
     public boolean isStationaryFor(int minTicks) {
         if (minTicks <= 0) return true;
         return stationaryTicks >= minTicks;
     }
 
-    /** Reset state. Call on disconnect/world unload to clear baseline. */
+    // Reset state. Call on disconnect/world unload to clear baseline.
     public void reset() {
         primed = false;
         ticksSinceSetback = CALM_WINDOW_TICKS;

@@ -77,7 +77,7 @@ public final class PrinterResourceManager {
         return MoarMod.getChestManager().supplyChestCount();
     }
 
-    /** How few items trigger a restock run. */
+    // How few items trigger a restock run.
     public static final int MIN_SUPPLY_ITEMS = 16;
 
     public static BlockPos findBestSupplyChest(
@@ -89,7 +89,7 @@ public final class PrinterResourceManager {
         return MoarMod.getChestManager().findBestChest(from, neededItemIds);
     }
 
-    /** Load all persisted data from the SQLite database. */
+    // Load all persisted data from the SQLite database.
     public static void load() {
         // Open the shared database first — all modules read from it
         MoarMod.getDatabase().open();
@@ -104,14 +104,14 @@ public final class PrinterResourceManager {
         MoarMod.getSpawnProofer().loadConfig();
     }
 
-    /** Save supply-chest positions to the database. */
+    // Save supply-chest positions to the database.
     public static void save() {
         MoarMod.getChestManager().saveSupplyChests();
     }
 
     // materials analysis
 
-    /** Compute materials analysis: needed, placed, missing. */
+    // Compute materials analysis: needed, placed, missing.
     public static MaterialsReport analyzeMaterials(
             LitematicaSchematic schematic,
             BlockPos anchor,
@@ -317,7 +317,7 @@ public final class PrinterResourceManager {
             return stillNeeded.values().stream().mapToInt(Integer::intValue).sum();
         }
 
-        /** Prettified item ID: "minecraft:oak_planks" → "Oak Planks" */
+        // Prettified item ID: "minecraft:oak_planks" → "Oak Planks"
         public static String prettyName(String itemId) {
             String path = itemId.contains(":") ? itemId.split(":", 2)[1] : itemId;
             String[] parts = path.split("_");
@@ -335,10 +335,8 @@ public final class PrinterResourceManager {
 
     // fluid helpers
 
-    /**
-     * Returns the bucket item needed to place the given fluid block,
-     * or null if the block is not a supported fluid.
-     */
+    // Returns the bucket item needed to place the given fluid block,
+    // or null if the block is not a supported fluid.
     private static Item fluidBucketItem(BlockState state) {
         if (state.getBlock() == Blocks.WATER) return Items.WATER_BUCKET;
         if (state.getBlock() == Blocks.LAVA) return Items.LAVA_BUCKET;

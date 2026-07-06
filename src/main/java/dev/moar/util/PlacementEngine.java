@@ -80,8 +80,8 @@ import net.minecraft.world.level.block.state.properties.BlockStateProperties;
 import net.minecraft.state.property.Properties;
 /*?}*/
 /*? if >=26.1 {*//*
-*//*?} else if >=1.21.5 {*/
-/*?} else {*/
+*//*?} else if >=1.21.5 {*//*
+*//*?} else {*/
 import net.minecraft.network.packet.c2s.play.ClientCommandC2SPacket;
 /*?}*/
 /*? if >=26.1 {*//*
@@ -166,9 +166,7 @@ import java.util.function.Predicate;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 
-/**
- * Core automation engine for block placement tasks.
- */
+// Core automation engine for block placement tasks.
 public final class PlacementEngine {
 
     private PlacementEngine() {}
@@ -213,6 +211,18 @@ public final class PlacementEngine {
     private static ItemSelectionKind pendingSelectionKind = ItemSelectionKind.NONE;
     private static ItemSelectionStep pendingSelectionStep = ItemSelectionStep.NONE;
     private static int        pendingSelectionSettleTicks;
+    // Fix #consistency: a hotbar-select that repeatedly fails VALIDATE (item
+    // selected doesn't match what the inventory read-back shows) used to
+    // silently re-stage the exact same slot forever — observed as dozens of
+    // "select hotbar slot=N" marks per second with no place ever happening,
+    // until the user manually stopped the printer. After a short streak of
+    // failures for the same item, back off so selectItem() reports FAILED
+    // and the normal placement-failure/cooldown path takes over instead.
+    private static Item       failedHotbarSelectItem;
+    private static int        failedHotbarSelectStreak;
+    private static long       failedHotbarSelectCooldownUntilTick = Long.MIN_VALUE;
+    private static final int  MAX_HOTBAR_SELECT_VALIDATE_FAILURES = 3;
+    private static final int  HOTBAR_SELECT_VALIDATE_FAILURE_COOLDOWN_TICKS = 100;
     private static final int  HOTBAR_SELECT_SETTLE_TICKS = 2;
     private static final int  HOTBAR_SELECT_PACKET_SETTLE_TICKS = 3;
     private static final int  PRE_PLACE_LOOK_SYNC_TICKS = 1;
@@ -230,7 +240,7 @@ public final class PlacementEngine {
     // Tolerance subtracted from block_interaction_range when computing reach;
     // absorbs minor client/server eye desync. Stationary printer needs little.
     private static final double REACH_AC_SAFETY_MARGIN = 0.15;
-    /** Sane upper bound that prevents runaway in case of a misconfigured attribute. */
+    // Sane upper bound that prevents runaway in case of a misconfigured attribute.
     private static final double REACH_HARD_CEILING = 6.0;
     private static final double PLACEMENT_ENTITY_MARGIN = 0.20;
     private static final Direction[] NORMAL_PLACE_FACE_ORDER = {
@@ -249,9 +259,9 @@ public final class PlacementEngine {
     };
 
     // self-correction state
-    /** Position of a block that was placed with wrong orientation. */
+    // Position of a block that was placed with wrong orientation.
     private static BlockPos   correctionTarget;
-    /** The desired state for a correction re-place. */
+    // The desired state for a correction re-place.
     private static BlockState correctionDesired;
     private static int        breakingTicks;
     private static final int  MAX_BREAKING_TICKS = 200;
@@ -308,8 +318,7 @@ public final class PlacementEngine {
     private static final double TICKS_PER_SECOND = 20.0;
     private static final double MAX_PLACE_CREDITS = 1.0;
 
-    /** Per-block cadence floor -- the minimum gap (in ns) between any two
-     *  consecutive placements. Derived from the user-facing BPS setting. */
+    // Minimum gap (ns) between consecutive placements, derived from the BPS setting.
     private static int    bps               = 19;
     private static long   lastPlacementTick = Long.MIN_VALUE;
     private static long   throttleTick      = Long.MIN_VALUE;
@@ -365,15 +374,25 @@ public final class PlacementEngine {
     // AutoBuild if the timeout streak includes swap-dependent placements.
     private static final int TIMEOUT_SUSPEND_THRESHOLD = 2;
     private static final int TIMEOUT_DISABLE_THRESHOLD = 8;
+    // Fix #51: swapsSuspended previously never cleared itself once tripped —
+    // only a full manual build restart (resetPlacementState) reset it. A
+    // transient 2-timeout blip (e.g. brief server lag) would then permanently
+    // disable all swap-dependent placements for the rest of the session, with
+    // the printer silently reporting "suspended" every tick and making zero
+    // progress on any block needing a different held item. Give the breaker a
+    // recovery window instead: once no further timeouts occur for this many
+    // ticks, auto-clear the suspension and let swap-dependent placements resume.
+    private static final int SWAPS_SUSPENDED_RECOVERY_TICKS = 1200;
     private static int consecutiveSwapTimeouts = 0;
     private static int consecutiveTimeouts = 0;
     private static boolean swapsSuspended = false;
     private static boolean swapsSuspendedNoticePending = false;
+    private static boolean swapsResumedNoticePending = false;
+    private static int swapsSuspendedRecoveryTicks = 0;
     private static boolean autoBuildKillSwitch = false;
     private static boolean autoBuildKillSwitchNoticePending = false;
-    /** Set true while an INVENTORY_SWAP-staged placement is in flight, so that the
-     *  resulting verification entry can record whether the placement depended on a
-     *  recent inventory swap. Cleared as soon as the verification entry is enqueued. */
+    // True while an INVENTORY_SWAP-staged placement is in flight, so the
+    // verification entry can record swap dependency; cleared once enqueued.
     private static boolean placementUsedInventorySwap = false;
     private static int postPlaceSettleTicks = 0;
     private static String lastSequenceFailure = "not-started";
@@ -407,7 +426,17 @@ public final class PlacementEngine {
         VANILLA
     }
     private static final ArrayDeque<PendingVerification> verifyQueue = new ArrayDeque<>();
-    private static final Map<BlockPos, VerificationSnapshot> verificationStates = new HashMap<>();
+    // Perf: bounded — statuses are only queried shortly after placement, but a
+    // long session over a large schematic previously accumulated one entry per
+    // block placed. Insertion-ordered eviction drops the stalest entries first
+    // (evicted entries simply read back as VerificationStatus.NONE).
+    private static final int MAX_VERIFICATION_STATES = 2048;
+    private static final Map<BlockPos, VerificationSnapshot> verificationStates =
+            new LinkedHashMap<>(256, 0.75f, false) {
+        @Override protected boolean removeEldestEntry(Map.Entry<BlockPos, VerificationSnapshot> eldest) {
+            return size() > MAX_VERIFICATION_STATES;
+        }
+    };
 
     // Post-timeout watch list: after marking a placement TIMEOUT, keep checking
     // the position for LATE_WATCH_TICKS in case the ack arrived after the window.
@@ -428,37 +457,38 @@ public final class PlacementEngine {
         }
     };
 
-    /** Number of consecutive placements that failed confirmation. */
+    // Number of consecutive placements that failed confirmation.
     public static int getConsecutiveFailures() { return consecutiveFailures; }
-    /** Total placements that timed out since last reset. */
+    // Total placements that timed out since last reset.
     public static int getTotalTimeouts() { return totalTimeouts; }
-    /** Number of consecutive placements that were rejected by the server. */
+    // Number of consecutive placements that were rejected by the server.
     public static int getConsecutiveRejections() { return consecutiveRejections; }
-    /** Total placements rejected since last reset. */
+    // Total placements rejected since last reset.
     public static int getTotalRejections() { return totalRejections; }
-    /** True when the inventory-swap circuit breaker has tripped for this session. */
+    // True when the inventory-swap circuit breaker has tripped for this session.
     public static boolean areSwapsSuspended() { return swapsSuspended; }
-    /** Returns true exactly once after the swap circuit breaker trips, so callers can
-     *  emit a chat notice without spamming. */
+    // Returns true exactly once after the swap breaker trips (for a one-shot chat notice).
     public static boolean consumeSwapsSuspendedNotice() {
         if (!swapsSuspendedNoticePending) return false;
         swapsSuspendedNoticePending = false;
         return true;
     }
-    /** True when the AutoBuild kill switch has tripped for this session. The printer
-     *  uses this as a signal to disable AutoBuild entirely after the server has stopped
-     *  acknowledging placements. */
+    // Returns true exactly once after the swap breaker auto-clears (for a one-shot chat notice).
+    public static boolean consumeSwapsResumedNotice() {
+        if (!swapsResumedNoticePending) return false;
+        swapsResumedNoticePending = false;
+        return true;
+    }
+    // True once the AutoBuild kill switch has tripped (server stopped acking placements).
     public static boolean isAutoBuildKillSwitchTripped() { return autoBuildKillSwitch; }
-    /** Returns true exactly once after the AutoBuild kill switch trips. */
+    // Returns true exactly once after the AutoBuild kill switch trips.
     public static boolean consumeAutoBuildKillSwitchNotice() {
         if (!autoBuildKillSwitchNoticePending) return false;
         autoBuildKillSwitchNoticePending = false;
         return true;
     }
-    /** Fix #18c: adaptive single-shot drain bonus. Returns extra recovery pause
-     *  ticks the printer should add to the standard timeout pause, scaling with
-     *  consecutive timeouts so the server has more time to drain its packet
-     *  queue before we resume. Returns 0 in the steady state, capped at 12 ticks. */
+    // Extra recovery-pause ticks added to the standard timeout pause, scaling
+    // with consecutive timeouts (capped at 12; 0 in the steady state).
     public static int getDrainPauseTicks() {
         if (consecutiveTimeouts <= 0) return 0;
         return Math.min(12, consecutiveTimeouts * 4);
@@ -484,14 +514,14 @@ public final class PlacementEngine {
         lastVerificationSupportPos = null;
     }
 
-    /** Fully clear the session-sticky breaker state. Called from the printer when
-     *  the user toggles AutoBuild off/on, so a fresh build session can attempt
-     *  inventory swaps and packet placements normally. */
+    // Clears session-sticky breaker state; called when the user toggles AutoBuild off/on.
     public static void clearSessionBreakerState() {
         consecutiveSwapTimeouts = 0;
         consecutiveTimeouts = 0;
         swapsSuspended = false;
         swapsSuspendedNoticePending = false;
+        swapsResumedNoticePending = false;
+        swapsSuspendedRecoveryTicks = 0;
         autoBuildKillSwitch = false;
         autoBuildKillSwitchNoticePending = false;
         // Fix #20: late-watch entries from a prior session are no longer
@@ -518,7 +548,7 @@ public final class PlacementEngine {
         verificationStates.remove(pos);
     }
 
-    /** True while a placement at this pos is still awaiting server confirmation. */
+    // True while a placement at this pos is still awaiting server confirmation.
     public static boolean isPlacementVerificationUnstable(BlockPos pos, BlockState expected) {
         if (pos == null) return false;
         VerificationSnapshot snapshot = verificationStates.get(pos);
@@ -570,7 +600,7 @@ public final class PlacementEngine {
         return player != null && target != null && playerTooCloseToPlacement(player, target);
     }
 
-    /** Tick the verification queue. Call once per game tick. */
+    // Tick the verification queue. Call once per game tick.
     public static void tickVerification() {
         /*? if >=26.1 {*//*
         Minecraft mc = Minecraft.getInstance();
@@ -585,6 +615,17 @@ public final class PlacementEngine {
         if (inventorySwapSettleTicks > 0) inventorySwapSettleTicks--;
         if (itemVarietyCooldownTicks > 0) itemVarietyCooldownTicks--;
         if (postPlaceSettleTicks > 0) postPlaceSettleTicks--;
+        if (swapsSuspended) {
+            if (swapsSuspendedRecoveryTicks > 0) {
+                swapsSuspendedRecoveryTicks--;
+            } else {
+                swapsSuspended = false;
+                swapsResumedNoticePending = true;
+                consecutiveTimeouts = 0;
+                consecutiveSwapTimeouts = 0;
+                PacketTelemetry.mark("breaker swaps-resumed after stable recovery window");
+            }
+        }
         /*? if >=26.1 {*//*
         long currentTick = mc.level.getGameTime();
         *//*?} else {*/
@@ -674,10 +715,15 @@ public final class PlacementEngine {
                         && consecutiveTimeouts >= TIMEOUT_SUSPEND_THRESHOLD) {
                     swapsSuspended = true;
                     swapsSuspendedNoticePending = true;
+                    swapsSuspendedRecoveryTicks = SWAPS_SUSPENDED_RECOVERY_TICKS;
                     PacketTelemetry.mark("breaker swaps-suspended"
                             + " consecutiveTimeouts=" + consecutiveTimeouts
                             + " consecutiveSwapTimeouts=" + consecutiveSwapTimeouts
                             + " threshold=" + TIMEOUT_SUSPEND_THRESHOLD);
+                } else if (swapsSuspended) {
+                    // Still unhealthy — a fresh timeout arrived during the
+                    // recovery window, so push the auto-clear back out.
+                    swapsSuspendedRecoveryTicks = SWAPS_SUSPENDED_RECOVERY_TICKS;
                 }
                 if (!autoBuildKillSwitch
                         && consecutiveSwapTimeouts > 0
@@ -807,7 +853,7 @@ public final class PlacementEngine {
         }
     }
 
-    /** True if a vanilla retry is queued for this pos (non-consuming). */
+    // True if a vanilla retry is queued for this pos (non-consuming).
     public static boolean hasScheduledVanillaRetry(BlockPos pos) {
         return pos != null && vanillaRetryTargets.getOrDefault(immutablePos(pos), 0) > 0;
     }
@@ -908,10 +954,9 @@ public final class PlacementEngine {
         return false;
     }
 
-    /** Enqueue a placement candidate to be sent after the current in-flight ACK.
-     *  Returns true if successfully enqueued (caller may treat this like a successful
-     *  placeBlock() in terms of scan-loop flow — i.e. stop looking for more candidates
-     *  for this tick unless the queue still has room). */
+    // Enqueue a placement candidate to send after the current in-flight ACK.
+    // Returns true if enqueued (caller can treat this like a successful
+    // placeBlock() and stop looking for more candidates this tick).
     private static boolean tryEnqueuePlacement(BlockPos target, BlockState desired,
                                                boolean allowSwap,
                                                java.util.function.Predicate<BlockPos> supportFilter) {
@@ -936,13 +981,15 @@ public final class PlacementEngine {
         return true;
     }
 
-    /** Drain one entry from the placement queue when the verification window is clear.
-     *  Called at the top of tick() every game tick so the queue advances as fast as
-     *  the server ACK cadence allows. */
+    // Drain one entry from the placement queue when the verification window is clear.
+    // Called every tick so the queue advances as fast as the server ACK cadence allows.
     public static void tickPlacementQueue() {
         if (placementQueue.isEmpty()) return;
         if (phase != PlacePhase.IDLE) return;
-        if (!verifyQueue.isEmpty()) return;           // wait for in-flight ACK
+        // Wait for the in-flight window to have room (see placeBlock()); this
+        // still serializes to 1 whenever maxInflightPlacementVerifications()
+        // has collapsed due to recent failures/rejections/unsafe conditions.
+        if (verifyQueue.size() >= maxInflightPlacementVerifications()) return;
         if (postPlaceSettleTicks > 0
                 || inventorySwapSettleTicks > 0
                 || itemVarietyCooldownTicks > 0) return;
@@ -1071,6 +1118,9 @@ public final class PlacementEngine {
         resetRejectionCounters();
         recentAcceptedSupports.clear();
         placementQueue.clear();
+        failedHotbarSelectItem = null;
+        failedHotbarSelectStreak = 0;
+        failedHotbarSelectCooldownUntilTick = Long.MIN_VALUE;
     }
 
     private static void clearPendingSelectionState() {
@@ -1094,7 +1144,7 @@ public final class PlacementEngine {
     private static Map<Item, Integer> cachedInventory = Map.of();
     private static long cachedInventoryTick = -1;
 
-    /** Cached inventory (invalidated once per tick). */
+    // Cached inventory (invalidated once per tick).
     public static Map<Item, Integer> getInventoryContentsCached() {
         /*? if >=26.1 {*//*
         Minecraft mc = Minecraft.getInstance();
@@ -1118,7 +1168,7 @@ public final class PlacementEngine {
         return cachedInventory;
     }
 
-    /** Tick the placement state machine. Returns true when a block was placed. */
+    // Tick the placement state machine. Returns true when a block was placed.
     public static boolean tick() {
         tickPlacementQueue();
         return switch (phase) {
@@ -1200,14 +1250,37 @@ public final class PlacementEngine {
         }
 
         if (getSelectedItem(player) != pendingItem) {
+            if (pendingSelectionKind == ItemSelectionKind.HOTBAR_SELECT) {
+                recordHotbarSelectValidationFailure(pendingItem);
+            }
             failPendingSelection();
             return false;
         }
 
+        if (pendingItem == failedHotbarSelectItem) {
+            failedHotbarSelectStreak = 0;
+        }
         clearPendingSelectionState();
         rotateTicks = 0;
         phase = PlacePhase.ROTATING;
         return false;
+    }
+
+    private static void recordHotbarSelectValidationFailure(Item item) {
+        if (item == failedHotbarSelectItem) {
+            failedHotbarSelectStreak++;
+        } else {
+            failedHotbarSelectItem = item;
+            failedHotbarSelectStreak = 1;
+        }
+        if (failedHotbarSelectStreak >= MAX_HOTBAR_SELECT_VALIDATE_FAILURES) {
+            failedHotbarSelectCooldownUntilTick =
+                    getCurrentWorldTick() + HOTBAR_SELECT_VALIDATE_FAILURE_COOLDOWN_TICKS;
+            PacketTelemetry.mark("select hotbar validate-fail cooldown item=" + item
+                    + " streak=" + failedHotbarSelectStreak
+                    + " ticks=" + HOTBAR_SELECT_VALIDATE_FAILURE_COOLDOWN_TICKS);
+            failedHotbarSelectStreak = 0;
+        }
     }
 
     /*? if >=26.1 {*//*
@@ -2057,9 +2130,13 @@ public final class PlacementEngine {
         /*?}*/
         if (phase != PlacePhase.IDLE) return false;
 
-        // Queue this placement for later when a placement is already in-flight.
+        // Queue this placement for later once the in-flight verification window
+        // (maxInflightPlacementVerifications(), normally 4) is full. The window
+        // collapses to 1 automatically on any consecutive failure/rejection/unsafe
+        // condition (see maxInflightPlacementVerifications()), so pipelining only
+        // runs deeper than 1 while placements are actually landing cleanly.
         // The queue is drained by tickPlacementQueue() as each server ACK arrives.
-        if (!verifyQueue.isEmpty()) {
+        if (verifyQueue.size() >= maxInflightPlacementVerifications()) {
             return tryEnqueuePlacement(target, desired, allowSwap, supportFilter);
         }
 
@@ -2435,7 +2512,7 @@ public final class PlacementEngine {
     }
     /*?}*/
 
-    /** Squared form of effectivePlaceReach for distance comparisons. */
+    // Squared form of effectivePlaceReach for distance comparisons.
     /*? if >=26.1 {*//*
     private static double effectivePlaceReachSq(LocalPlayer player) {
     *//*?} else {*/
@@ -2657,9 +2734,7 @@ public final class PlacementEngine {
         return delta.z > 0 ? Direction.SOUTH : Direction.NORTH;
     }
 
-    /**
-     * Break the misplaced block for re-placement.
-     */
+    // Break the misplaced block for re-placement.
     private static boolean startCorrection(BlockPos target, BlockState desired,
                                            /*? if >=26.1 {*//*
                                            LocalPlayer player,
@@ -2745,7 +2820,7 @@ public final class PlacementEngine {
         return true;
     }
 
-    /** Computes a hit position on the given face via ray cast, falling back to face center. */
+    // Computes a hit position on the given face via ray cast, falling back to face center.
     /*? if >=26.1 {*//*
     private static Vec3 getFaceCenterHit(BlockPos neighbor, Direction face) {
         return Vec3.atCenterOf(neighbor)
@@ -2758,7 +2833,7 @@ public final class PlacementEngine {
     }
     /*?}*/
 
-    /** Computes a hit position on the given face via ray cast, falling back to face center. */
+    // Computes a hit position on the given face via ray cast, falling back to face center.
     /*? if >=26.1 {*//*
     private static Vec3 computeRayFaceHit(Vec3 eyePos, float yaw, float pitch,
     *//*?} else {*/
@@ -2858,10 +2933,8 @@ public final class PlacementEngine {
         /*?}*/
     }
 
-    /**
-     * Clamps a coordinate to the 0–1 range of the block, but fixes it to
-     * the face boundary for the axis matching the face direction.
-     */
+    // Clamps a coordinate to the 0–1 range of the block, but fixes it to
+    // the face boundary for the axis matching the face direction.
     private static double clampToFace(double value, int blockOrigin, Direction face, Direction.Axis axis) {
         double min = blockOrigin;
         double max = blockOrigin + 1.0;
@@ -3254,7 +3327,7 @@ public final class PlacementEngine {
         return null;
     }
 
-    /** Sends a look packet without modifying client-side rotation. */
+    // Sends a look packet without modifying client-side rotation.
     /*? if >=26.1 {*//*
     private static void sendSilentLookPacket(LocalPlayer player, float yaw, float pitch) {
     *//*?} else {*/
@@ -3300,7 +3373,7 @@ public final class PlacementEngine {
     }
     /*?}*/
 
-    /** Sets entity yaw/pitch and sends a matching look packet. */
+    // Sets entity yaw/pitch and sends a matching look packet.
     /*? if >=26.1 {*//*
     public static void sendLookPacket(LocalPlayer player, float yaw, float pitch) {
     *//*?} else {*/
@@ -3363,7 +3436,7 @@ public final class PlacementEngine {
         /*?}*/
     }
 
-    /** Forces sneak on for placement; returns a Runnable that restores it. */
+    // Forces sneak on for placement; returns a Runnable that restores it.
     /*? if >=26.1 {*//*
     public static Runnable ensureSneakForPlacement(LocalPlayer player) {
     *//*?} else {*/
@@ -3392,7 +3465,7 @@ public final class PlacementEngine {
         };
     }
 
-    /** Releases sneak for interaction; returns a Runnable that restores it. */
+    // Releases sneak for interaction; returns a Runnable that restores it.
     /*? if >=26.1 {*//*
     public static Runnable releaseForInteraction(LocalPlayer player) {
     *//*?} else {*/
@@ -3451,7 +3524,7 @@ public final class PlacementEngine {
     }
     /*?}*/
 
-    /** Restores local camera aim without sending extra restore packets. */
+    // Restores local camera aim without sending extra restore packets.
     /*? if >=26.1 {*//*
     private static void restoreLook(LocalPlayer player) {
     *//*?} else {*/
@@ -3490,13 +3563,16 @@ public final class PlacementEngine {
 
     // inventory helpers
 
-    /** Selects the required item in the hotbar (or swaps from inventory). */
+    // Selects the required item in the hotbar (or swaps from inventory).
     /*? if >=26.1 {*//*
     public static ItemSelectionResult selectItem(LocalPlayer player, Minecraft mc,
     *//*?} else {*/
     public static ItemSelectionResult selectItem(ClientPlayerEntity player, MinecraftClient mc,
     /*?}*/
                                      Item item, boolean allowSwap) {
+        if (item == failedHotbarSelectItem && getCurrentWorldTick() < failedHotbarSelectCooldownUntilTick) {
+            return ItemSelectionResult.FAILED;
+        }
         /*? if >=26.1 {*//*
         Inventory inv = player.getInventory();
         *//*?} else {*/
@@ -3758,7 +3834,7 @@ public final class PlacementEngine {
     }
     /*?}*/
 
-    /** Selects the best tool for breaking the given block. */
+    // Selects the best tool for breaking the given block.
     /*? if >=26.1 {*//*
     public static void selectBestTool(LocalPlayer player, Minecraft mc,
     *//*?} else {*/
@@ -3812,7 +3888,7 @@ public final class PlacementEngine {
         }
     }
 
-    /** Snapshot of all items in the player's inventory (Item → total count). */
+    // Snapshot of all items in the player's inventory (Item → total count).
     public static Map<Item, Integer> getInventoryContents() {
         /*? if >=26.1 {*//*
         Minecraft mc = Minecraft.getInstance();
@@ -3887,7 +3963,7 @@ public final class PlacementEngine {
         return contents;
     }
 
-    /** Returns the yaw needed to produce the desired FACING, or null. */
+    // Returns the yaw needed to produce the desired FACING, or null.
     private static Float getRequiredYaw(BlockState desired) {
         Block block = desired.getBlock();
 
@@ -4145,7 +4221,7 @@ public final class PlacementEngine {
         return null;
     }
 
-    /** Returns the pitch needed for UP/DOWN facing blocks, or null. */
+    // Returns the pitch needed for UP/DOWN facing blocks, or null.
     private static Float getRequiredPitch(BlockState desired) {
         Block block = desired.getBlock();
 
@@ -4226,7 +4302,7 @@ public final class PlacementEngine {
         return null;
     }
 
-    /** Adjusts hit Y for correct slab/stair/trapdoor half placement. */
+    // Adjusts hit Y for correct slab/stair/trapdoor half placement.
     /*? if >=26.1 {*//*
     private static Vec3 adjustHitForHalf(Vec3 hitPos, BlockPos neighbor,
     *//*?} else {*/
@@ -4337,7 +4413,7 @@ public final class PlacementEngine {
         return hitPos;
     }
 
-    /** Forces hit Y to upper or lower quarter of the block face. */
+    // Forces hit Y to upper or lower quarter of the block face.
     /*? if >=26.1 {*//*
     private static Vec3 forceHitY(Vec3 hitPos, BlockPos neighbor, boolean upper) {
     *//*?} else {*/
@@ -4353,7 +4429,7 @@ public final class PlacementEngine {
         /*?}*/
     }
 
-    /** Adjusts hit X/Z to influence door hinge side. */
+    // Adjusts hit X/Z to influence door hinge side.
     /*? if >=26.1 {*//*
     private static Vec3 adjustHitForDoorHinge(Vec3 hitPos, BlockPos neighbor,
     *//*?} else {*/
@@ -4432,7 +4508,7 @@ public final class PlacementEngine {
         }
     }
 
-    /** Adjusts hit Y for air-placed half-blocks (TOP → Y+0.75). */
+    // Adjusts hit Y for air-placed half-blocks (TOP → Y+0.75).
     /*? if >=26.1 {*//*
     private static Vec3 adjustHitForAirPlace(Vec3 hitPos, BlockPos target,
     *//*?} else {*/
@@ -4509,7 +4585,7 @@ public final class PlacementEngine {
         return hitPos;
     }
 
-    /** Finds an adjacent face, with orientation awareness for wall/floor/ceiling blocks. */
+    // Finds an adjacent face, with orientation awareness for wall/floor/ceiling blocks.
     /*? if >=26.1 {*//*
     private static Direction findOrientedPlacementFace(Level world, BlockPos target,
     *//*?} else {*/
@@ -4785,7 +4861,7 @@ public final class PlacementEngine {
         return findPlacementFace(world, target);
     }
 
-    /** Returns dir if there's a solid support block in that direction, else null. */
+    // Returns dir if there's a solid support block in that direction, else null.
     /*? if >=26.1 {*//*
     private static Direction requireSolidFace(Level world, BlockPos target, Direction dir) {
     *//*?} else {*/
@@ -4812,7 +4888,7 @@ public final class PlacementEngine {
         return null; // required support block not present
     }
 
-    /** Resolves placement face for FLOOR/WALL/CEILING blocks (buttons, levers). */
+    // Resolves placement face for FLOOR/WALL/CEILING blocks (buttons, levers).
     /*? if >=26.1 {*//*
     private static Direction resolveWallMountedFace(Level world, BlockPos target,
     *//*?} else {*/
@@ -4852,7 +4928,7 @@ public final class PlacementEngine {
         return findPlacementFace(world, target);
     }
 
-    /** Finds a face along the desired axis for pillar block placement. */
+    // Finds a face along the desired axis for pillar block placement.
     /*? if >=26.1 {*//*
     private static Direction preferFaceForAxis(Level world, BlockPos target,
     *//*?} else {*/
@@ -5057,7 +5133,7 @@ public final class PlacementEngine {
         return false;
     }
 
-    /** Converts a cardinal Direction to player yaw in degrees. */
+    // Converts a cardinal Direction to player yaw in degrees.
     private static float directionToYaw(Direction dir) {
         return switch (dir) {
             case SOUTH -> 0.0f;
@@ -5068,7 +5144,7 @@ public final class PlacementEngine {
         };
     }
 
-    /** Computes pitch angle from eye to target. */
+    // Computes pitch angle from eye to target.
     /*? if >=26.1 {*//*
     private static float computePitchToward(Vec3 eye, Vec3 target) {
     *//*?} else {*/
@@ -5100,7 +5176,7 @@ public final class PlacementEngine {
         return wrapped;
     }
 
-    /** Wraps a yaw to [-180, 180) so unbounded accumulation never reaches the server. */
+    // Wraps a yaw to [-180, 180) so unbounded accumulation never reaches the server.
     private static float wrapDegrees180(float deg) {
         return ((deg % 360f) + 540f) % 360f - 180f;
     }
@@ -5123,7 +5199,7 @@ public final class PlacementEngine {
 
     // placement face finding
 
-    /** Finds the best adjacent solid face, preferring non-interactive neighbors. */
+    // Finds the best adjacent solid face, preferring non-interactive neighbors.
     /*? if >=26.1 {*//*
     public static Direction findPlacementFace(Level world, BlockPos target) {
     *//*?} else {*/
@@ -5157,7 +5233,7 @@ public final class PlacementEngine {
         return fallback;
     }
 
-    /** Finds a horizontal side face (no UP/DOWN) for half-block placement. */
+    // Finds a horizontal side face (no UP/DOWN) for half-block placement.
     /*? if >=26.1 {*//*
     private static Direction findSidePlacementFace(Level world, BlockPos target) {
     *//*?} else {*/
@@ -5189,7 +5265,7 @@ public final class PlacementEngine {
         return fallback;
     }
 
-    /** Finds a non-interactive adjacent face (for chests, etc). */
+    // Finds a non-interactive adjacent face (for chests, etc).
     /*? if >=26.1 {*//*
     private static Direction findNonInteractiveFace(Level world, BlockPos target) {
     *//*?} else {*/
@@ -5221,7 +5297,7 @@ public final class PlacementEngine {
         return interactive; // null if nothing solid adjacent
     }
 
-    /** Whether any adjacent block is solid (supports placement). */
+    // Whether any adjacent block is solid (supports placement).
     /*? if >=26.1 {*//*
     public static boolean hasAdjacentSolid(Level world, BlockPos pos) {
     *//*?} else {*/
@@ -5725,7 +5801,7 @@ public final class PlacementEngine {
 
     // interactive block detection
 
-    /** Set of block classes that open GUIs / handle interactions on right-click. */
+    // Set of block classes that open GUIs / handle interactions on right-click.
     private static final Set<Class<? extends Block>> INTERACTIVE = Set.of(
             AbstractChestBlock.class,
             AbstractFurnaceBlock.class,
@@ -5764,7 +5840,7 @@ public final class PlacementEngine {
             /*?}*/
     );
 
-    /** Returns true if right-clicking this block opens a GUI or toggles state. */
+    // Returns true if right-clicking this block opens a GUI or toggles state.
     public static boolean isInteractive(Block block) {
         for (Class<? extends Block> clazz : INTERACTIVE) {
             if (clazz.isInstance(block)) return true;
@@ -5772,10 +5848,8 @@ public final class PlacementEngine {
         return false;
     }
 
-    /**
-     * Temporarily forces the player into a sneaking state for block placement.
-     * Returns a Runnable that restores the original sneaking state.
-     */
+    // Temporarily forces the player into a sneaking state for block placement.
+    // Returns a Runnable that restores the original sneaking state.
     /*? if >=26.1 {*//*
     public static Runnable forceForPlacement(net.minecraft.client.player.LocalPlayer player) {
         boolean wasSneaking = player.isShiftKeyDown();

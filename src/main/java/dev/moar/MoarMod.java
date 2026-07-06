@@ -50,10 +50,8 @@ import org.lwjgl.glfw.GLFW;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-/**
- * MOAR — a standalone Fabric mod that automatically places
- * blocks from loaded .litematic schematics.
- */
+// MOAR — a standalone Fabric mod that automatically places
+// blocks from loaded .litematic schematics.
 public class MoarMod implements ClientModInitializer {
 
     public static final String MOD_ID = "moar";
@@ -223,52 +221,52 @@ public class MoarMod implements ClientModInitializer {
         LOGGER.info("MOAR initialized.");
     }
 
-    /** Get the singleton printer instance. */
+    // Get the singleton printer instance.
     public static SchematicPrinter getPrinter() {
         return PRINTER;
     }
 
-    /** Get the singleton queue manager instance. */
+    // Get the singleton queue manager instance.
     public static SchematicQueueManager getQueueManager() {
         return QUEUE_MANAGER;
     }
 
-    /** Get the singleton spawnproofer instance. */
+    // Get the singleton spawnproofer instance.
     public static SpawnProofer getSpawnProofer() {
         return SPAWN_PROOFER;
     }
 
-    /** Get the singleton chest manager instance. */
+    // Get the singleton chest manager instance.
     public static ChestManager getChestManager() {
         return CHEST_MANAGER;
     }
 
-    /** Get the singleton stash manager instance. */
+    // Get the singleton stash manager instance.
     public static StashManager getStashManager() {
         return STASH_MANAGER;
     }
 
-    /** Get the singleton lane manager instance. */
+    // Get the singleton lane manager instance.
     public static LaneManager getLaneManager() {
         return LANE_MANAGER;
     }
 
-    /** Get the shared SQLite database. */
+    // Get the shared SQLite database.
     public static StashDatabase getDatabase() {
         return DATABASE;
     }
 
-    /** Get the loaded API/webhook properties. */
+    // Get the loaded API/webhook properties.
     public static MoarProperties getProperties() {
         return PROPERTIES;
     }
 
-    /** Get the embedded API server. */
+    // Get the embedded API server.
     public static ApiServer getApiServer() {
         return API_SERVER;
     }
 
-    /** Open the MOAR GUI on the next client tick after chat/screens settle. */
+    // Open the MOAR GUI on the next client tick after chat/screens settle.
     public static void requestGuiOpen() {
         guiOpenRequested = true;
     }

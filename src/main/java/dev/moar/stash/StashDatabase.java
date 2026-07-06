@@ -33,7 +33,7 @@ public final class StashDatabase {
 
     // Lifecycle
 
-    /** Open (or create) the database and ensure tables exist. */
+    // Open (or create) the database and ensure tables exist.
     public void open() {
         close(); // release any existing connection first
         try {
@@ -50,7 +50,7 @@ public final class StashDatabase {
         }
     }
 
-    /** Close the database connection. */
+    // Close the database connection.
     public void close() {
         if (connection != null) {
             try {
@@ -273,7 +273,7 @@ public final class StashDatabase {
         connection.commit();
     }
 
-    /** Safely add the label column to an existing containers table. */
+    // Safely add the label column to an existing containers table.
     private void migrateAddLabel(Statement stmt) {
         try {
             stmt.executeUpdate("ALTER TABLE containers ADD COLUMN label TEXT DEFAULT NULL");
@@ -282,7 +282,7 @@ public final class StashDatabase {
         }
     }
 
-    /** Safely add the front_face column to lane_config for existing databases. */
+    // Safely add the front_face column to lane_config for existing databases.
     private void migrateAddLaneFrontFace(Statement stmt) {
         try {
             stmt.executeUpdate("ALTER TABLE lane_config ADD COLUMN front_face TEXT DEFAULT NULL");
@@ -293,7 +293,7 @@ public final class StashDatabase {
 
     // Region operations
 
-    /** Save a named region (upsert). */
+    // Save a named region (upsert).
     public void saveRegion(String name, BlockPos corner1, BlockPos corner2) {
         if (!isOpen()) return;
         try (PreparedStatement ps = connection.prepareStatement(
@@ -314,7 +314,7 @@ public final class StashDatabase {
         }
     }
 
-    /** Load a named region. Returns [corner1, corner2] or null if not found. */
+    // Load a named region. Returns [corner1, corner2] or null if not found.
     public BlockPos[] loadRegion(String name) {
         if (!isOpen()) return null;
         try (PreparedStatement ps = connection.prepareStatement(
@@ -333,7 +333,7 @@ public final class StashDatabase {
         return null;
     }
 
-    /** List all saved region names. */
+    // List all saved region names.
     public List<String> listRegions() {
         List<String> names = new ArrayList<>();
         if (!isOpen()) return names;
@@ -348,7 +348,7 @@ public final class StashDatabase {
         return names;
     }
 
-    /** Get all regions with their bounds. */
+    // Get all regions with their bounds.
     public Map<String, BlockPos[]> loadAllRegions() {
         Map<String, BlockPos[]> result = new LinkedHashMap<>();
         if (!isOpen()) return result;
@@ -365,7 +365,7 @@ public final class StashDatabase {
         return result;
     }
 
-    /** Delete a named region. Returns true if a row was deleted. */
+    // Delete a named region. Returns true if a row was deleted.
     public boolean deleteRegion(String name) {
         if (!isOpen()) return false;
         try (PreparedStatement ps = connection.prepareStatement(
@@ -383,7 +383,7 @@ public final class StashDatabase {
 
     // Label operations
 
-    /** Set the label for a container at the given position. */
+    // Set the label for a container at the given position.
     public void updateLabel(BlockPos pos, String label) {
         if (!isOpen()) return;
         try (PreparedStatement ps = connection.prepareStatement(
@@ -400,7 +400,7 @@ public final class StashDatabase {
         }
     }
 
-    /** Batch-update labels for multiple containers. */
+    // Batch-update labels for multiple containers.
     public void updateLabels(Map<BlockPos, String> labels) {
         if (!isOpen() || labels.isEmpty()) return;
         try (PreparedStatement ps = connection.prepareStatement(
@@ -420,7 +420,7 @@ public final class StashDatabase {
         }
     }
 
-    /** Get the label for a container. Returns null if not set. */
+    // Get the label for a container. Returns null if not set.
     public String getLabel(BlockPos pos) {
         if (!isOpen()) return null;
         try (PreparedStatement ps = connection.prepareStatement(
@@ -437,7 +437,7 @@ public final class StashDatabase {
         }
     }
 
-    /** Get all labels (position → label) for containers that have one. */
+    // Get all labels (position → label) for containers that have one.
     public Map<BlockPos, String> getAllLabels() {
         Map<BlockPos, String> result = new LinkedHashMap<>();
         if (!isOpen()) return result;
@@ -456,10 +456,8 @@ public final class StashDatabase {
 
     // Write operations
 
-    /**
-     * Save a single container entry (upsert). Replaces any existing data
-     * at the same position.
-     */
+    // Save a single container entry (upsert). Replaces any existing data
+    // at the same position.
     public void saveContainer(ContainerEntry entry) {
         if (!isOpen()) return;
         try {
@@ -472,10 +470,8 @@ public final class StashDatabase {
         }
     }
 
-    /**
-     * Batch-save the entire in-memory index to the database.
-     * Existing entries at the same positions are replaced.
-     */
+    // Batch-save the entire in-memory index to the database.
+    // Existing entries at the same positions are replaced.
     public void saveAll(Map<BlockPos, ContainerEntry> index) {
         if (!isOpen() || index.isEmpty()) return;
         try {
@@ -594,7 +590,7 @@ public final class StashDatabase {
         }
     }
 
-    /** Wipe stash container data from the database. */
+    // Wipe stash container data from the database.
     public void wipeAll() {
         if (!isOpen()) return;
         try (Statement stmt = connection.createStatement()) {
@@ -612,7 +608,7 @@ public final class StashDatabase {
 
     // ── Position-set tables (supply_chests, dump_chests, spawnproofer_supply) ──
 
-    /** Save a set of BlockPos to a named table (replaces all rows). */
+    // Save a set of BlockPos to a named table (replaces all rows).
     private void savePositionSet(String table, Collection<BlockPos> positions) {
         if (!isOpen()) return;
         try (Statement del = connection.createStatement()) {
@@ -634,7 +630,7 @@ public final class StashDatabase {
         }
     }
 
-    /** Load all BlockPos from a named table (insertion order preserved). */
+    // Load all BlockPos from a named table (insertion order preserved).
     private List<BlockPos> loadPositionSet(String table) {
         List<BlockPos> result = new ArrayList<>();
         if (!isOpen()) return result;
@@ -675,7 +671,7 @@ public final class StashDatabase {
 
     // Scaffold table
 
-    /** Replace all scaffold entries. */
+    // Replace all scaffold entries.
     public void saveScaffold(Map<BlockPos, String> scaffoldMap) {
         if (!isOpen()) return;
         try (Statement del = connection.createStatement()) {
@@ -698,7 +694,7 @@ public final class StashDatabase {
         }
     }
 
-    /** Load all scaffold entries from the database. */
+    // Load all scaffold entries from the database.
     public Map<BlockPos, String> loadScaffold() {
         Map<BlockPos, String> result = new LinkedHashMap<>();
         if (!isOpen()) return result;
@@ -717,7 +713,7 @@ public final class StashDatabase {
 
     // Config key-value table
 
-    /** Set a config value (upsert). */
+    // Set a config value (upsert).
     public void setConfig(String key, String value) {
         if (!isOpen()) return;
         try (PreparedStatement ps = connection.prepareStatement(
@@ -732,7 +728,7 @@ public final class StashDatabase {
         }
     }
 
-    /** Get a config value, or null if not set. */
+    // Get a config value, or null if not set.
     public String getConfig(String key) {
         if (!isOpen()) return null;
         try (PreparedStatement ps = connection.prepareStatement(
@@ -747,7 +743,7 @@ public final class StashDatabase {
         }
     }
 
-    /** Delete a config key. */
+    // Delete a config key.
     public void deleteConfig(String key) {
         if (!isOpen()) return;
         try (PreparedStatement ps = connection.prepareStatement(
@@ -763,10 +759,8 @@ public final class StashDatabase {
 
     // Storage chests (sorting config)
 
-    /**
-     * Save the full sorting configuration (storage chests, types, overflow).
-     * Replaces all rows in storage_chests.
-     */
+    // Save the full sorting configuration (storage chests, types, overflow).
+    // Replaces all rows in storage_chests.
     public void saveStorageChests(List<BlockPos> chests,
                                   Map<BlockPos, String> chestTypes,
                                   BlockPos overflowChest) {
@@ -794,13 +788,13 @@ public final class StashDatabase {
         }
     }
 
-    /** Result of loading storage chest config. */
+    // Result of loading storage chest config.
     public record StorageChestConfig(
             List<BlockPos> chests,
             Map<BlockPos, String> chestTypes,
             BlockPos overflowChest) {}
 
-    /** Load sorting configuration from the database. */
+    // Load sorting configuration from the database.
     public StorageChestConfig loadStorageChests() {
         List<BlockPos> chests = new ArrayList<>();
         Map<BlockPos, String> types = new LinkedHashMap<>();
@@ -824,7 +818,7 @@ public final class StashDatabase {
 
     // Keep items
 
-    /** Save the keep-items set (replaces all rows). */
+    // Save the keep-items set (replaces all rows).
     public void saveKeepItems(Collection<String> itemIds) {
         if (!isOpen()) return;
         try (Statement del = connection.createStatement()) {
@@ -844,7 +838,7 @@ public final class StashDatabase {
         }
     }
 
-    /** Load keep-item IDs from the database. */
+    // Load keep-item IDs from the database.
     public Set<String> loadKeepItems() {
         Set<String> result = new LinkedHashSet<>();
         if (!isOpen()) return result;
@@ -861,10 +855,8 @@ public final class StashDatabase {
 
     // Read operations
 
-    /**
-     * Load all container entries from the database into a map.
-     * Returns an empty map on error.
-     */
+    // Load all container entries from the database into a map.
+    // Returns an empty map on error.
     public Map<BlockPos, ContainerEntry> loadAll() {
         Map<BlockPos, ContainerEntry> result = new LinkedHashMap<>();
         if (!isOpen()) return result;
@@ -1083,7 +1075,7 @@ public final class StashDatabase {
         return result;
     }
 
-    /** Count total containers stored in the database. */
+    // Count total containers stored in the database.
     public int countContainers() {
         if (!isOpen()) return 0;
         try (Statement stmt = connection.createStatement();
@@ -1095,7 +1087,7 @@ public final class StashDatabase {
         }
     }
 
-    /** Count total unique item types stored in the database. */
+    // Count total unique item types stored in the database.
     public int countItemTypes() {
         if (!isOpen()) return 0;
         try (Statement stmt = connection.createStatement();
@@ -1107,7 +1099,7 @@ public final class StashDatabase {
         }
     }
 
-    /** Sum total item quantity across all containers. */
+    // Sum total item quantity across all containers.
     public int countTotalItems() {
         if (!isOpen()) return 0;
         try (Statement stmt = connection.createStatement();
@@ -1121,10 +1113,10 @@ public final class StashDatabase {
 
     // Kit operations
 
-    /** Maximum item slots in a kit (matches shulker box capacity). */
+    // Maximum item slots in a kit (matches shulker box capacity).
     public static final int KIT_MAX_SLOTS = 27;
 
-    /** Create a new empty kit. Returns false if the name already exists. */
+    // Create a new empty kit. Returns false if the name already exists.
     public boolean createKit(String name) {
         if (!isOpen()) return false;
         try (PreparedStatement ps = connection.prepareStatement(
@@ -1141,7 +1133,7 @@ public final class StashDatabase {
         }
     }
 
-    /** Delete a kit and all its items. */
+    // Delete a kit and all its items.
     public boolean deleteKit(String name) {
         if (!isOpen()) return false;
         try {
@@ -1164,7 +1156,7 @@ public final class StashDatabase {
         }
     }
 
-    /** Add or update an item in a kit. Returns false if the kit would exceed 27 slots. */
+    // Add or update an item in a kit. Returns false if the kit would exceed 27 slots.
     public boolean addKitItem(String kitName, String itemId, int quantity) {
         if (!isOpen()) return false;
         try {
@@ -1200,7 +1192,7 @@ public final class StashDatabase {
         }
     }
 
-    /** Remove an item from a kit. Returns false if the item wasn't in the kit. */
+    // Remove an item from a kit. Returns false if the item wasn't in the kit.
     public boolean removeKitItem(String kitName, String itemId) {
         if (!isOpen()) return false;
         try (PreparedStatement ps = connection.prepareStatement(
@@ -1217,7 +1209,7 @@ public final class StashDatabase {
         }
     }
 
-    /** Save a full kit from a snapshot (replaces all items). Truncates to 27 slots. */
+    // Save a full kit from a snapshot (replaces all items). Truncates to 27 slots.
     public boolean snapshotKit(String kitName, Map<String, Integer> items) {
         if (!isOpen()) return false;
         try {
@@ -1256,7 +1248,7 @@ public final class StashDatabase {
         }
     }
 
-    /** List all kit names. */
+    // List all kit names.
     public List<String> listKits() {
         List<String> names = new ArrayList<>();
         if (!isOpen()) return names;
@@ -1271,7 +1263,7 @@ public final class StashDatabase {
         return names;
     }
 
-    /** Check if a kit exists. */
+    // Check if a kit exists.
     public boolean kitExists(String name) {
         if (!isOpen()) return false;
         try (PreparedStatement ps = connection.prepareStatement(
@@ -1285,7 +1277,7 @@ public final class StashDatabase {
         }
     }
 
-    /** Load all items for a kit. Returns an ordered map of item_id -> quantity. */
+    // Load all items for a kit. Returns an ordered map of item_id -> quantity.
     public Map<String, Integer> loadKitItems(String kitName) {
         Map<String, Integer> items = new LinkedHashMap<>();
         if (!isOpen()) return items;
@@ -1303,7 +1295,7 @@ public final class StashDatabase {
         return items;
     }
 
-    /** Count unique item slots used in a kit. */
+    // Count unique item slots used in a kit.
     public int countKitSlots(String kitName) {
         if (!isOpen()) return 0;
         try (PreparedStatement ps = connection.prepareStatement(
@@ -1319,10 +1311,8 @@ public final class StashDatabase {
 
     // ── Storage Lane CRUD ──────────────────────────────────────────────────────
 
-    /**
-     * Persist a StorageLane (insert-only). Updates lane.id on success.
-     * Returns true on success.
-     */
+    // Persist a StorageLane (insert-only). Updates lane.id on success.
+    // Returns true on success.
     public boolean saveLane(StorageLane lane) {
         if (!isOpen()) return false;
         try {
@@ -1386,7 +1376,7 @@ public final class StashDatabase {
         }
     }
 
-    /** Update the item assignment for an existing lane. */
+    // Update the item assignment for an existing lane.
     public boolean updateLaneItem(int laneId, String itemId) {
         if (!isOpen()) return false;
         try (PreparedStatement ps = connection.prepareStatement(
@@ -1403,7 +1393,7 @@ public final class StashDatabase {
         }
     }
 
-    /** Update an existing lane's metadata and positions in place. */
+    // Update an existing lane's metadata and positions in place.
     public boolean updateLane(StorageLane lane) {
         if (!isOpen() || lane.getId() == 0) return false;
         try {
@@ -1450,7 +1440,7 @@ public final class StashDatabase {
         insertLanePositions(laneId, table, positions);
     }
 
-    /** Load all persisted storage lanes. */
+    // Load all persisted storage lanes.
     public List<StorageLane> loadAllLanes() {
         List<StorageLane> lanes = new ArrayList<>();
         if (!isOpen()) return lanes;
@@ -1512,7 +1502,7 @@ public final class StashDatabase {
         }
     }
 
-    /** Delete a single lane (cascades to lane_chests/lane_inputs). */
+    // Delete a single lane (cascades to lane_chests/lane_inputs).
     public boolean deleteLane(int laneId) {
         if (!isOpen()) return false;
         try {
@@ -1541,7 +1531,7 @@ public final class StashDatabase {
         }
     }
 
-    /** Delete all persisted storage lanes. */
+    // Delete all persisted storage lanes.
     public void clearAllLanes() {
         if (!isOpen()) return;
         try (Statement stmt = connection.createStatement()) {

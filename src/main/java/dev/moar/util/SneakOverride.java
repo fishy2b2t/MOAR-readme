@@ -25,26 +25,24 @@ public final class SneakOverride {
     // edge-walking where the position is inherently narrow.
     private static volatile boolean forceAbsoluteSneak;
 
-    /** Enable/disable the edge-safe sneak request. */
+    // Enable/disable the edge-safe sneak request.
     public static void setForceSneak(boolean value) {
         forceSneak = value;
     }
 
-    /**
-     * Enable/disable unconditional sneak — no edge detection check.
-     * Use during edge-walking and bridging where every position is
-     * inherently dangerous.
-     */
+    // Enable/disable unconditional sneak — no edge detection check.
+    // Use during edge-walking and bridging where every position is
+    // inherently dangerous.
     public static void setForceAbsoluteSneak(boolean value) {
         forceAbsoluteSneak = value;
     }
 
-    /** True if the printer wants edge safety. */
+    // True if the printer wants edge safety.
     public static boolean isForceSneak() {
         return forceSneak;
     }
 
-    /** True if unconditional sneak is active (edge-walking). */
+    // True if unconditional sneak is active (edge-walking).
     public static boolean isForceAbsoluteSneak() {
         return forceAbsoluteSneak;
     }

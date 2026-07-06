@@ -14,10 +14,8 @@ import net.minecraft.util.math.BlockPos;
 import java.io.IOException;
 import java.util.*;
 
-/**
- * Manages a queue of schematic build tasks.
- * Builds one schematic at a time, automatically advancing to the next on completion.
- */
+// Manages a queue of schematic build tasks.
+// Builds one schematic at a time, automatically advancing to the next on completion.
 public final class SchematicQueueManager {
 
     private static final Logger LOGGER = LoggerFactory.getLogger("MOAR/Queue");
@@ -36,28 +34,22 @@ public final class SchematicQueueManager {
 
     // Queue management
 
-    /**
-     * Add a task to the end of the queue.
-     */
+    // Add a task to the end of the queue.
     public void enqueue(SchematicTask task) {
         queue.add(task);
         LOGGER.info("Enqueued task: {} ({} total in queue)", task.getDisplayName(), queue.size());
     }
 
-    /**
-     * Add a task at a specific position in the queue.
-     * Position 0 = front of queue (next to build).
-     */
+    // Add a task at a specific position in the queue.
+    // Position 0 = front of queue (next to build).
     public void enqueueAt(SchematicTask task, int position) {
         int insertPos = Math.max(0, Math.min(position, queue.size()));
         queue.add(insertPos, task);
         LOGGER.info("Enqueued task at position {}: {}", insertPos, task.getDisplayName());
     }
 
-    /**
-     * Remove a task from the queue by ID.
-     * Cannot remove the active task.
-     */
+    // Remove a task from the queue by ID.
+    // Cannot remove the active task.
     public boolean remove(UUID taskId) {
         if (activeTask != null && activeTask.getId().equals(taskId)) {
             LOGGER.warn("Cannot remove active task: {}", activeTask.getDisplayName());
@@ -71,19 +63,15 @@ public final class SchematicQueueManager {
         return removed;
     }
 
-    /**
-     * Clear all queued tasks (not including active task).
-     */
+    // Clear all queued tasks (not including active task).
     public void clear() {
         int count = queue.size();
         queue.clear();
         LOGGER.info("Cleared {} tasks from queue", count);
     }
 
-    /**
-     * Move to the next task in the queue.
-     * Stops the current task if one is active.
-     */
+    // Move to the next task in the queue.
+    // Stops the current task if one is active.
     public boolean advanceQueue() {
         if (queue.isEmpty()) {
             LOGGER.debug("Queue is empty, cannot advance");
@@ -109,9 +97,7 @@ public final class SchematicQueueManager {
         return startTask(nextTask);
     }
 
-    /**
-     * Start the first queued task only when nothing is currently active.
-     */
+    // Start the first queued task only when nothing is currently active.
     public boolean startNextIfIdle() {
         if (activeTask != null) {
             LOGGER.debug("Queue already has an active task: {}", activeTask.getDisplayName());
@@ -120,10 +106,8 @@ public final class SchematicQueueManager {
         return advanceQueue();
     }
 
-    /**
-     * Skip the currently active task and move to the next.
-     * Marks the current task as failed.
-     */
+    // Skip the currently active task and move to the next.
+    // Marks the current task as failed.
     public boolean skipCurrent(String reason) {
         if (activeTask == null) {
             LOGGER.warn("No active task to skip");
@@ -147,9 +131,7 @@ public final class SchematicQueueManager {
         return true;
     }
 
-    /**
-     * Pause the active queue task without advancing.
-     */
+    // Pause the active queue task without advancing.
     public boolean pauseActiveTask() {
         if (activeTask == null || activeTask.isFinished()) {
             return false;
@@ -198,10 +180,8 @@ public final class SchematicQueueManager {
         }
     }
 
-    /**
-     * Called every tick to check if the active task is complete.
-     * Automatically advances to next task if enabled.
-     */
+    // Called every tick to check if the active task is complete.
+    // Automatically advances to next task if enabled.
     public void tick() {
         if (activeTask == null) return;
 
@@ -263,7 +243,7 @@ public final class SchematicQueueManager {
 
     // Queue reordering
 
-    /** Move a task to a specific queue position (0 = next to build). Returns false if the task is active or not found. */
+    // Move a task to a specific queue position (0 = next to build). Returns false if the task is active or not found.
     public boolean moveTask(UUID taskId, int newPosition) {
         if (activeTask != null && activeTask.getId().equals(taskId)) {
             LOGGER.warn("Cannot reorder active task");
@@ -303,7 +283,7 @@ public final class SchematicQueueManager {
         return true;
     }
 
-    /** Move a task one position towards the front. Returns false if already at front or not found. */
+    // Move a task one position towards the front. Returns false if already at front or not found.
     public boolean moveTaskUp(UUID taskId) {
         int currentIndex = findTaskIndex(taskId);
         if (currentIndex < 0) {
@@ -319,7 +299,7 @@ public final class SchematicQueueManager {
         return moveTask(taskId, currentIndex - 1);
     }
 
-    /** Move a task one position towards the back. Returns false if already at back or not found. */
+    // Move a task one position towards the back. Returns false if already at back or not found.
     public boolean moveTaskDown(UUID taskId) {
         int currentIndex = findTaskIndex(taskId);
         if (currentIndex < 0) {
@@ -335,7 +315,7 @@ public final class SchematicQueueManager {
         return moveTask(taskId, currentIndex + 1);
     }
 
-    /** Move a task to the front of the queue. Returns false if not found. */
+    // Move a task to the front of the queue. Returns false if not found.
     public boolean moveTaskToFront(UUID taskId) {
         if (findTaskIndex(taskId) < 0) {
             LOGGER.warn("Task not found: {}", taskId);
@@ -344,7 +324,7 @@ public final class SchematicQueueManager {
         return moveTask(taskId, 0);
     }
 
-    /** Move a task to the back of the queue. Returns false if not found. */
+    // Move a task to the back of the queue. Returns false if not found.
     public boolean moveTaskToBack(UUID taskId) {
         if (findTaskIndex(taskId) < 0) {
             LOGGER.warn("Task not found: {}", taskId);
@@ -353,10 +333,8 @@ public final class SchematicQueueManager {
         return moveTask(taskId, queue.size() - 1);
     }
 
-    /**
-     * Find a task by ID and return its short ID (first 8 chars).
-     * Returns null if not found.
-     */
+    // Find a task by ID and return its short ID (first 8 chars).
+    // Returns null if not found.
     public String getTaskShortId(UUID taskId) {
         // Check active task
         if (activeTask != null && activeTask.getId().equals(taskId)) {
@@ -373,10 +351,8 @@ public final class SchematicQueueManager {
         return null;
     }
 
-    /**
-     * Find a task by short ID (first 8 characters of UUID).
-     * Returns null if not found or ambiguous.
-     */
+    // Find a task by short ID (first 8 characters of UUID).
+    // Returns null if not found or ambiguous.
     public SchematicTask findTaskByShortId(String shortId) {
         SchematicTask found = null;
         
@@ -470,10 +446,8 @@ public final class SchematicQueueManager {
 
     // Auto-detection integration
 
-    /**
-     * Detect all Litematica placements and add them to the queue.
-     * Filters out placements with unsupported transforms.
-     */
+    // Detect all Litematica placements and add them to the queue.
+    // Filters out placements with unsupported transforms.
     public int enqueueFromDetection() {
         List<LitematicaDetector.DetectedPlacement> placements = 
             LitematicaDetector.detectPlacements();
@@ -521,9 +495,7 @@ public final class SchematicQueueManager {
         return added;
     }
 
-    /**
-     * Format queue status for display.
-     */
+    // Format queue status for display.
     public String formatStatus() {
         if (isEmpty()) {
             return "Queue is empty";

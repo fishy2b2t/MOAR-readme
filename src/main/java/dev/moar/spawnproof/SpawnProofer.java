@@ -93,23 +93,23 @@ public class SpawnProofer {
 
     // Configuration
 
-    /** Corners of the area to spawnproof (inclusive). */
+    // Corners of the area to spawnproof (inclusive).
     private BlockPos corner1;
     private BlockPos corner2;
 
-    /** The light source block to place (default: torch). */
+    // The light source block to place (default: torch).
     private Block lightSource = Blocks.TORCH;
 
-    /** The item form of the light source. */
+    // The item form of the light source.
     private Item lightSourceItem = Items.TORCH;
 
-    /** Luminance emitted by the chosen light source. */
+    // Luminance emitted by the chosen light source.
     private int lightSourceLuminance = 14;
 
-    /** Replace the ground block with the light source instead of placing on top. */
+    // Replace the ground block with the light source instead of placing on top.
     private boolean embedInGround = false;
 
-    /** Light sources → luminance. */
+    // Light sources → luminance.
     private static final Map<Block, Integer> KNOWN_LIGHT_SOURCES = new LinkedHashMap<>();
     static {
         KNOWN_LIGHT_SOURCES.put(Blocks.TORCH,                14);
@@ -128,111 +128,105 @@ public class SpawnProofer {
 
     // Runtime state
 
-    /** Positions that are dark and spawnable — the remaining work queue. */
+    // Positions that are dark and spawnable — the remaining work queue.
     private final List<BlockPos> darkSpots = new ArrayList<>();
 
-    /** Positions where we've placed light sources. */
+    // Positions where we've placed light sources.
     private final Set<BlockPos> placedPositions = new HashSet<>();
 
-    /** Best placement positions calculated by the solver. */
+    // Best placement positions calculated by the solver.
     private final Deque<BlockPos> placementQueue = new ArrayDeque<>();
 
-    /** Position to return to after restocking. */
+    // Position to return to after restocking.
     private BlockPos returnPos;
 
-    /** Queue head currently awaiting server confirmation. */
+    // Queue head currently awaiting server confirmation.
     private BlockPos pendingPlacementTarget;
 
-    /** Actual world position of the placement awaiting confirmation. */
+    // Actual world position of the placement awaiting confirmation.
     private BlockPos pendingPlacementPos;
 
-    /** Desired state for the placement awaiting confirmation. */
+    // Desired state for the placement awaiting confirmation.
     private BlockState pendingPlacementState;
 
-    /** Number of timeout-based retries for the current placement target. */
+    // Number of timeout-based retries for the current placement target.
     private int pendingPlacementTimeouts;
 
-    /** Queue target currently associated with timeout retries. */
+    // Queue target currently associated with timeout retries.
     private BlockPos pendingTimeoutTarget;
 
-    /** Timeout-reposition cycles for the current target. */
+    // Timeout-reposition cycles for the current target.
     private int pendingTimeoutCycles;
 
-    /** Supply chest positions (reuses PrinterDatabase if available). */
+    // Supply chest positions (reuses PrinterDatabase if available).
     private final List<BlockPos> supplyChests = new ArrayList<>();
 
-    /** Tick counter for throttling. */
+    // Tick counter for throttling.
     private int tickCounter;
 
-    /** Total light sources placed this session. */
+    // Total light sources placed this session.
     private int totalPlaced;
 
-    /** Whether the scanner has completed its initial pass. */
+    // Whether the scanner has completed its initial pass.
     private boolean scanComplete;
 
-    /** Count of consecutive rescans that found the same dark-spot count (loop detection). */
+    // Count of consecutive rescans that found the same dark-spot count (loop detection).
     private int rescanCount;
     private int lastDarkSpotCount;
 
-    /** Cooldown ticks between placements for rate limiting. */
+    // Cooldown ticks between placements for rate limiting.
     private static final int WALK_CHECK_INTERVAL = 5;
 
-    /** Maximum reach distance for placement (vanilla: 4.5). */
+    // Maximum reach distance for placement (vanilla: 4.5).
     private static final double PLACE_REACH = 4.5;
 
-    /** Number of consecutive ticks where placeBlock() returned false
-     *  for the current queue head.  After a threshold, skip the position. */
+    // Consecutive ticks placeBlock() failed for the queue head; skip after threshold.
     private int placeRetryTicks;
     private static final int MAX_PLACE_RETRIES = 40;
 
-    /** Cooldown ticks after arriving at a position before the first placement.
-     *  Gives the server time to acknowledge our position and reduces
-     *  packet bursts that trigger velocity setbacks under strict server validation. */
+    // Settle ticks after arrival before the first placement, to avoid velocity setbacks.
     private int placementSettleTicks;
     private static final int PLACEMENT_SETTLE_DELAY = 3;
 
-    /** If the server rejects this many consecutive placements, auto-pause.
-     *  Likely caused by region-threaded cross-region rejection or strict validation. */
+    // Auto-pause after this many consecutive server rejections.
     private static final int REJECT_PAUSE_THRESHOLD = 6;
 
-    /** Retry silent placement timeouts a couple of times before repositioning. */
+    // Retry silent placement timeouts a couple of times before repositioning.
     private static final int MAX_TIMEOUT_RETRIES = 2;
 
-    /** Max timeout cycles before skipping target. */
+    // Max timeout cycles before skipping target.
     private static final int MAX_TIMEOUT_CYCLES = 3;
 
     // Public API
 
-    /** Get current state. */
+    // Get current state.
     public State getState() { return state; }
 
-    /** Whether the proofer is actively running. */
+    // Whether the proofer is actively running.
     public boolean isActive() {
         return state != State.IDLE && state != State.DONE && state != State.PAUSED;
     }
 
-    /** Set corner 1 of the area. */
+    // Set corner 1 of the area.
     public void setCorner1(BlockPos pos) {
         this.corner1 = pos;
         saveConfig();
     }
 
-    /** Set corner 2 of the area. */
+    // Set corner 2 of the area.
     public void setCorner2(BlockPos pos) {
         this.corner2 = pos;
         saveConfig();
     }
 
-    /** Get corner 1. */
+    // Get corner 1.
     public BlockPos getCorner1() { return corner1; }
 
-    /** Get corner 2. */
+    // Get corner 2.
     public BlockPos getCorner2() { return corner2; }
 
-    /**
-     * Set the light source block to use.
-     * Returns false if the block is not a recognized light source.
-     */
+    // Set the light source block to use.
+    // Returns false if the block is not a recognized light source.
     public boolean setLightSource(String blockId) {
         Identifier id = Identifier.tryParse(blockId);
         if (id == null) return false;
@@ -265,9 +259,7 @@ public class SpawnProofer {
         return true;
     }
 
-    /**
-     * Set light source by Block instance.
-     */
+    // Set light source by Block instance.
     public void setLightSource(Block block) {
         this.lightSource = block;
         this.lightSourceItem = block.asItem();
@@ -285,7 +277,7 @@ public class SpawnProofer {
         saveConfig();
     }
 
-    /** Get the name of the current light source. */
+    // Get the name of the current light source.
     public String getLightSourceName() {
         /*? if >=26.1 {*//*
         return BuiltInRegistries.BLOCK.getKey(lightSource).getPath();
@@ -294,32 +286,30 @@ public class SpawnProofer {
         /*?}*/
     }
 
-    /** Get count of dark spots remaining. */
+    // Get count of dark spots remaining.
     public int getDarkSpotCount() { return darkSpots.size(); }
 
-    /** Get count of placed light sources. */
+    // Get count of placed light sources.
     public int getTotalPlaced() { return totalPlaced; }
 
-    /** Toggle embed-in-ground mode. */
+    // Toggle embed-in-ground mode.
     public void setEmbedInGround(boolean embed) {
         this.embedInGround = embed;
         saveConfig();
     }
 
-    /** Whether embed-in-ground mode is active. */
+    // Whether embed-in-ground mode is active.
     public boolean isEmbedInGround() { return embedInGround; }
 
-    /**
-     * Whether the current light source is a full block that can be embedded.
-     * Torches and lanterns cannot be embedded.
-     */
+    // Whether the current light source is a full block that can be embedded.
+    // Torches and lanterns cannot be embedded.
     public boolean isFullBlockLightSource() {
         return !(lightSource instanceof TorchBlock)
                 && !(lightSource instanceof WallTorchBlock)
                 && !(lightSource instanceof LanternBlock);
     }
 
-    /** Add a supply chest position. */
+    // Add a supply chest position.
     public void addSupplyChest(BlockPos pos) {
         if (!supplyChests.contains(pos)) {
             supplyChests.add(pos);
@@ -327,21 +317,21 @@ public class SpawnProofer {
         }
     }
 
-    /** Remove a supply chest position. */
+    // Remove a supply chest position.
     public void removeSupplyChest(BlockPos pos) {
         if (supplyChests.remove(pos)) {
             saveSupplyChests();
         }
     }
 
-    /** Get supply chest positions. */
+    // Get supply chest positions.
     public List<BlockPos> getSupplyChests() {
         return Collections.unmodifiableList(supplyChests);
     }
 
     // Persistence
 
-    /** Save spawnproofer config to the database. */
+    // Save spawnproofer config to the database.
     private void saveConfig() {
         StashDatabase db = MoarMod.getDatabase();
         if (!db.isOpen()) return;
@@ -363,13 +353,13 @@ public class SpawnProofer {
         db.setConfig("spawnproofer.embedInGround", String.valueOf(embedInGround));
     }
 
-    /** Save spawnproofer supply chests to the database. */
+    // Save spawnproofer supply chests to the database.
     private void saveSupplyChests() {
         StashDatabase db = MoarMod.getDatabase();
         if (db.isOpen()) db.saveSpawnprooferSupply(supplyChests);
     }
 
-    /** Load spawnproofer config and supply chests from the database. */
+    // Load spawnproofer config and supply chests from the database.
     public void loadConfig() {
         StashDatabase db = MoarMod.getDatabase();
         if (!db.isOpen()) return;
@@ -416,10 +406,8 @@ public class SpawnProofer {
 
     // Lifecycle
 
-    /**
-     * Start spawnproofing the configured area.
-     * Requires both corners to be set.
-     */
+    // Start spawnproofing the configured area.
+    // Requires both corners to be set.
     public boolean start() {
         if (corner1 == null || corner2 == null) {
             ChatHelper.info("§cSet both corners first: /spawnproof pos1 and /spawnproof pos2");
@@ -443,7 +431,7 @@ public class SpawnProofer {
         return true;
     }
 
-    /** Stop and reset. */
+    // Stop and reset.
     public void stop() {
         PathWalker.stop();
         PlacementEngine.reset();
@@ -457,7 +445,7 @@ public class SpawnProofer {
         ChatHelper.info("§eSpawnProofer stopped.");
     }
 
-    /** Pause — can be resumed. */
+    // Pause — can be resumed.
     public void pause() {
         if (isActive()) {
             PathWalker.stop();
@@ -469,7 +457,7 @@ public class SpawnProofer {
         }
     }
 
-    /** Resume from pause. */
+    // Resume from pause.
     public void resume() {
         if (state == State.PAUSED) {
             state = scanComplete ? State.WALKING : State.SCANNING;
@@ -479,9 +467,7 @@ public class SpawnProofer {
 
     // Tick
 
-    /**
-     * Drive the state machine. Call every client tick.
-     */
+    // Drive the state machine. Call every client tick.
     public void tick() {
         if (state == State.IDLE || state == State.DONE || state == State.PAUSED) return;
 
@@ -523,10 +509,8 @@ public class SpawnProofer {
 
     // State handlers
 
-    /**
-     * Scan the area for dark spawnable positions.
-     * Done in a single tick since it's just light level queries.
-     */
+    // Scan the area for dark spawnable positions.
+    // Done in a single tick since it's just light level queries.
     /*? if >=26.1 {*//*
     private void tickScanning(Minecraft mc) {
     *//*?} else {*/
@@ -612,9 +596,7 @@ public class SpawnProofer {
         state = State.WALKING;
     }
 
-    /**
-     * Walk toward the next placement position.
-     */
+    // Walk toward the next placement position.
     /*? if >=26.1 {*//*
     private void tickWalking(Minecraft mc) {
     *//*?} else {*/
@@ -676,13 +658,11 @@ public class SpawnProofer {
         PathWalker.tick();
     }
 
-    /**
-     * Place a light source at the current target.
-     *
-     * The placementQueue contains final placement positions
-     * (where the light source block goes), NOT dark-surface positions.
-     * The greedy solver already validated each via canPlaceLightAt.
-     */
+    // Place a light source at the current target.
+    //
+    // The placementQueue contains final placement positions
+    // (where the light source block goes), NOT dark-surface positions.
+    // The greedy solver already validated each via canPlaceLightAt.
     /*? if >=26.1 {*//*
     private void tickPlacing(Minecraft mc) {
     *//*?} else {*/
@@ -884,9 +864,7 @@ public class SpawnProofer {
         }
     }
 
-    /**
-     * Walk to nearest supply chest for more light sources.
-     */
+    // Walk to nearest supply chest for more light sources.
     /*? if >=26.1 {*//*
     private void tickResupplying(Minecraft mc) {
     *//*?} else {*/
@@ -934,10 +912,8 @@ public class SpawnProofer {
         PathWalker.tick();
     }
 
-    /**
-     * Wait for the player to open the chest and take items.
-     * Auto-takes light source items from the chest.
-     */
+    // Wait for the player to open the chest and take items.
+    // Auto-takes light source items from the chest.
     /*? if >=26.1 {*//*
     private void tickRestocking(Minecraft mc) {
     *//*?} else {*/
@@ -962,9 +938,7 @@ public class SpawnProofer {
         }
     }
 
-    /**
-     * Return to the build area after restocking.
-     */
+    // Return to the build area after restocking.
     /*? if >=26.1 {*//*
     private void tickReturning(Minecraft mc) {
     *//*?} else {*/
@@ -995,15 +969,13 @@ public class SpawnProofer {
 
     // Light level analysis
 
-    /**
-     * Check if a position is a dark, spawnable surface.
-     *
-     * A position is dark-spawnable if:
-     * 1. The block at pos is solid and opaque (spawnable surface)
-     * 2. The block above pos is air (space for mob)
-     * 3. The block two above pos is air or passable (headroom)
-     * 4. Block light level at pos+1 (where the mob stands) is 0
-     */
+    // Check if a position is a dark, spawnable surface.
+    //
+    // A position is dark-spawnable if:
+    // 1. The block at pos is solid and opaque (spawnable surface)
+    // 2. The block above pos is air (space for mob)
+    // 3. The block two above pos is air or passable (headroom)
+    // 4. Block light level at pos+1 (where the mob stands) is 0
     /*? if >=26.1 {*//*
     private boolean isDarkSpawnable(Level world, BlockPos pos) {
     *//*?} else {*/
@@ -1051,11 +1023,9 @@ public class SpawnProofer {
         return blockLight == 0;
     }
 
-    /**
-     * Check if a position can receive a light source.
-     * The position must be air or replaceable vegetation (short grass, ferns, etc.)
-     * and have proper support for the light source type.
-     */
+    // Check if a position can receive a light source.
+    // The position must be air or replaceable vegetation (short grass, ferns, etc.)
+    // and have proper support for the light source type.
     /*? if >=26.1 {*//*
     private boolean canPlaceLightAt(Level world, BlockPos pos) {
     *//*?} else {*/
@@ -1133,10 +1103,8 @@ public class SpawnProofer {
         return true;
     }
 
-    /**
-     * Find the best position to place a light source to cover a dark spot.
-     * Prefers placing ON TOP of the spawnable surface (pos.up()).
-     */
+    // Find the best position to place a light source to cover a dark spot.
+    // Prefers placing ON TOP of the spawnable surface (pos.up()).
     /*? if >=26.1 {*//*
     private BlockPos findPlacementPosition(Level world, BlockPos darkSurface) {
     *//*?} else {*/
@@ -1175,9 +1143,7 @@ public class SpawnProofer {
         return null;
     }
 
-    /**
-     * Determine the correct torch blockstate (floor vs wall).
-     */
+    // Determine the correct torch blockstate (floor vs wall).
     /*? if >=26.1 {*//*
     private BlockState determineTorchState(Level world, BlockPos pos) {
     *//*?} else {*/
@@ -1233,15 +1199,13 @@ public class SpawnProofer {
 
     // Greedy solver
 
-    /**
-     * Linear sweep solver: iterate dark spots, place a light source for
-     * each uncovered spot, and predict coverage to skip nearby spots.
-     *
-     * Much faster than greedy set-cover (O(n × p) vs O(n² × p) where
-     * n = dark spots, p = placements).  Produces slightly more placements
-     * than optimal, but a verification rescan catches any residual dark
-     * spots and adds a small follow-up pass.
-     */
+    // Linear sweep solver: iterate dark spots, place a light source for
+    // each uncovered spot, and predict coverage to skip nearby spots.
+    //
+    // Much faster than greedy set-cover (O(n × p) vs O(n² × p) where
+    // n = dark spots, p = placements).  Produces slightly more placements
+    // than optimal, but a verification rescan catches any residual dark
+    // spots and adds a small follow-up pass.
     /*? if >=26.1 {*//*
     private void solvePlacements(Level world) {
     *//*?} else {*/
@@ -1329,39 +1293,35 @@ public class SpawnProofer {
         }
     }
 
-    /** Pack a BlockPos into a long key for set lookups. */
+    // Pack a BlockPos into a long key for set lookups.
     private static long packPos(BlockPos pos) {
         return packPos(pos.getX(), pos.getY(), pos.getZ());
     }
 
-    /** Pack x/y/z into a long key for set lookups. */
+    // Pack x/y/z into a long key for set lookups.
     private static long packPos(int x, int y, int z) {
         return ((long) (x & 0x3FFFFFF) << 38)
                 | ((long) (z & 0x3FFFFFF) << 12)
                 | (y & 0xFFF);
     }
 
-    /** Taxicab (Manhattan) distance between two positions. */
+    // Taxicab (Manhattan) distance between two positions.
     private int taxicabDistance(BlockPos a, BlockPos b) {
         return Math.abs(a.getX() - b.getX())
                 + Math.abs(a.getY() - b.getY())
                 + Math.abs(a.getZ() - b.getZ());
     }
 
-    /**
-     * Whether embed-in-ground mode is effectively active.
-     * True only when the user enabled embed mode AND the current light
-     * source is a full block (torches/lanterns can't be embedded).
-     */
+    // Whether embed-in-ground mode is effectively active.
+    // True only when the user enabled embed mode AND the current light
+    // source is a full block (torches/lanterns can't be embedded).
     private boolean useEmbedMode() {
         return embedInGround && isFullBlockLightSource();
     }
 
     // Inventory helpers
 
-    /**
-     * Check if the player has at least one light source item.
-     */
+    // Check if the player has at least one light source item.
     /*? if >=26.1 {*//*
     private boolean hasLightSourceInInventory(Minecraft mc) {
     *//*?} else {*/
@@ -1384,9 +1344,7 @@ public class SpawnProofer {
         return false;
     }
 
-    /**
-     * Count how many light source items the player has.
-     */
+    // Count how many light source items the player has.
     /*? if >=26.1 {*//*
     public int countLightSourceInInventory(Minecraft mc) {
     *//*?} else {*/
@@ -1416,9 +1374,7 @@ public class SpawnProofer {
 
     // Supply chest
 
-    /**
-     * Find the nearest supply chest.
-     */
+    // Find the nearest supply chest.
     private BlockPos findNearestChest(BlockPos from) {
         BlockPos best = null;
         double bestDist = Double.MAX_VALUE;
@@ -1569,12 +1525,12 @@ public class SpawnProofer {
         pendingTimeoutTarget = null;
     }
 
-    /** Format a position for display. */
+    // Format a position for display.
     private static String formatPos(BlockPos pos) {
         return pos.getX() + " " + pos.getY() + " " + pos.getZ();
     }
 
-    /** Get a status summary string. */
+    // Get a status summary string.
     public String getStatus() {
         String embedTag = useEmbedMode() ? " [embed]" : "";
         return switch (state) {
@@ -1591,7 +1547,7 @@ public class SpawnProofer {
         };
     }
 
-    /** Get known light source blocks. */
+    // Get known light source blocks.
     public static Set<Block> getKnownLightSources() {
         return Collections.unmodifiableSet(KNOWN_LIGHT_SOURCES.keySet());
     }

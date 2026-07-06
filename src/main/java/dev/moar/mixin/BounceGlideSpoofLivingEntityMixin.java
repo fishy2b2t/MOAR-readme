@@ -8,17 +8,15 @@ import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
-/**
- * Spoofs isGliding/isFallFlying to true for the local player while BounceController is active.
- *
- * Without this, walking physics apply client-side while the server uses elytra physics,
- * causing position divergence and rubber-band every tick.
- *
- * Also zeroes jumpingCooldown each tick so jump() fires on every ground contact.
- *
- * Method name varies by version: isFallFlying (1.21.1 Yarn, Mojmap 26.1),
- * isGliding (1.21.4-1.21.11 Yarn).
- */
+// Spoofs isGliding/isFallFlying to true for the local player while BounceController is active.
+//
+// Without this, walking physics apply client-side while the server uses elytra physics,
+// causing position divergence and rubber-band every tick.
+//
+// Also zeroes jumpingCooldown each tick so jump() fires on every ground contact.
+//
+// Method name varies by version: isFallFlying (1.21.1 Yarn, Mojmap 26.1),
+// isGliding (1.21.4-1.21.11 Yarn).
 /*? if >=26.1 {*//*
 @Mixin(net.minecraft.world.entity.LivingEntity.class)
 *//*?} else {*/
@@ -43,7 +41,7 @@ public abstract class BounceGlideSpoofLivingEntityMixin {
         if (!BounceController.get().isActive()) return;
         cir.setReturnValue(true);
     }
-    *//*?} else if >=1.21.4 {*//*
+    *//*?} else if >=1.21.4 {*/
     @Inject(method = "isGliding", at = @At("HEAD"), cancellable = true)
     private void moar$ebounceSpoofGliding(CallbackInfoReturnable<Boolean> cir) {
         if (!(((Object) this) instanceof net.minecraft.client.network.ClientPlayerEntity)) return;
@@ -52,8 +50,8 @@ public abstract class BounceGlideSpoofLivingEntityMixin {
         if (!BounceController.get().isActive()) return;
         cir.setReturnValue(true);
     }
-    *//*?} else {*/
-    @Inject(method = "isFallFlying", at = @At("HEAD"), cancellable = true)
+    /*?} else {*/
+    /*@Inject(method = "isFallFlying", at = @At("HEAD"), cancellable = true)
     private void moar$ebounceSpoofGliding(CallbackInfoReturnable<Boolean> cir) {
         if (!(((Object) this) instanceof net.minecraft.client.network.ClientPlayerEntity)) return;
         net.minecraft.client.network.ClientPlayerEntity p = net.minecraft.client.MinecraftClient.getInstance().player;
@@ -61,7 +59,7 @@ public abstract class BounceGlideSpoofLivingEntityMixin {
         if (!BounceController.get().isActive()) return;
         cir.setReturnValue(true);
     }
-    /*?}*/
+    *//*?}*/
 
     // ── jumpingCooldown reset ────────────────────────────────────────
 
