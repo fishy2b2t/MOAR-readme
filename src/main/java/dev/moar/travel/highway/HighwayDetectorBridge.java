@@ -115,11 +115,18 @@ public final class HighwayDetectorBridge {
         MinecraftClient mc = MinecraftClient.getInstance();
         if (mc.world == null) return false;
         /*?}*/
+        // Perf: single mutable cursor instead of up-to-125 BlockPos allocations
+        // per probed cell.
+        /*? if >=26.1 {*//*
+        BlockPos.MutableBlockPos p = new BlockPos.MutableBlockPos();
+        *//*?} else {*/
+        BlockPos.Mutable p = new BlockPos.Mutable();
+        /*?}*/
         for (int dy = 0; dy <= PORTAL_V_HEIGHT; dy++) {
             int y = floorY + dy;
             for (int dx = -PORTAL_H_RADIUS; dx <= PORTAL_H_RADIUS; dx++) {
                 for (int dz = -PORTAL_H_RADIUS; dz <= PORTAL_H_RADIUS; dz++) {
-                    BlockPos p = new BlockPos(bx + dx, y, bz + dz);
+                    p.set(bx + dx, y, bz + dz);
                     if (!isChunkLoaded(p)) continue; // skip unloaded cells
                     /*? if >=26.1 {*//*
                     if (mc.level.getBlockState(p).getBlock() == Blocks.NETHER_PORTAL) return true;

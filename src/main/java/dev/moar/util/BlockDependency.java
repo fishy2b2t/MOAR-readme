@@ -373,18 +373,16 @@ public final class BlockDependency {
         /*?}*/
     }
 
-    /**
-     * Returns the dependency tier of a block state.
-     *   0 -- freestanding (no dependency)
-     *   1 -- needs adjacent support
-     * Used in comparator tie-breaking to prioritize freestanding blocks.
-     */
+    // Returns the dependency tier of a block state.
+    //   0 -- freestanding (no dependency)
+    //   1 -- needs adjacent support
+    // Used in comparator tie-breaking to prioritize freestanding blocks.
     public static int getTier(BlockState state) {
         if (state.getBlock() instanceof VineBlock) return 1;
         return getRequiredSupport(state) == null ? 0 : 1;
     }
 
-    /** True for non-load-bearing redstone components/rails deferred to the redstone pass. */
+    // True for non-load-bearing redstone components/rails deferred to the redstone pass.
     public static boolean isRedstoneComponent(BlockState state) {
         Block block = state.getBlock();
 

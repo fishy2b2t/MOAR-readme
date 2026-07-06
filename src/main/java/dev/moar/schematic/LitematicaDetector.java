@@ -84,8 +84,20 @@ public final class LitematicaDetector {
         }
     }
 
+    // Perf: detection reflects into Litematica and reparses config JSON from
+    // disk. Callers poll it from periodic tick validation (~every 100t), so a
+    // short TTL cache avoids re-reading unchanged files. 2s staleness is
+    // acceptable for every call site (user commands + periodic checks).
+    private static final long DETECT_CACHE_TTL_MS = 2000;
+    private static List<DetectedPlacement> cachedPlacements;
+    private static long cachedPlacementsExpiryMs;
+
     // Return enabled placements. Prefer reflection, then JSON.
     public static List<DetectedPlacement> detectPlacements() {
+        long now = System.currentTimeMillis();
+        if (cachedPlacements != null && now < cachedPlacementsExpiryMs) {
+            return cachedPlacements;
+        }
         String currentContext = getCurrentPlacementContext();
         String currentDimension = getCurrentDimensionSuffix();
         List<DetectedPlacement> live = detectFromMemory();
@@ -95,13 +107,17 @@ public final class LitematicaDetector {
         // the active server/world, which avoids stale placements lingering in
         // Litematica's in-memory manager after a singleplayer world or server
         // switch. Fall back to live data when no scoped config exists yet.
+        List<DetectedPlacement> result;
         if (!configPlacements.isEmpty()) {
-            return configPlacements;
+            result = configPlacements;
+        } else if (!live.isEmpty()) {
+            result = live;
+        } else {
+            result = configPlacements;
         }
-        if (!live.isEmpty()) {
-            return live;
-        }
-        return configPlacements;
+        cachedPlacements = result;
+        cachedPlacementsExpiryMs = now + DETECT_CACHE_TTL_MS;
+        return result;
     }
 
     private static List<DetectedPlacement> detectFromConfig(String currentContext, String currentDimension) {

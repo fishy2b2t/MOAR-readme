@@ -619,9 +619,7 @@ public final class SpawnProofCommand {
         return MoarMod.getChestManager();
     }
 
-    /**
-     * Get the block position the player is looking at.
-     */
+    // Get the block position the player is looking at.
     /*? if >=26.1 {*//*
     private static BlockPos getTargetBlock(Minecraft mc) {
     *//*?} else {*/

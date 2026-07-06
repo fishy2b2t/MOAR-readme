@@ -39,12 +39,12 @@ public final class ChatHelper {
 
     private ChatHelper() {}
 
-    /** Send a message: [Printer] message */
+    // Send a message: [Printer] message
     public static void info(String message) {
         send(prefix(), message);
     }
 
-    /** Send a labelled message: [Printer] [label] message */
+    // Send a labelled message: [Printer] [label] message
     public static void labelled(String label, String message) {
         send(prefix()
                 /*? if >=26.1 {*//*

@@ -149,63 +149,63 @@ public final class StashManager {
 
     // Region corners
 
-    /** User-set corner 1 of the stash region. */
+    // User-set corner 1 of the stash region.
     private BlockPos corner1;
-    /** User-set corner 2 of the stash region. */
+    // User-set corner 2 of the stash region.
     private BlockPos corner2;
 
-    /** Computed inclusive minimum corner of the region. */
+    // Computed inclusive minimum corner of the region.
     private BlockPos regionMin;
-    /** Computed inclusive maximum corner of the region. */
+    // Computed inclusive maximum corner of the region.
     private BlockPos regionMax;
 
     // Configuration
 
-    /** Maximum number of containers to scan per session. */
+    // Maximum number of containers to scan per session.
     private static final int MAX_CONTAINERS = 2048;
 
-    /** Ticks to wait for the chest screen to appear. */
+    // Ticks to wait for the chest screen to appear.
     private static final int OPEN_TIMEOUT_TICKS = 60;
 
-    /** Ticks to stay on the reading screen to ensure contents are loaded. */
+    // Ticks to stay on the reading screen to ensure contents are loaded.
     private static final int READ_DELAY_TICKS = 5;
 
-    /** Leg length for linear waypoint interpolation (blocks). */
+    // Leg length for linear waypoint interpolation (blocks).
     private static final int WAYPOINT_LEG_LENGTH = 48;
 
     // Runtime state
 
-    /** Discovered container positions (sorted by distance). */
+    // Discovered container positions (sorted by distance).
     private final Deque<BlockPos> scanQueue = new ArrayDeque<>();
 
-    /** Positions we've already visited (avoids double-counting). */
+    // Positions we've already visited (avoids double-counting).
     private final Set<BlockPos> visitedPositions = new HashSet<>();
 
-    /** Full stash index: container position → inventory snapshot. */
+    // Full stash index: container position → inventory snapshot.
     private final Map<BlockPos, ContainerEntry> index = new LinkedHashMap<>();
 
-    /** Chunks we've already scanned for containers (packed cx|cz). */
+    // Chunks we've already scanned for containers (packed cx|cz).
     private final Set<Long> scannedChunks = new HashSet<>();
 
-    /** Current container being visited. */
+    // Current container being visited.
     private BlockPos currentTarget;
 
-    /** Ticks spent waiting for screen to open. */
+    // Ticks spent waiting for screen to open.
     private int openWaitTicks;
 
-    /** Ticks spent on reading screen. */
+    // Ticks spent on reading screen.
     private int readWaitTicks;
 
-    /** Total containers found during all zone scans combined. */
+    // Total containers found during all zone scans combined.
     private int totalFound;
 
-    /** Total containers successfully indexed. */
+    // Total containers successfully indexed.
     private int totalIndexed;
 
-    /** Containers skipped (unreachable, failed to open). */
+    // Containers skipped (unreachable, failed to open).
     private int totalSkipped;
 
-    /** Whether a render-distance warning was shown this session. */
+    // Whether a render-distance warning was shown this session.
     private boolean warnedRenderDistance;
 
     // Data types
@@ -225,7 +225,7 @@ public final class StashManager {
         }
     }
 
-    /** Detail record for a single shulker box found inside a container. */
+    // Detail record for a single shulker box found inside a container.
     public record ShulkerDetail(
             String shulkerType,
             Map<String, Integer> contents
@@ -258,9 +258,7 @@ public final class StashManager {
 
     // Lifecycle
 
-    /**
-     * Start scanning the region defined by corner1 and corner2.
-     */
+    // Start scanning the region defined by corner1 and corner2.
     public boolean start() {
         /*? if >=26.1 {*//*
         Minecraft mc = Minecraft.getInstance();
@@ -333,7 +331,7 @@ public final class StashManager {
         return true;
     }
 
-    /** Stop scanning and reset. */
+    // Stop scanning and reset.
     public void stop() {
         PathWalker.stop();
         state = State.IDLE;
@@ -345,7 +343,7 @@ public final class StashManager {
                 + totalIndexed + " containers indexed so far.");
     }
 
-    /** Clear the index entirely (memory + database). */
+    // Clear the index entirely (memory + database).
     public void clearIndex() {
         index.clear();
         totalIndexed = 0;
@@ -355,10 +353,8 @@ public final class StashManager {
         ChatHelper.labelled("Stash", "§eStash index cleared.");
     }
 
-    /**
-     * Load persisted stash data from the database.
-     * Called once at mod initialization.
-     */
+    // Load persisted stash data from the database.
+    // Called once at mod initialization.
     public void loadFromDatabase() {
         StashDatabase database = MoarMod.getDatabase();
         if (!database.isOpen()) return;
@@ -543,7 +539,7 @@ public final class StashManager {
         return out;
     }
 
-    /** Walk toward the current target container. */
+    // Walk toward the current target container.
     /*? if >=26.1 {*//*
     private void tickWalking(Minecraft mc) {
     *//*?} else {*/
@@ -596,7 +592,7 @@ public final class StashManager {
         PathWalker.tick();
     }
 
-    /** Open the container at currentTarget. */
+    // Open the container at currentTarget.
     /*? if >=26.1 {*//*
     private void tickOpening(Minecraft mc) {
     *//*?} else {*/
@@ -668,7 +664,7 @@ public final class StashManager {
         }
     }
 
-    /** Read the contents of the currently open container screen. */
+    // Read the contents of the currently open container screen.
     /*? if >=26.1 {*//*
     private void tickReading(Minecraft mc) {
     *//*?} else {*/
@@ -788,10 +784,8 @@ public final class StashManager {
         advanceToNext();
     }
 
-    /**
-     * Walk toward the next unscanned zone using incremental waypoints.
-     * This mirrors the printer's megabase waypoint pattern.
-     */
+    // Walk toward the next unscanned zone using incremental waypoints.
+    // This mirrors the printer's megabase waypoint pattern.
     /*? if >=26.1 {*//*
     private void tickWalkingToZone(Minecraft mc) {
     *//*?} else {*/
@@ -821,7 +815,7 @@ public final class StashManager {
 
     // Navigation
 
-    /** Advance to the next container, or to the next zone, or finish. */
+    // Advance to the next container, or to the next zone, or finish.
     private void advanceToNext() {
         if (!scanQueue.isEmpty()) {
             currentTarget = scanQueue.poll();
@@ -852,10 +846,8 @@ public final class StashManager {
         }
     }
 
-    /**
-     * Compute linear waypoints from the player to the target zone center
-     * and start walking via PathWalker.
-     */
+    // Compute linear waypoints from the player to the target zone center
+    // and start walking via PathWalker.
     /*? if >=26.1 {*//*
     private void startWalkingToZone(Minecraft mc, BlockPos zoneCenter) {
     *//*?} else {*/
@@ -877,11 +869,9 @@ public final class StashManager {
         state = State.WALKING_TO_ZONE;
     }
 
-    /**
-     * Find the nearest chunk in the region that hasn't been scanned yet.
-     * Returns the center of that chunk (at region min Y), or null if
-     * all chunks have been scanned.
-     */
+    // Find the nearest chunk in the region that hasn't been scanned yet.
+    // Returns the center of that chunk (at region min Y), or null if
+    // all chunks have been scanned.
     /*? if >=26.1 {*//*
     private BlockPos findUnscannedZone(Minecraft mc) {
     *//*?} else {*/
@@ -930,7 +920,7 @@ public final class StashManager {
         return best;
     }
 
-    /** End the scan and print summary. */
+    // End the scan and print summary.
     private void finishScan() {
         state = State.DONE;
         ChatHelper.labelled("Stash", "§aScan complete! Indexed §f"
@@ -959,7 +949,7 @@ public final class StashManager {
 
     // Region helpers
 
-    /** Check if any chunks in the region are currently unloaded. */
+    // Check if any chunks in the region are currently unloaded.
     /*? if >=26.1 {*//*
     private boolean hasUnloadedChunks(Level world) {
     *//*?} else {*/
@@ -982,10 +972,8 @@ public final class StashManager {
         return false;
     }
 
-    /**
-     * Compute linear-interpolation waypoints from → to.
-     * Same algorithm as SchematicPrinter's megabase waypoint logic.
-     */
+    // Compute linear-interpolation waypoints from → to.
+    // Same algorithm as SchematicPrinter's megabase waypoint logic.
     private static List<BlockPos> computeLinearWaypoints(BlockPos from, BlockPos to, int legLength) {
         List<BlockPos> waypoints = new ArrayList<>();
         double dx = to.getX() - from.getX();
@@ -1018,7 +1006,7 @@ public final class StashManager {
         return waypoints;
     }
 
-    /** Pack chunk coordinates into a single long for set storage. */
+    // Pack chunk coordinates into a single long for set storage.
     private static long packChunk(int cx, int cz) {
         return ((long) cx << 32) | (cz & 0xFFFFFFFFL);
     }
@@ -1145,7 +1133,7 @@ public final class StashManager {
                 + totalShulkers + " shulker boxes";
     }
 
-    /** Get a region size string for status display. */
+    // Get a region size string for status display.
     public String getRegionInfo() {
         if (corner1 == null || corner2 == null) return "No region defined.";
         int sizeX = Math.abs(corner1.getX() - corner2.getX()) + 1;
@@ -1156,7 +1144,7 @@ public final class StashManager {
 
     // Utility
 
-    /** Check if a block is a container we should scan. */
+    // Check if a block is a container we should scan.
     private static boolean isContainer(Block block) {
         return block instanceof ChestBlock
                 || block instanceof BarrelBlock
@@ -1164,7 +1152,7 @@ public final class StashManager {
                 || block instanceof HopperBlock;
     }
 
-    /** For double chests, get the partner position. Returns null for single chests. */
+    // For double chests, get the partner position. Returns null for single chests.
     private static BlockPos getDoubleChestPartner(BlockPos pos, BlockState state) {
         /*? if >=26.1 {*//*
         if (!state.hasProperty(BlockStateProperties.CHEST_TYPE)) return null;
@@ -1204,7 +1192,7 @@ public final class StashManager {
         /*?}*/
     }
 
-    /** Format an item ID into a human-readable name. */
+    // Format an item ID into a human-readable name.
     private static String formatItemName(String itemId) {
         String name = itemId.replace("minecraft:", "");
         String[] parts = name.split("_");
@@ -1219,7 +1207,7 @@ public final class StashManager {
         return sb.toString();
     }
 
-    /** Escape a value for CSV. */
+    // Escape a value for CSV.
     private static String csvEscape(String value) {
         if (value == null) return "";
         if (value.contains(",") || value.contains("\"") || value.contains("\n")) {
@@ -1228,7 +1216,7 @@ public final class StashManager {
         return value;
     }
 
-    /** Assign labels to containers based on their contents (called after organization). */
+    // Assign labels to containers based on their contents (called after organization).
     public void assignLabels() {
         // Stub — label assignment will be implemented later
     }

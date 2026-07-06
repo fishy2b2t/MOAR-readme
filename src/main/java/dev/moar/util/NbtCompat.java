@@ -24,20 +24,20 @@ public final class NbtCompat {
 
     private NbtCompat() {}
 
-    /** Check whether the compound contains a key of the given NBT element type. */
+    // Check whether the compound contains a key of the given NBT element type.
     /*? if >=26.1 {*//*
     public static boolean contains(CompoundTag nbt, String key, int type) {
     *//*?} else {*/
     public static boolean contains(NbtCompound nbt, String key, int type) {
     /*?}*/
-        /*? if >=1.21.5 {*//*
+        /*? if >=1.21.5 {*/
         return nbt.contains(key);
-        *//*?} else {*/
-        return nbt.contains(key, type);
-        /*?}*/
+        /*?} else {*/
+        /*return nbt.contains(key, type);
+        *//*?}*/
     }
 
-    /** Get an int value, returning defaultValue if absent. */
+    // Get an int value, returning defaultValue if absent.
     /*? if >=26.1 {*//*
     public static int getInt(CompoundTag nbt, String key, int defaultValue) {
     *//*?} else {*/
@@ -50,7 +50,7 @@ public final class NbtCompat {
         /*?}*/
     }
 
-    /** Get an int value, returning 0 if absent. */
+    // Get an int value, returning 0 if absent.
     /*? if >=26.1 {*//*
     public static int getInt(CompoundTag nbt, String key) {
     *//*?} else {*/
@@ -59,7 +59,7 @@ public final class NbtCompat {
         return getInt(nbt, key, 0);
     }
 
-    /** Get a string value, returning defaultValue if absent. */
+    // Get a string value, returning defaultValue if absent.
     /*? if >=26.1 {*//*
     public static String getString(CompoundTag nbt, String key, String defaultValue) {
     *//*?} else {*/
@@ -72,7 +72,7 @@ public final class NbtCompat {
         /*?}*/
     }
 
-    /** Get a string value, returning empty string if absent. */
+    // Get a string value, returning empty string if absent.
     /*? if >=26.1 {*//*
     public static String getString(CompoundTag nbt, String key) {
     *//*?} else {*/
@@ -81,7 +81,7 @@ public final class NbtCompat {
         return getString(nbt, key, "");
     }
 
-    /** Get a sub-compound, returning a new empty compound if absent. */
+    // Get a sub-compound, returning a new empty compound if absent.
     /*? if >=26.1 {*//*
     public static CompoundTag getCompound(CompoundTag nbt, String key) {
     *//*?} else {*/
@@ -96,7 +96,7 @@ public final class NbtCompat {
         /*?}*/
     }
 
-    /** Get a long array, returning an empty array if absent. */
+    // Get a long array, returning an empty array if absent.
     /*? if >=26.1 {*//*
     public static long[] getLongArray(CompoundTag nbt, String key) {
     *//*?} else {*/
@@ -109,7 +109,7 @@ public final class NbtCompat {
         /*?}*/
     }
 
-    /** Get an NBT list of the specified element type. */
+    // Get an NBT list of the specified element type.
     /*? if >=26.1 {*//*
     public static ListTag getList(CompoundTag nbt, String key, int type) {
     *//*?} else {*/
@@ -126,7 +126,7 @@ public final class NbtCompat {
 
     // game version helpers
 
-    /** Returns the data version (save version ID) of the current Minecraft build. */
+    // Returns the data version (save version ID) of the current Minecraft build.
     public static int currentDataVersion() {
         /*? if >=26.1 {*//*
         return SharedConstants.getCurrentVersion().dataVersion().version();

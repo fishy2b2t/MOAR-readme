@@ -187,12 +187,10 @@ public final class LitematicaSchematic {
                 globalMinX, globalMinY, globalMinZ);
     }
 
-    /**
-     * Returns the target BlockState at schematic-local coordinates.
-     * Coordinates are relative to the normalized origin (0, 0, 0).
-     * Returns Blocks.AIR default state if the position is outside
-     * all regions.
-     */
+    // Returns the target BlockState at schematic-local coordinates.
+    // Coordinates are relative to the normalized origin (0, 0, 0).
+    // Returns Blocks.AIR default state if the position is outside
+    // all regions.
     public BlockState getBlockState(int x, int y, int z) {
         for (Region region : regions) {
             int lx = x - region.originX;
@@ -211,7 +209,7 @@ public final class LitematicaSchematic {
         /*?}*/
     }
 
-    /** Whether the given schematic-local position is inside any region. */
+    // Whether the given schematic-local position is inside any region.
     public boolean contains(int x, int y, int z) {
         for (Region region : regions) {
             int lx = x - region.originX;
@@ -246,11 +244,9 @@ public final class LitematicaSchematic {
         return dataVersion > NbtCompat.currentDataVersion();
     }
 
-    /**
-     * Returns the offset that was subtracted during normalization.
-     * Add this to Litematica's placement origin to get the correct
-     * anchor for world ↔ schematic coordinate conversion.
-     */
+    // Returns the offset that was subtracted during normalization.
+    // Add this to Litematica's placement origin to get the correct
+    // anchor for world ↔ schematic coordinate conversion.
     public int getOriginOffsetX() { return originOffsetX; }
     public int getOriginOffsetY() { return originOffsetY; }
     public int getOriginOffsetZ() { return originOffsetZ; }
@@ -279,10 +275,8 @@ public final class LitematicaSchematic {
 
     // --- Region
 
-    /**
-     * One named region inside the schematic.  Stores the palette and the
-     * bit-packed block-state index array.
-     */
+    // One named region inside the schematic.  Stores the palette and the
+    // bit-packed block-state index array.
     public static final class Region {
         final String regionName;
         public int originX, originY, originZ;

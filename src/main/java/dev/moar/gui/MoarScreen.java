@@ -67,6 +67,11 @@ public final class MoarScreen extends Screen {
 
     private Section section = Section.KITS;
     private String notice = "";
+    // Kit info is backed by SQLite queries — never query per frame.
+    private List<String> cachedKitLines;
+    private int cachedKitCount;
+    private long kitCacheExpiryMs;
+    private static final long KIT_CACHE_TTL_MS = 1000;
 
     /*? if >=26.1 {*//*
     private EditBox kitNameField;
@@ -106,6 +111,9 @@ public final class MoarScreen extends Screen {
     }
 
     private void rebuild() {
+        // Kit actions (create/delete) land here via section buttons —
+        // force a fresh kit query on next draw.
+        kitCacheExpiryMs = 0;
         /*? if >=26.1 {*//*
         clearWidgets();
         *//*?} else {*/
@@ -371,22 +379,31 @@ public final class MoarScreen extends Screen {
     *//*?} else {*/
     private void drawKitInfo(DrawContext context, int x, int y) {
     /*?}*/
-        StashDatabase db = openDatabase();
-        if (db == null) {
-            drawText(context, "Database unavailable.", x, y, 0xFFFF7777);
-            return;
-        }
-        List<String> kits = db.listKits();
-        drawText(context, "Saved kits: " + kits.size(), x, y, 0xFFBBBBBB);
-        int row = 0;
-        for (String kit : kits) {
-            if (row >= 8) {
-                drawText(context, "... " + (kits.size() - row) + " more", x, y + 14 + row * 12, 0xFF888888);
-                break;
+        long now = System.currentTimeMillis();
+        if (cachedKitLines == null || now >= kitCacheExpiryMs) {
+            StashDatabase db = openDatabase();
+            if (db == null) {
+                drawText(context, "Database unavailable.", x, y, 0xFFFF7777);
+                return;
             }
-            drawText(context, kit + " (" + db.countKitSlots(kit) + "/" + StashDatabase.KIT_MAX_SLOTS + " slots)",
-                    x, y + 14 + row * 12, 0xFFE8E8E8);
-            row++;
+            List<String> kits = db.listKits();
+            cachedKitCount = kits.size();
+            cachedKitLines = new ArrayList<>();
+            for (String kit : kits) {
+                if (cachedKitLines.size() >= 8) {
+                    cachedKitLines.add("... " + (kits.size() - 8) + " more");
+                    break;
+                }
+                cachedKitLines.add(kit + " (" + db.countKitSlots(kit) + "/"
+                        + StashDatabase.KIT_MAX_SLOTS + " slots)");
+            }
+            kitCacheExpiryMs = now + KIT_CACHE_TTL_MS;
+        }
+        drawText(context, "Saved kits: " + cachedKitCount, x, y, 0xFFBBBBBB);
+        for (int row = 0; row < cachedKitLines.size(); row++) {
+            String line = cachedKitLines.get(row);
+            int color = line.startsWith("... ") ? 0xFF888888 : 0xFFE8E8E8;
+            drawText(context, line, x, y + 14 + row * 12, color);
         }
     }
 

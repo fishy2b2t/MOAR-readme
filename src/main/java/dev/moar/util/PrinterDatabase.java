@@ -27,10 +27,10 @@ public final class PrinterDatabase {
         }
     };
 
-    /** True when scaffold table modified since last DB write. */
+    // True when scaffold table modified since last DB write.
     private static boolean scaffoldDirty;
 
-    /** Record a scaffold block position with its block item ID. */
+    // Record a scaffold block position with its block item ID.
     public static void addScaffold(BlockPos pos, String itemId) {
         /*? if >=26.1 {*//*
         scaffoldTable.put(pos.immutable(), itemId);
@@ -46,7 +46,7 @@ public final class PrinterDatabase {
         }
     }
 
-    /** Remove multiple scaffold positions in one batch. */
+    // Remove multiple scaffold positions in one batch.
     public static void removeScaffoldBatch(Collection<BlockPos> positions) {
         boolean changed = false;
         for (BlockPos pos : positions) {
@@ -55,7 +55,7 @@ public final class PrinterDatabase {
         if (changed) scaffoldDirty = true;
     }
 
-    /** Write scaffold data to disk if modified since last write. */
+    // Write scaffold data to disk if modified since last write.
     public static void flushScaffoldIfDirty() {
         if (scaffoldDirty) {
             saveScaffold();
@@ -75,22 +75,22 @@ public final class PrinterDatabase {
         return scaffoldTable.containsKey(pos);
     }
 
-    /** Block item ID for a scaffold position, or null. */
+    // Block item ID for a scaffold position, or null.
     public static String getScaffoldBlockId(BlockPos pos) {
         return scaffoldTable.get(pos);
     }
 
-    /** Unmodifiable view of all scaffold entries (position → item ID). */
+    // Unmodifiable view of all scaffold entries (position → item ID).
     public static Map<BlockPos, String> getScaffoldEntries() {
         return Collections.unmodifiableMap(scaffoldTable);
     }
 
-    /** Ordered stream of scaffold positions (insertion order). */
+    // Ordered stream of scaffold positions (insertion order).
     public static java.util.stream.Stream<BlockPos> scaffoldStream() {
         return scaffoldTable.keySet().stream();
     }
 
-    /** Clear all tracked scaffold positions and save. */
+    // Clear all tracked scaffold positions and save.
     public static void clearScaffold() {
         scaffoldTable.clear();
         scaffoldDirty = false;
@@ -99,7 +99,7 @@ public final class PrinterDatabase {
 
     // --- PERSISTENCE — scaffold blocks (SQLite via StashDatabase)
 
-    /** Load scaffold entries from the database. */
+    // Load scaffold entries from the database.
     public static void loadScaffold() {
         var db = MoarMod.getDatabase();
         if (!db.isOpen()) return;
@@ -110,7 +110,7 @@ public final class PrinterDatabase {
         }
     }
 
-    /** Save scaffold entries to the database. */
+    // Save scaffold entries to the database.
     public static void saveScaffold() {
         var db = MoarMod.getDatabase();
         if (db.isOpen()) db.saveScaffold(scaffoldTable);

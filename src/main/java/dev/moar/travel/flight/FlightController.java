@@ -345,11 +345,11 @@ public final class FlightController {
                 MoarNetworkManager.OWNER_FLIGHT, 1, 2)) {
             return false;
         }
-        /*? if >=1.21.5 {*//*
+        /*? if >=1.21.5 {*/
         inv.setSelectedSlot(slot);
-        *//*?} else {*/
-        inv.selectedSlot = slot;
-        /*?}*/
+        /*?} else {*/
+        /*inv.selectedSlot = slot;
+        *//*?}*/
         player.networkHandler.sendPacket(new UpdateSelectedSlotC2SPacket(slot));
         mc.interactionManager.interactItem(player, Hand.MAIN_HAND);
         LOGGER.debug("[Flight] fired rocket slot {}", slot);

@@ -8,23 +8,21 @@ import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
-/**
- * Forces key.forward → isPressed/isDown = true while BounceController is active.
- *
- * Without this, KeyboardInput.tick() reads the real key state (not held) and
- * passes a zero forward-axis movement input to travel(). On the server, the
- * ground-phase predictor sees no forward input → predicts near-zero velocity →
- * the sprint-jump position the client sends diverges → setback under strict validation.
- *
- * Field rename history (Yarn):
- *   <=1.21.8 Yarn  : KeyBinding.translationKey  /  getTranslationKey()
- *   >=1.21.10 Yarn : KeyBinding.id              /  getId()
- *   26.1 Mojmap    : KeyMapping.name            /  getName()
- *
- * Method name:
- *   Yarn:       isPressed()
- *   Mojmap 26.1: isDown()
- */
+// Forces key.forward → isPressed/isDown = true while BounceController is active.
+//
+// Without this, KeyboardInput.tick() reads the real key state (not held) and
+// passes a zero forward-axis movement input to travel(). On the server, the
+// ground-phase predictor sees no forward input → predicts near-zero velocity →
+// the sprint-jump position the client sends diverges → setback under strict validation.
+//
+// Field rename history (Yarn):
+//   <=1.21.8 Yarn  : KeyBinding.translationKey  /  getTranslationKey()
+//   >=1.21.10 Yarn : KeyBinding.id              /  getId()
+//   26.1 Mojmap    : KeyMapping.name            /  getName()
+//
+// Method name:
+//   Yarn:       isPressed()
+//   Mojmap 26.1: isDown()
 /*? if >=26.1 {*//*
 @Mixin(net.minecraft.client.KeyMapping.class)
 *//*?} else {*/

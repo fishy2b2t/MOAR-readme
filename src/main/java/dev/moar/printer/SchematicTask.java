@@ -9,10 +9,8 @@ import net.minecraft.util.math.BlockPos;
 import java.nio.file.Path;
 import java.util.UUID;
 
-/**
- * Represents a single schematic build task in the queue.
- * Tracks metadata, progress, and state for one schematic placement.
- */
+// Represents a single schematic build task in the queue.
+// Tracks metadata, progress, and state for one schematic placement.
 public final class SchematicTask {
 
     private final UUID id;

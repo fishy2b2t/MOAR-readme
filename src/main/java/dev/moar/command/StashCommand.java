@@ -71,7 +71,7 @@ public final class StashCommand {
 
     private StashCommand() {}
 
-    /** Suggests all Minecraft item IDs (path only, no namespace). */
+    // Suggests all Minecraft item IDs (path only, no namespace).
     private static final SuggestionProvider<FabricClientCommandSource> SUGGEST_ITEMS = (ctx, builder) -> {
         String remaining = builder.getRemaining().toLowerCase(java.util.Locale.ROOT);
         /*? if >=26.1 {*//*
@@ -88,7 +88,7 @@ public final class StashCommand {
         return builder.buildFuture();
     };
 
-    /** Suggests saved kit names from the stash database. */
+    // Suggests saved kit names from the stash database.
     private static final SuggestionProvider<FabricClientCommandSource> SUGGEST_KITS = (ctx, builder) -> {
         StashDatabase db = getOpenDatabase();
         if (db == null) return builder.buildFuture();
@@ -101,7 +101,7 @@ public final class StashCommand {
         return builder.buildFuture();
     };
 
-    /** Suggests saved region profile names from the stash database. */
+    // Suggests saved region profile names from the stash database.
     private static final SuggestionProvider<FabricClientCommandSource> SUGGEST_REGIONS = (ctx, builder) -> {
         StashDatabase db = getOpenDatabase();
         if (db == null) return builder.buildFuture();
@@ -114,7 +114,7 @@ public final class StashCommand {
         return builder.buildFuture();
     };
 
-    /** Suggests known lane names from accepted and pending lanes. */
+    // Suggests known lane names from accepted and pending lanes.
     private static final SuggestionProvider<FabricClientCommandSource> SUGGEST_LANES = (ctx, builder) -> {
         String remaining = builder.getRemaining().toLowerCase(java.util.Locale.ROOT);
         java.util.Set<String> names = new java.util.LinkedHashSet<>();
@@ -491,7 +491,7 @@ public final class StashCommand {
         return retriever.start(item, count) ? 1 : 0;
     }
 
-    /** Build the /stash dump sub-tree (add, remove, list, clear). */
+    // Build the /stash dump sub-tree (add, remove, list, clear).
     private static com.mojang.brigadier.builder.LiteralArgumentBuilder<
             net.fabricmc.fabric.api.client.command.v2.FabricClientCommandSource> buildDumpSubcommand() {
         /*? if >=26.1 {*//*
@@ -640,7 +640,7 @@ public final class StashCommand {
         return dump;
     }
 
-    /** Build the /stash kit sub-tree. */
+    // Build the /stash kit sub-tree.
     private static com.mojang.brigadier.builder.LiteralArgumentBuilder<
             net.fabricmc.fabric.api.client.command.v2.FabricClientCommandSource> buildKitSubcommand() {
         /*? if >=26.1 {*//*
@@ -1017,7 +1017,7 @@ public final class StashCommand {
         return 1;
     }
 
-    /** Find a chest/barrel/shulker near the crosshair (crosshair > feet > below). */
+    // Find a chest/barrel/shulker near the crosshair (crosshair > feet > below).
     /*? if >=26.1 {*//*
     private static BlockPos findTargetContainer(Minecraft mc) {
     *//*?} else {*/
@@ -1026,7 +1026,7 @@ public final class StashCommand {
         return findTargetStorageBlock(mc, false);
     }
 
-    /** Find an input-capable block near the crosshair (includes hoppers). */
+    // Find an input-capable block near the crosshair (includes hoppers).
     /*? if >=26.1 {*//*
     private static BlockPos findTargetInput(Minecraft mc) {
     *//*?} else {*/
@@ -1080,7 +1080,7 @@ public final class StashCommand {
         return MoarMod.getStashManager();
     }
 
-    /** Build the /stash region sub-tree (save, load, list, delete). */
+    // Build the /stash region sub-tree (save, load, list, delete).
     private static com.mojang.brigadier.builder.LiteralArgumentBuilder<
             net.fabricmc.fabric.api.client.command.v2.FabricClientCommandSource> buildRegionSubcommand() {
         /*? if >=26.1 {*//*
